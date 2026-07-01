@@ -1,22 +1,51 @@
-// api/chat.js
+const admin = require('firebase-admin');
+
+// 🛡️ 1. Inicializa o Firebase Admin de forma segura
+if (admin && !admin.apps?.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    }),
+  });
+}
+
 export default async function handler(req, res) {
+  // Configuração de CORS
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization'); // Incluído Authorization
 
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido.' });
 
+  // 🛡️ 2. O LEÃO DE CHÁCARA: Verificando o Token do Flutter
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Acesso negado. Token de segurança ausente.' });
+  }
+
+  const idToken = authHeader.split('Bearer ')[1];
+
+  try {
+    // Decodifica o token para garantir que é o usuário autorizado
+    await admin.auth().verifyIdToken(idToken);
+  } catch (error) {
+    console.error("Tentativa de invasão ou token expirado:", error);
+    return res.status(403).json({ error: 'Token inválido ou expirado.' });
+  }
+
+  // 🛡️ 3. Lógica do Gemini
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return res.status(500).json({ error: 'Chave ausente no servidor.' });
 
   try {
-    const { message, context } = req.body; 
+    const { message, context } = req.body;
 
     if (!message) return res.status(400).json({ error: 'Mensagem obrigatória.' });
 
-    // 🛡️ SYSTEM INSTRUCTION
     const systemInstruction = 
       "CICLO MENSTRUAL (CONTEXTO ADICIONAL):\n" +
       "O usuário forneceu dados de ciclo menstrual. Se 'isEnabled' for verdadeiro:\n" +
@@ -35,8 +64,8 @@ export default async function handler(req, res) {
       ? `\n\n[CONTEXTO ATUAL DO USUÁRIO]: ${JSON.stringify(context)}`
       : "\n\n[CONTEXTO ATUAL DO USUÁRIO]: Dados indisponíveis.";
 
-    // 🚀 CORREÇÃO: Endpoint correto para modelos Gemini e estrutura 'contents'
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`, {
+    // Chamada do Gemini (modelo corrigido para 1.5-flash)
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -48,13 +77,11 @@ export default async function handler(req, res) {
 
     const data = await response.json();
 
-    // 🚀 CORREÇÃO: Nova estrutura de resposta do Gemini (candidates -> content -> parts)
     if (response.ok && data.candidates && data.candidates[0].content.parts[0].text) {
       const replyText = data.candidates[0].content.parts[0].text;
       return res.status(200).json({ reply: replyText });
     }
     
-    // Se deu erro, retorna o erro bruto do Google para debug
     return res.status(500).json({ error: 'Erro na API do Google', details: data });
 
   } catch (error) {
