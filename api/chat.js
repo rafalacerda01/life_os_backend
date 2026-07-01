@@ -9,14 +9,14 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido.' });
 
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'Chave ausente.' });
+  if (!apiKey) return res.status(500).json({ error: 'Chave ausente no servidor.' });
 
   try {
     const { message, context } = req.body; 
 
     if (!message) return res.status(400).json({ error: 'Mensagem obrigatória.' });
 
-    // 🛡️ SYSTEM INSTRUCTION CORRIGIDA (Sem erros de sintaxe)
+    // 🛡️ SYSTEM INSTRUCTION
     const systemInstruction = 
       "CICLO MENSTRUAL (CONTEXTO ADICIONAL):\n" +
       "O usuário forneceu dados de ciclo menstrual. Se 'isEnabled' for verdadeiro:\n" +
@@ -31,28 +31,32 @@ export default async function handler(req, res) {
       "2. ACESSO AOS DADOS: Você recebeu um [CONTEXTO ATUAL DO USUÁRIO] com campos como 'humor', 'hidratacao', 'medicamentos' e 'ciclo_menstrual'.\n" +
       "3. REGRA DE OURO: Sempre que o usuário perguntar algo relacionado a si mesmo ou à rotina, você DEVE incorporar esses dados na sua resposta. Se os dados estiverem ausentes ou forem 'Dados indisponíveis', informe ao usuário que o registro está pendente.";
 
-    // 🧠 Construção do contexto biológico
     const bioContext = context 
       ? `\n\n[CONTEXTO ATUAL DO USUÁRIO]: ${JSON.stringify(context)}`
       : "\n\n[CONTEXTO ATUAL DO USUÁRIO]: Dados indisponíveis.";
 
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/interactions?key=${apiKey}`, {
+    // 🚀 CORREÇÃO: Endpoint correto para modelos Gemini e estrutura 'contents'
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: "gemini-3.5-flash",
-        input: `${systemInstruction}${bioContext}\n\nUsuário diz: ${message}`
+        contents: [{
+          parts: [{ text: `${systemInstruction}${bioContext}\n\nUsuário diz: ${message}` }]
+        }]
       })
     });
 
     const data = await response.json();
-    if (response.ok && data.steps) {
-      const outputStep = data.steps.find(step => step.type === "model_output");
-      if (outputStep?.content?.[0]?.text) {
-        return res.status(200).json({ reply: outputStep.content[0].text });
-      }
+
+    // 🚀 CORREÇÃO: Nova estrutura de resposta do Gemini (candidates -> content -> parts)
+    if (response.ok && data.candidates && data.candidates[0].content.parts[0].text) {
+      const replyText = data.candidates[0].content.parts[0].text;
+      return res.status(200).json({ reply: replyText });
     }
-    return res.status(500).json({ error: 'Erro na API', details: data });
+    
+    // Se deu erro, retorna o erro bruto do Google para debug
+    return res.status(500).json({ error: 'Erro na API do Google', details: data });
+
   } catch (error) {
     return res.status(500).json({ error: 'Erro interno', details: error.message });
   }
