@@ -1,9 +1,10 @@
-const admin = require('firebase-admin');
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
 
-// 🛡️ 1. Inicializa o Firebase Admin de forma segura
-if (admin && !admin.apps?.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
+// 🛡️ 1. Inicializa o Firebase Admin com a API Modular (À prova da Vercel)
+if (!getApps().length) {
+  initializeApp({
+    credential: cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
       privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
@@ -16,7 +17,7 @@ module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization'); // Incluído Authorization
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido.' });
@@ -30,8 +31,8 @@ module.exports = async function handler(req, res) {
   const idToken = authHeader.split('Bearer ')[1];
 
   try {
-    // Decodifica o token para garantir que é o usuário autorizado
-    await admin.auth().verifyIdToken(idToken);
+    // Decodifica o token com a função getAuth() direta
+    await getAuth().verifyIdToken(idToken);
   } catch (error) {
     console.error("Tentativa de invasão ou token expirado:", error);
     return res.status(403).json({ error: 'Token inválido ou expirado.' });
@@ -64,20 +65,19 @@ module.exports = async function handler(req, res) {
       ? `\n\n[CONTEXTO ATUAL DO USUÁRIO]: ${JSON.stringify(context)}`
       : "\n\n[CONTEXTO ATUAL DO USUÁRIO]: Dados indisponíveis.";
 
-    // Chamada do Gemini (modelo corrigido para 1.5-flash)
+    // Chamada do Gemini 3.5-flash
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    contents: [{
-      parts: [{ text: `${systemInstruction}${bioContext}\n\nUsuário diz: ${message}` }]
-    }],
-    // Adicione a configuração de raciocínio correta:
-    generationConfig: {
-      "thinking_level": "medium" 
-    }
-  })
-});
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{ text: `${systemInstruction}${bioContext}\n\nUsuário diz: ${message}` }]
+        }],
+        generationConfig: {
+          "thinking_level": "medium" 
+        }
+      })
+    });
 
     const data = await response.json();
 
@@ -91,4 +91,4 @@ module.exports = async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: 'Erro interno', details: error.message });
   }
-}
+};
