@@ -1,4 +1,4 @@
-import * as admin from 'firebase-admin';
+const admin = require('firebase-admin');
 
 // 🛡️ 1. Inicializa o Firebase Admin de forma segura
 if (admin && !admin.apps?.length) {
@@ -11,7 +11,7 @@ if (admin && !admin.apps?.length) {
   });
 }
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   // Configuração de CORS
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
