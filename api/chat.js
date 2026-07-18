@@ -72,10 +72,8 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         contents: [{
           parts: [{ text: `${systemInstruction}${bioContext}\n\nUsuário diz: ${message}` }]
-        }],
-        generationConfig: {
-          "thinking_level": "medium" 
-        }
+        }]
+        
       })
     });
 
