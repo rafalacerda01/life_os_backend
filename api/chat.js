@@ -1,7 +1,7 @@
-const { initializeApp, cert, getApps } = require('firebase-admin/app');
-const { getAuth } = require('firebase-admin/auth');
+import { initializeApp, cert, getApps } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
 
-// 🛡️ 1. Inicializa o Firebase Admin com a API Modular (À prova da Vercel)
+// 🛡️ 1. Inicializa o Firebase Admin com a API Modular e ESM Moderno (Vercel-friendly)
 if (!getApps().length) {
   initializeApp({
     credential: cert({
@@ -12,7 +12,7 @@ if (!getApps().length) {
   });
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   // Configuração de CORS
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -31,7 +31,7 @@ module.exports = async function handler(req, res) {
   const idToken = authHeader.split('Bearer ')[1];
 
   try {
-    // Decodifica o token com a função getAuth() direta
+    // Decodifica o token com a função getAuth()
     await getAuth().verifyIdToken(idToken);
   } catch (error) {
     console.error("Tentativa de invasão ou token expirado:", error);
@@ -91,4 +91,4 @@ module.exports = async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: 'Erro interno', details: error.message });
   }
-};
+}
