@@ -1,4 +1,4 @@
-const admin = require('firebase-admin');
+import admin from 'firebase-admin';
 
 // 🛡️ 1. Inicializa o Firebase Admin de forma segura
 if (admin && !admin.apps?.length) {
