@@ -1,7 +1,8 @@
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
+import { getFirestore } from 'firebase-admin/firestore';
 
-// 🛡️ Inicializa o Firebase Admin (Igual ao chat.js)
+// 🛡️ Inicializa o Firebase Admin
 if (!getApps().length) {
   initializeApp({
     credential: cert({
@@ -11,6 +12,8 @@ if (!getApps().length) {
     }),
   });
 }
+
+const db = getFirestore();
 
 export default async function handler(req, res) {
   // 1. Configuração de CORS
@@ -22,38 +25,52 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido.' });
 
-  // 2. Middleware de Autenticação Incorporado
+  // 2. Verificação do Token do Firebase
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Acesso negado. Token não fornecido.' });
   }
 
-  const idToken = authHeader.split('Bearer ')[1];
+  const token = authHeader.split('Bearer ')[1];
   let decodedToken;
 
   try {
-    decodedToken = await getAuth().verifyIdToken(idToken);
+    decodedToken = await getAuth().verifyIdToken(token);
   } catch (error) {
     console.error('Erro ao verificar o token Firebase:', error);
     return res.status(403).json({ error: 'Token inválido ou expirado.' });
   }
 
-  // 3. Lógica do Sync (O que ficava no seu syncController)
   try {
-    const payload = req.body;
-    const userId = decodedToken.uid; // ID do usuário autenticado no Firebase
+    const userId = decodedToken.uid;
+    const { timestamp, tasks, habits, finances } = req.body;
 
-    // AQUI VOCÊ INSERE A INTEGRAÇÃO COM O BANCO DE DADOS
-    // Exemplo: await database.save(userId, payload);
+    console.log(`Recebendo sincronização do usuário ${userId} em ${timestamp}`);
 
-    return res.status(200).json({ 
-        message: 'Sincronização recebida com sucesso',
-        userId: userId,
-        receivedData: payload
+    // 3. Salvando os dados no Firestore (Coleção 'users' -> documento do usuário -> subcoleção ou campos de sync)
+    const userRef = db.collection('users').doc(userId);
+    
+    await userRef.set({
+      lastSync: timestamp || new Date().toISOString(),
+      tasks: tasks || [],
+      habits: habits || [],
+      finances: finances || [],
+      updatedAt: getFirestore.FieldValue.serverTimestamp()
+    }, { merge: true }); // O { merge: true } garante que não apagamos dados antigos que não vieram nessa requisição
+
+    return res.status(200).json({
+      success: true,
+      message: "Sincronização concluída e salva no Firestore com sucesso.",
+      serverTimestamp: new Date().toISOString(),
+      updatedData: {
+        tasks: tasks || [],
+        habits: habits || [],
+        finances: finances || []
+      }
     });
 
   } catch (error) {
-    console.error('Erro na lógica de sincronização:', error);
-    return res.status(500).json({ error: 'Erro interno do servidor', details: error.message });
+    console.error("Erro no processo de sincronização com o banco:", error);
+    return res.status(500).json({ error: "Erro interno ao processar a sincronização.", details: error.message });
   }
 }
