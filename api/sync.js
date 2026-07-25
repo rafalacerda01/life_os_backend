@@ -47,7 +47,7 @@ export default async function handler(req, res) {
 
     console.log(`Recebendo sincronização do usuário ${userId} em ${timestamp}`);
 
-    // 3. Salvando os dados no Firestore (Coleção 'users' -> documento do usuário -> subcoleção ou campos de sync)
+    // 3. Salvando os dados no Firestore com a sintaxe correta
     const userRef = db.collection('users').doc(userId);
     
     await userRef.set({
@@ -55,8 +55,8 @@ export default async function handler(req, res) {
       tasks: tasks || [],
       habits: habits || [],
       finances: finances || [],
-      updatedAt: getFirestore.FieldValue.serverTimestamp()
-    }, { merge: true }); // O { merge: true } garante que não apagamos dados antigos que não vieram nessa requisição
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
 
     return res.status(200).json({
       success: true,
