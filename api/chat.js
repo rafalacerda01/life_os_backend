@@ -75,16 +75,16 @@ DIRETRIZES DE RESPOSTA:
       ? `\n\n[CONTEXTO ATUAL DO USUÁRIO]: ${JSON.stringify(context)}`
       : "\n\n[CONTEXTO ATUAL DO USUÁRIO]: Dados indisponíveis.";
 
-    // Chamada do Gemini 3.5-flash
+    // Chamada otimizada para o Gemini 3.5 Flash via REST na v1beta
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    contents: [{
-      parts: [{ text: `${systemInstruction}${bioContext}\n\nUsuário diz: ${message}` }]
-    }]
-  })
-});
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{ text: `${systemInstruction}${bioContext}\n\nUsuário diz: ${message}` }]
+        }]
+      })
+    });
 
     const data = await response.json();
 
@@ -93,9 +93,11 @@ DIRETRIZES DE RESPOSTA:
       return res.status(200).json({ reply: replyText });
     }
     
+    console.error("Erro retornado pela API do Google:", data);
     return res.status(500).json({ error: 'Erro na API do Google', details: data });
 
   } catch (error) {
+    console.error("Erro interno no servidor:", error);
     return res.status(500).json({ error: 'Erro interno', details: error.message });
   }
 }
