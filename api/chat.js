@@ -77,15 +77,14 @@ DIRETRIZES DE RESPOSTA:
 
     // Chamada do Gemini 3.5-flash
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          parts: [{ text: `${systemInstruction}${bioContext}\n\nUsuário diz: ${message}` }]
-        }]
-        
-      })
-    });
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    contents: [{
+      parts: [{ text: `${systemInstruction}${bioContext}\n\nUsuário diz: ${message}` }]
+    }]
+  })
+});
 
     const data = await response.json();
 
