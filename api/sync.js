@@ -22,7 +22,7 @@ const db = getFirestore();
 export default async function handler(req, res) {
   // 1. Configuração de CORS Restrita / Segura
   res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Allow-Origin', '*'); // Se preferir, troque '*' pelo domínio exato do app em produção
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
@@ -47,13 +47,24 @@ export default async function handler(req, res) {
 
   try {
     const userId = decodedToken.uid;
-    const { timestamp, tasks, habits, finances } = req.body || {};
+    const { 
+      timestamp, tasks, habits, finances, 
+      check_ins, goals, health_entries, 
+      medications, study_stats, subjects, flashcards 
+    } = req.body || {};
 
     // 3. Validação de Tipagem do Payload (Anti-Corrupção de Dados)
     if (
       (tasks && !Array.isArray(tasks)) ||
       (habits && !Array.isArray(habits)) ||
-      (finances && !Array.isArray(finances))
+      (finances && !Array.isArray(finances)) ||
+      (check_ins && !Array.isArray(check_ins)) ||
+      (goals && !Array.isArray(goals)) ||
+      (health_entries && !Array.isArray(health_entries)) ||
+      (medications && !Array.isArray(medications)) ||
+      (study_stats && !Array.isArray(study_stats)) ||
+      (subjects && !Array.isArray(subjects)) ||
+      (flashcards && !Array.isArray(flashcards))
     ) {
       return res.status(400).json({ error: 'Formato de dados inválido. As coleções devem ser do tipo array.' });
     }
@@ -72,14 +83,26 @@ export default async function handler(req, res) {
     if (tasks !== undefined) payloadToSave.tasks = tasks;
     if (habits !== undefined) payloadToSave.habits = habits;
     if (finances !== undefined) payloadToSave.finances = finances;
+    if (check_ins !== undefined) payloadToSave.check_ins = check_ins;
+    if (goals !== undefined) payloadToSave.goals = goals;
+    if (health_entries !== undefined) payloadToSave.health_entries = health_entries;
+    if (medications !== undefined) payloadToSave.medications = medications;
+    if (study_stats !== undefined) payloadToSave.study_stats = study_stats;
+    if (subjects !== undefined) payloadToSave.subjects = subjects;
+    if (flashcards !== undefined) payloadToSave.flashcards = flashcards;
 
     // Salvando no Firestore de forma atômica
     await userRef.set(payloadToSave, { merge: true });
 
+    // 🚀 5. BUSCA O ESTADO ATUALIZADO DO BANCO PARA DEVOLVER AO APP
+    const updatedDoc = await userRef.get();
+    const serverData = updatedDoc.exists ? updatedDoc.data() : {};
+
     return res.status(200).json({
       success: true,
-      message: "Sincronização concluída e salva no Firestore com sucesso.",
+      message: "Sincronização concluída com sucesso.",
       serverTimestamp: serverIsoString,
+      ...serverData, // Retorna todas as tabelas guardadas no documento do usuário
     });
 
   } catch (error) {
