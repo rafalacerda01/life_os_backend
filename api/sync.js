@@ -20,11 +20,24 @@ if (!getApps().length) {
 const db = getFirestore();
 
 export default async function handler(req, res) {
-  // 1. Configuração de CORS Restrita / Segura
+  
+  // ========================================================================
+  // 🛡️ CORREÇÃO SEGURA DO CORS (Deve vir ANTES do req.method === 'OPTIONS')
+  // ========================================================================
+  const origin = req.headers.origin;
+  const allowedOrigins = [
+    'https://painel.life-os.com', 
+    'https://app.life-os.com',
+    'http://localhost:3000'
+  ];
+
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
   res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Allow-Origin', '*'); // Se preferir, troque '*' pelo domínio exato do app em produção
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  // ========================================================================
 
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido.' });
