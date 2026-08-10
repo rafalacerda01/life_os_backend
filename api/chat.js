@@ -1,9 +1,12 @@
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
+import { getFirestore } from 'firebase-admin/firestore';
 
 // ============================================================================
 // LIFE OS - AI CHAT ENDPOINT
 // ============================================================================
+
+let db;
 
 if (!getApps().length) {
   const projectId = process.env.FIREBASE_PROJECT_ID;
@@ -24,6 +27,8 @@ if (!getApps().length) {
     }),
   });
 }
+
+db = getFirestore();
 
 // ============================================================================
 // LIMITES
@@ -69,7 +74,37 @@ function applyCors(req, res) {
     'Content-Type, Authorization',
   );
 }
+async function hasAiConsent(userId) {
+  const consentSnapshot = await db
+    .collection('users')
+    .doc(userId)
+    .collection('privacy')
+    .doc('ai_consent')
+    .get();
 
+  if (!consentSnapshot.exists) {
+    return false;
+  }
+
+  const data = consentSnapshot.data();
+
+  return data?.accepted === true;
+}
+
+async function hasPremiumAccess(userId) {
+  const userSnapshot = await db
+    .collection('users')
+    .doc(userId)
+    .get();
+
+  if (!userSnapshot.exists) {
+    return false;
+  }
+
+  const data = userSnapshot.data();
+
+  return data?.isPremium === true;
+}
 // ============================================================================
 // HELPERS
 // ============================================================================
@@ -296,16 +331,69 @@ export default async function handler(req, res) {
 
   const userId = decodedToken.uid;
 
-  // --------------------------------------------------------------------------
-  // RATE LIMIT
-  // --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// CONSENTIMENTO
+// --------------------------------------------------------------------------
 
-  if (!checkRateLimit(userId)) {
-    return res.status(429).json({
-      error:
-        'Muitas solicitações. Tente novamente em alguns instantes.',
-    });
-  }
+let consentGranted;
+
+try {
+  consentGranted = await hasAiConsent(userId);
+} catch (error) {
+  console.error(
+    'Falha ao verificar consentimento da IA:',
+    error?.message ?? 'unknown_error',
+  );
+
+  return res.status(500).json({
+    error: 'Não foi possível verificar a autorização para uso da IA.',
+  });
+}
+
+if (!consentGranted) {
+  return res.status(451).json({
+    error: 'Consentimento necessário para utilizar o Companion IA.',
+  });
+}
+
+// --------------------------------------------------------------------------
+// PREMIUM
+//
+// O status Premium NÃO é confiado ao cliente.
+// O UID vem exclusivamente do Firebase ID Token validado pelo backend.
+// --------------------------------------------------------------------------
+
+let premiumGranted;
+
+try {
+  premiumGranted = await hasPremiumAccess(userId);
+} catch (error) {
+  console.error(
+    'Falha ao verificar status Premium:',
+    error?.message ?? 'unknown_error',
+  );
+
+  return res.status(500).json({
+    error: 'Não foi possível verificar a autorização Premium.',
+  });
+}
+
+if (!premiumGranted) {
+  return res.status(402).json({
+    error: 'Plano PRO necessário para utilizar o Companion IA.',
+  });
+}
+
+// --------------------------------------------------------------------------
+// RATE LIMIT
+// --------------------------------------------------------------------------
+
+if (!checkRateLimit(userId)) {
+  return res.status(429).json({
+    error:
+      'Muitas solicitações. Tente novamente em alguns instantes.',
+  });
+}
 
   // --------------------------------------------------------------------------
   // BODY
