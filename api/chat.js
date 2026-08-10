@@ -324,7 +324,7 @@ export default async function handler(req, res) {
       error?.message ?? 'unknown_error',
     );
 
-    return res.status(403).json({
+    return res.status(401).json({
       error: 'Token inválido ou expirado.',
     });
   }
