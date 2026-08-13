@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "engines": {
-    "node": "24.x"
+    "node": "20.x"
   },
   "scripts": {
     "start": "node index.js",
@@ -16,6 +16,7 @@
   "dependencies": {
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "firebase-admin": "^14.2.0"
+    "firebase-admin": "^14.2.0",
+    "jwks-rsa": "^4.1.0"
   }
 }
