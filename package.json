@@ -3,8 +3,9 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "type": "module",
   "engines": {
-    "node": "20.x"
+    "node": "22.x"
   },
   "scripts": {
     "start": "node index.js",
@@ -16,7 +17,9 @@
   "dependencies": {
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "firebase-admin": "^14.2.0",
-    "jwks-rsa": "^4.1.0"
+    "firebase-admin": "^14.2.0"
+  },
+  "overrides": {
+    "jose": "4.15.9"
   }
 }
