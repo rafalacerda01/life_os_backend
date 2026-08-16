@@ -1,7 +1,9 @@
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
-import { getFirestore } from 'firebase-admin/firestore';
-
+import {
+  getFirestore,
+  FieldValue,
+} from 'firebase-admin/firestore';
 // ============================================================================
 // LIFE OS - SYNC ENDPOINT
 // ============================================================================
@@ -60,7 +62,12 @@ const ALLOWED_TOP_LEVEL_KEYS = new Set([
   'habits',
   'finances',
 ]);
+const HABITS_FREE_LIMIT = 3;
+const HABITS_PREMIUM_LIMIT = 30;
 
+const MAX_HABIT_TITLE_LENGTH = 200;
+const MAX_HABIT_DATES = 5000;
+const MAX_HABIT_DATE_LENGTH = 20;
 // ============================================================================
 // SCHEMA ALLOWLIST
 // ============================================================================
@@ -518,7 +525,279 @@ function validateEntityStructure(
 
   return true;
 }
+function validateHabitCreatePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
 
+  const { habitId, title, completedDates } = body;
+
+  if (
+    typeof habitId !== 'string' ||
+    habitId.trim().length === 0 ||
+    habitId.length > 128 ||
+    habitId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'habitId inválido.',
+    };
+  }
+
+  if (
+    typeof title !== 'string' ||
+    title.trim().length === 0 ||
+    title.length > MAX_HABIT_TITLE_LENGTH
+  ) {
+    return {
+      valid: false,
+      error: 'Título do hábito inválido.',
+    };
+  }
+
+  if (!Array.isArray(completedDates)) {
+    return {
+      valid: false,
+      error: 'completedDates deve ser uma lista.',
+    };
+  }
+
+  if (completedDates.length > MAX_HABIT_DATES) {
+    return {
+      valid: false,
+      error: 'Limite de completedDates excedido.',
+    };
+  }
+
+  if (
+    !completedDates.every(
+      (date) =>
+        typeof date === 'string' &&
+        date.length <= MAX_HABIT_DATE_LENGTH,
+    )
+  ) {
+    return {
+      valid: false,
+      error: 'completedDates contém valores inválidos.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
+
+function validateHabitDeletePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const { habitId } = body;
+
+  if (
+    typeof habitId !== 'string' ||
+    habitId.trim().length === 0 ||
+    habitId.length > 128 ||
+    habitId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'habitId inválido.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
+
+async function createHabitWithQuota({
+  userId,
+  habitId,
+  title,
+  completedDates,
+}) {
+  const userRef = db.collection('users').doc(userId);
+  const habitRef = userRef.collection('habits').doc(habitId);
+
+  return db.runTransaction(async (transaction) => {
+    const userSnapshot = await transaction.get(userRef);
+    const habitSnapshot = await transaction.get(habitRef);
+
+    if (!userSnapshot.exists) {
+      const error = new Error(
+        'Usuário não encontrado.',
+      );
+
+      error.statusCode = 404;
+      error.code = 'USER_NOT_FOUND';
+
+      throw error;
+    }
+
+    // Idempotência:
+    // se a criação já aconteceu e a resposta foi perdida,
+    // uma nova tentativa não incrementa o contador novamente.
+    if (habitSnapshot.exists) {
+      return {
+        alreadyExisted: true,
+      };
+    }
+
+    const userData = userSnapshot.data() ?? {};
+
+    const isPremium =
+      userData.isPremium === true;
+
+    const habitsCount =
+      userData.habitsCount;
+
+    if (
+      typeof habitsCount !== 'number' ||
+      !Number.isInteger(habitsCount) ||
+      habitsCount < 0
+    ) {
+      const error = new Error(
+        'Contador de hábitos ainda não foi migrado.',
+      );
+
+      error.statusCode = 412;
+      error.code =
+        'HABIT_QUOTA_MIGRATION_REQUIRED';
+
+      throw error;
+    }
+
+    const limit = isPremium
+      ? HABITS_PREMIUM_LIMIT
+      : HABITS_FREE_LIMIT;
+
+    if (habitsCount >= limit) {
+      const error = new Error(
+        isPremium
+          ? 'Limite Premium de hábitos atingido.'
+          : 'Limite gratuito de 3 hábitos atingido.',
+      );
+
+      error.statusCode = 403;
+      error.code =
+        'HABIT_QUOTA_EXCEEDED';
+
+      throw error;
+    }
+
+    transaction.set(
+      habitRef,
+      {
+        title: title.trim(),
+        completedDates,
+      },
+      {
+        merge: true,
+      },
+    );
+
+    transaction.update(
+      userRef,
+      {
+        habitsCount: habitsCount + 1,
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+    );
+
+    return {
+      alreadyExisted: false,
+    };
+  });
+}
+
+async function deleteHabitWithQuota({
+  userId,
+  habitId,
+}) {
+  const userRef = db.collection('users').doc(userId);
+  const habitRef = userRef.collection('habits').doc(habitId);
+
+  const notificationRef1 = userRef
+    .collection('notifications')
+    .doc(habitId);
+
+  const notificationRef2 = userRef
+    .collection('notifications')
+    .doc(`habit_${habitId}`);
+
+  return db.runTransaction(async (transaction) => {
+    const userSnapshot = await transaction.get(userRef);
+    const habitSnapshot =
+      await transaction.get(habitRef);
+
+    if (!userSnapshot.exists) {
+      const error = new Error(
+        'Usuário não encontrado.',
+      );
+
+      error.statusCode = 404;
+      error.code = 'USER_NOT_FOUND';
+
+      throw error;
+    }
+
+    // Idempotência:
+    // se o hábito já foi removido, não decrementamos novamente.
+    if (!habitSnapshot.exists) {
+      return {
+        alreadyDeleted: true,
+      };
+    }
+
+    const userData = userSnapshot.data() ?? {};
+    const habitsCount =
+      userData.habitsCount;
+
+    if (
+      typeof habitsCount !== 'number' ||
+      !Number.isInteger(habitsCount) ||
+      habitsCount < 0
+    ) {
+      const error = new Error(
+        'Contador de hábitos ainda não foi migrado.',
+      );
+
+      error.statusCode = 412;
+      error.code =
+        'HABIT_QUOTA_MIGRATION_REQUIRED';
+
+      throw error;
+    }
+
+    transaction.delete(habitRef);
+    transaction.delete(notificationRef1);
+    transaction.delete(notificationRef2);
+
+    transaction.update(
+      userRef,
+      {
+        habitsCount: Math.max(
+          0,
+          habitsCount - 1,
+        ),
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+    );
+
+    return {
+      alreadyDeleted: false,
+    };
+  });
+}
 // ============================================================================
 // HANDLER
 // ============================================================================
@@ -638,7 +917,94 @@ export default async function handler(req, res) {
           'Payload de sincronização inválido.',
       });
     }
+    
+        // ------------------------------------------------------------------------
+    // OPERAÇÕES SERVER-SIDE DE HÁBITOS
+    // ------------------------------------------------------------------------
 
+    const operation = rawBody.operation;
+
+    if (operation === 'create_habit') {
+      const validation =
+        validateHabitCreatePayload(rawBody);
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          error: validation.error,
+        });
+      }
+
+      try {
+        await createHabitWithQuota({
+          userId,
+          habitId: rawBody.habitId.trim(),
+          title: rawBody.title,
+          completedDates: rawBody.completedDates,
+        });
+
+        return res.status(200).json({
+          success: true,
+          operation: 'create_habit',
+        });
+      } catch (error) {
+        console.error(
+          'Erro ao criar hábito server-side:',
+          error?.message ??
+            'unknown_error',
+        );
+
+        return res.status(
+          error?.statusCode ?? 500,
+        ).json({
+          error:
+            error?.message ??
+            'Não foi possível criar o hábito.',
+          code:
+            error?.code ??
+            'HABIT_CREATE_FAILED',
+        });
+      }
+    }
+
+    if (operation === 'delete_habit') {
+      const validation =
+        validateHabitDeletePayload(rawBody);
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          error: validation.error,
+        });
+      }
+
+      try {
+        await deleteHabitWithQuota({
+          userId,
+          habitId: rawBody.habitId.trim(),
+        });
+
+        return res.status(200).json({
+          success: true,
+          operation: 'delete_habit',
+        });
+      } catch (error) {
+        console.error(
+          'Erro ao excluir hábito server-side:',
+          error?.message ??
+            'unknown_error',
+        );
+
+        return res.status(
+          error?.statusCode ?? 500,
+        ).json({
+          error:
+            error?.message ??
+            'Não foi possível excluir o hábito.',
+          code:
+            error?.code ??
+            'HABIT_DELETE_FAILED',
+        });
+      }
+    }
     // ------------------------------------------------------------------------
     // TOP LEVEL ALLOWLIST
     // ------------------------------------------------------------------------
