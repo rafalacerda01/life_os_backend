@@ -72,6 +72,12 @@ const SUBJECTS_PREMIUM_LIMIT = 30;
 
 const MAX_SUBJECT_TITLE_LENGTH = 200;
 const MAX_SUBJECT_ID_LENGTH = 128;
+const MEDICATIONS_FREE_LIMIT = 3;
+const MEDICATIONS_PREMIUM_LIMIT = 30;
+
+const MAX_MEDICATION_NAME_LENGTH = 200;
+const MAX_MEDICATION_ID_LENGTH = 128;
+const MAX_MEDICATION_DURATION_DAYS = 3650;
 const MAX_GOAL_TITLE_LENGTH = 200;
 const MAX_GOAL_ID_LENGTH = 128;
 
@@ -621,6 +627,115 @@ function validateSubjectCreatePayload(body) {
   };
 }
 
+function validateMedicationCreatePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const {
+    medicationId,
+    name,
+    startDate,
+    durationDays,
+    endDate,
+  } = body;
+
+  if (
+    typeof medicationId !== 'string' ||
+    medicationId.trim().length === 0 ||
+    medicationId.length > MAX_MEDICATION_ID_LENGTH ||
+    medicationId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'medicationId inválido.',
+    };
+  }
+
+  if (
+    typeof name !== 'string' ||
+    name.trim().length === 0 ||
+    name.length > MAX_MEDICATION_NAME_LENGTH
+  ) {
+    return {
+      valid: false,
+      error: 'Nome do medicamento inválido.',
+    };
+  }
+
+  if (
+    typeof startDate !== 'string' ||
+    !Number.isFinite(Date.parse(startDate))
+  ) {
+    return {
+      valid: false,
+      error: 'Data inicial do medicamento inválida.',
+    };
+  }
+
+  if (
+    durationDays !== null &&
+    (
+      typeof durationDays !== 'number' ||
+      !Number.isInteger(durationDays) ||
+      durationDays <= 0 ||
+      durationDays > MAX_MEDICATION_DURATION_DAYS
+    )
+  ) {
+    return {
+      valid: false,
+      error: 'Duração do medicamento inválida.',
+    };
+  }
+
+  if (
+    endDate !== null &&
+    (
+      typeof endDate !== 'string' ||
+      !Number.isFinite(Date.parse(endDate))
+    )
+  ) {
+    return {
+      valid: false,
+      error: 'Data final do medicamento inválida.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
+
+function validateMedicationDeletePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const { medicationId } = body;
+
+  if (
+    typeof medicationId !== 'string' ||
+    medicationId.trim().length === 0 ||
+    medicationId.length > MAX_MEDICATION_ID_LENGTH ||
+    medicationId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'medicationId inválido.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
+
 function validateSubjectDeletePayload(body) {
   if (!isPlainObject(body)) {
     return {
@@ -927,6 +1042,210 @@ function validateHabitDeletePayload(body) {
   return {
     valid: true,
   };
+}
+async function createMedicationWithQuota({
+  userId,
+  medicationId,
+  name,
+  startDate,
+  durationDays,
+  endDate,
+}) {
+  const userRef =
+    db.collection('users').doc(userId);
+
+  const medicationRef =
+    userRef.collection('medications').doc(medicationId);
+
+  return db.runTransaction(async (transaction) => {
+    const userSnapshot =
+      await transaction.get(userRef);
+
+    const medicationSnapshot =
+      await transaction.get(medicationRef);
+
+    if (!userSnapshot.exists) {
+      const error = new Error(
+        'Usuário não encontrado.',
+      );
+
+      error.statusCode = 404;
+      error.code = 'USER_NOT_FOUND';
+
+      throw error;
+    }
+
+    if (medicationSnapshot.exists) {
+      return {
+        alreadyExisted: true,
+      };
+    }
+
+    const userData =
+      userSnapshot.data() ?? {};
+
+    const isPremium =
+      userData.isPremium === true;
+
+    const medicationsCount =
+      userData.medicationsCount;
+
+    if (
+      typeof medicationsCount !== 'number' ||
+      !Number.isInteger(medicationsCount) ||
+      medicationsCount < 0
+    ) {
+      const error = new Error(
+        'Contador de medicamentos ainda não foi migrado.',
+      );
+
+      error.statusCode = 412;
+      error.code =
+        'MEDICATION_QUOTA_MIGRATION_REQUIRED';
+
+      throw error;
+    }
+
+    const limit = isPremium
+      ? MEDICATIONS_PREMIUM_LIMIT
+      : MEDICATIONS_FREE_LIMIT;
+
+    if (medicationsCount >= limit) {
+      const error = new Error(
+        isPremium
+          ? 'Limite Premium de 30 medicamentos atingido.'
+          : 'Limite gratuito de 3 medicamentos atingido.',
+      );
+
+      error.statusCode = 403;
+      error.code =
+        'MEDICATION_QUOTA_EXCEEDED';
+
+      throw error;
+    }
+
+    transaction.set(
+      medicationRef,
+      {
+        name: name.trim(),
+        startDate: new Date(startDate),
+        durationDays,
+        endDate:
+          endDate !== null
+            ? new Date(endDate)
+            : null,
+        createdAt:
+          FieldValue.serverTimestamp(),
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+      {
+        merge: true,
+      },
+    );
+
+    transaction.update(
+      userRef,
+      {
+        medicationsCount:
+          medicationsCount + 1,
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+    );
+
+    return {
+      alreadyExisted: false,
+    };
+  });
+}
+
+async function deleteMedicationWithQuota({
+  userId,
+  medicationId,
+}) {
+  const userRef =
+    db.collection('users').doc(userId);
+
+  const medicationRef =
+    userRef.collection('medications').doc(medicationId);
+
+  const notificationRef =
+    userRef
+      .collection('notifications')
+      .doc(`health_med_${medicationId}`);
+
+  return db.runTransaction(async (transaction) => {
+    const userSnapshot =
+      await transaction.get(userRef);
+
+    const medicationSnapshot =
+      await transaction.get(medicationRef);
+
+    if (!userSnapshot.exists) {
+      const error = new Error(
+        'Usuário não encontrado.',
+      );
+
+      error.statusCode = 404;
+      error.code = 'USER_NOT_FOUND';
+
+      throw error;
+    }
+
+    if (!medicationSnapshot.exists) {
+      return {
+        alreadyDeleted: true,
+      };
+    }
+
+    const userData =
+      userSnapshot.data() ?? {};
+
+    const medicationsCount =
+      userData.medicationsCount;
+
+    if (
+      typeof medicationsCount !== 'number' ||
+      !Number.isInteger(medicationsCount) ||
+      medicationsCount < 0
+    ) {
+      const error = new Error(
+        'Contador de medicamentos ainda não foi migrado.',
+      );
+
+      error.statusCode = 412;
+      error.code =
+        'MEDICATION_QUOTA_MIGRATION_REQUIRED';
+
+      throw error;
+    }
+
+    transaction.delete(
+      medicationRef,
+    );
+
+    transaction.delete(
+      notificationRef,
+    );
+
+    transaction.update(
+      userRef,
+      {
+        medicationsCount:
+          Math.max(
+            0,
+            medicationsCount - 1,
+          ),
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+    );
+
+    return {
+      alreadyDeleted: false,
+    };
+  });
 }
 async function createSubjectWithQuota({
   userId,
@@ -1852,6 +2171,89 @@ export default async function handler(req, res) {
     // ------------------------------------------------------------------------
 
     const operation = rawBody.operation;
+    if (operation === 'create_medication') {
+  const validation =
+    validateMedicationCreatePayload(rawBody);
+
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: validation.error,
+    });
+  }
+
+  try {
+    await createMedicationWithQuota({
+      userId,
+      medicationId:
+        rawBody.medicationId.trim(),
+      name: rawBody.name,
+      startDate: rawBody.startDate,
+      durationDays: rawBody.durationDays,
+      endDate: rawBody.endDate,
+    });
+
+    return res.status(200).json({
+      success: true,
+      operation: 'create_medication',
+    });
+  } catch (error) {
+    console.error(
+      'Erro ao criar medicamento server-side:',
+      error?.message ?? 'unknown_error',
+    );
+
+    return res.status(
+      error?.statusCode ?? 500,
+    ).json({
+      error:
+        error?.message ??
+        'Não foi possível criar o medicamento.',
+      code:
+        error?.code ??
+        'MEDICATION_CREATE_FAILED',
+    });
+  }
+}
+
+if (operation === 'delete_medication') {
+  const validation =
+    validateMedicationDeletePayload(rawBody);
+
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: validation.error,
+    });
+  }
+
+  try {
+    await deleteMedicationWithQuota({
+      userId,
+      medicationId:
+        rawBody.medicationId.trim(),
+    });
+
+    return res.status(200).json({
+      success: true,
+      operation: 'delete_medication',
+    });
+  } catch (error) {
+    console.error(
+      'Erro ao excluir medicamento server-side:',
+      error?.message ?? 'unknown_error',
+    );
+
+    return res.status(
+      error?.statusCode ?? 500,
+    ).json({
+      error:
+        error?.message ??
+        'Não foi possível excluir o medicamento.',
+      code:
+        error?.code ??
+        'MEDICATION_DELETE_FAILED',
+    });
+  }
+}
     if (operation === 'create_subject') {
   const validation =
     validateSubjectCreatePayload(rawBody);

@@ -132,19 +132,13 @@ for (const userDoc of usersSnapshot.docs) {
   tasksSnapshot,
   goalsSnapshot,
   subjectsSnapshot,
+  medicationsSnapshot,
 ] = await Promise.all([
-  userDoc.ref
-    .collection('habits')
-    .get(),
-  userDoc.ref
-    .collection('tasks')
-    .get(),
-  userDoc.ref
-    .collection('goals')
-    .get(),
-  userDoc.ref
-    .collection('subjects')
-    .get(),
+  userDoc.ref.collection('habits').get(),
+  userDoc.ref.collection('tasks').get(),
+  userDoc.ref.collection('goals').get(),
+  userDoc.ref.collection('subjects').get(),
+  userDoc.ref.collection('medications').get(),
 ]);
 
   const habitsCount =
@@ -158,6 +152,9 @@ for (const userDoc of usersSnapshot.docs) {
 
   const subjectsCount =
   subjectsSnapshot.size;
+
+  const medicationsCount =
+  medicationsSnapshot.size;
 
   const userData =
     userDoc.data() ?? {};
@@ -174,11 +171,15 @@ for (const userDoc of usersSnapshot.docs) {
   const currentSubjectsCount =
   userData.subjectsCount;
 
+  const currentMedicationsCount =
+  userData.medicationsCount;
+
   if (
   currentHabitsCount === habitsCount &&
   currentTasksCount === tasksCount &&
   currentGoalsCount === goalsCount &&
-  currentSubjectsCount === subjectsCount
+  currentSubjectsCount === subjectsCount &&
+  currentMedicationsCount === medicationsCount
 ) {
   unchanged++;
   continue;
@@ -191,6 +192,7 @@ for (const userDoc of usersSnapshot.docs) {
   tasksCount,
   goalsCount,
   subjectsCount,
+  medicationsCount,
   updatedAt:
     FieldValue.serverTimestamp(),
 },
