@@ -67,7 +67,11 @@ const HABITS_PREMIUM_LIMIT = 30;
 const TASKS_FREE_LIMIT = 3;
 const GOALS_FREE_LIMIT = 3;
 const GOALS_PREMIUM_LIMIT = 30;
+const SUBJECTS_FREE_LIMIT = 3;
+const SUBJECTS_PREMIUM_LIMIT = 30;
 
+const MAX_SUBJECT_TITLE_LENGTH = 200;
+const MAX_SUBJECT_ID_LENGTH = 128;
 const MAX_GOAL_TITLE_LENGTH = 200;
 const MAX_GOAL_ID_LENGTH = 128;
 
@@ -544,6 +548,105 @@ function validateEntityStructure(
 
   return true;
 }
+function validateSubjectCreatePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const {
+    subjectId,
+    title,
+    hasExam,
+    examDate,
+  } = body;
+
+  if (
+    typeof subjectId !== 'string' ||
+    subjectId.trim().length === 0 ||
+    subjectId.length > MAX_SUBJECT_ID_LENGTH ||
+    subjectId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'subjectId inválido.',
+    };
+  }
+
+  if (
+    typeof title !== 'string' ||
+    title.trim().length === 0 ||
+    title.length > MAX_SUBJECT_TITLE_LENGTH
+  ) {
+    return {
+      valid: false,
+      error: 'Título da matéria inválido.',
+    };
+  }
+
+  if (typeof hasExam !== 'boolean') {
+    return {
+      valid: false,
+      error: 'Indicador de prova inválido.',
+    };
+  }
+
+  if (
+    examDate !== null &&
+    (
+      typeof examDate !== 'string' ||
+      !Number.isFinite(Date.parse(examDate))
+    )
+  ) {
+    return {
+      valid: false,
+      error: 'Data da prova inválida.',
+    };
+  }
+
+  if (
+    hasExam === true &&
+    examDate === null
+  ) {
+    return {
+      valid: false,
+      error: 'Data da prova é obrigatória.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
+
+function validateSubjectDeletePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const { subjectId } = body;
+
+  if (
+    typeof subjectId !== 'string' ||
+    subjectId.trim().length === 0 ||
+    subjectId.length > MAX_SUBJECT_ID_LENGTH ||
+    subjectId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'subjectId inválido.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
 function validateGoalCreatePayload(body) {
   if (!isPlainObject(body)) {
     return {
@@ -824,6 +927,267 @@ function validateHabitDeletePayload(body) {
   return {
     valid: true,
   };
+}
+async function createSubjectWithQuota({
+  userId,
+  subjectId,
+  title,
+  hasExam,
+  examDate,
+}) {
+  const userRef =
+    db.collection('users').doc(userId);
+
+  const subjectRef =
+    userRef.collection('subjects').doc(subjectId);
+
+  return db.runTransaction(async (transaction) => {
+    const userSnapshot =
+      await transaction.get(userRef);
+
+    const subjectSnapshot =
+      await transaction.get(subjectRef);
+
+    if (!userSnapshot.exists) {
+      const error = new Error(
+        'Usuário não encontrado.',
+      );
+
+      error.statusCode = 404;
+      error.code = 'USER_NOT_FOUND';
+
+      throw error;
+    }
+
+    if (subjectSnapshot.exists) {
+      return {
+        alreadyExisted: true,
+      };
+    }
+
+    const userData =
+      userSnapshot.data() ?? {};
+
+    const isPremium =
+      userData.isPremium === true;
+
+    const subjectsCount =
+      userData.subjectsCount;
+
+    if (
+      typeof subjectsCount !== 'number' ||
+      !Number.isInteger(subjectsCount) ||
+      subjectsCount < 0
+    ) {
+      const error = new Error(
+        'Contador de matérias ainda não foi migrado.',
+      );
+
+      error.statusCode = 412;
+      error.code =
+        'SUBJECT_QUOTA_MIGRATION_REQUIRED';
+
+      throw error;
+    }
+
+    const limit = isPremium
+      ? SUBJECTS_PREMIUM_LIMIT
+      : SUBJECTS_FREE_LIMIT;
+
+    if (subjectsCount >= limit) {
+      const error = new Error(
+        isPremium
+          ? 'Limite Premium de 30 matérias atingido.'
+          : 'Limite gratuito de 3 matérias atingido.',
+      );
+
+      error.statusCode = 403;
+      error.code = 'SUBJECT_QUOTA_EXCEEDED';
+
+      throw error;
+    }
+
+    transaction.set(
+      subjectRef,
+      {
+        title: title.trim(),
+        hasExam,
+        examDate:
+          examDate !== null
+            ? new Date(examDate)
+            : null,
+        cardsToReview: 0,
+        streakDays: 0,
+        progress: 0,
+        createdAt:
+          FieldValue.serverTimestamp(),
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+      {
+        merge: true,
+      },
+    );
+
+    transaction.update(
+      userRef,
+      {
+        subjectsCount: subjectsCount + 1,
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+    );
+
+    return {
+      alreadyExisted: false,
+    };
+  });
+}
+
+async function deleteSubjectWithQuota({
+  userId,
+  subjectId,
+}) {
+  const userRef =
+    db.collection('users').doc(userId);
+
+  const subjectRef =
+    userRef.collection('subjects').doc(subjectId);
+
+  const studyInfoRef =
+    userRef.collection('study_info').doc('main');
+
+  const flashcardsQuery =
+    userRef
+      .collection('review_queue')
+      .where('subjectId', '==', subjectId);
+
+  return db.runTransaction(async (transaction) => {
+    // Todas as leituras antes das escritas.
+    const userSnapshot =
+      await transaction.get(userRef);
+
+    const subjectSnapshot =
+      await transaction.get(subjectRef);
+
+    const studyInfoSnapshot =
+      await transaction.get(studyInfoRef);
+
+    const flashcardsSnapshot =
+      await transaction.get(flashcardsQuery);
+
+    if (!userSnapshot.exists) {
+      const error = new Error(
+        'Usuário não encontrado.',
+      );
+
+      error.statusCode = 404;
+      error.code = 'USER_NOT_FOUND';
+
+      throw error;
+    }
+
+    if (!subjectSnapshot.exists) {
+      return {
+        alreadyDeleted: true,
+      };
+    }
+
+    const userData =
+      userSnapshot.data() ?? {};
+
+    const subjectsCount =
+      userData.subjectsCount;
+
+    if (
+      typeof subjectsCount !== 'number' ||
+      !Number.isInteger(subjectsCount) ||
+      subjectsCount < 0
+    ) {
+      const error = new Error(
+        'Contador de matérias ainda não foi migrado.',
+      );
+
+      error.statusCode = 412;
+      error.code =
+        'SUBJECT_QUOTA_MIGRATION_REQUIRED';
+
+      throw error;
+    }
+
+    if (flashcardsSnapshot.size > 450) {
+      const error = new Error(
+        'A matéria possui flashcards demais para exclusão transacional.',
+      );
+
+      error.statusCode = 409;
+      error.code =
+        'SUBJECT_DELETE_TOO_MANY_FLASHCARDS';
+
+      throw error;
+    }
+
+    const studyInfoData =
+      studyInfoSnapshot.data() ?? {};
+
+    const rawReviewQueue =
+      studyInfoData.reviewQueue;
+
+    const currentReviewQueue =
+      typeof rawReviewQueue === 'number' &&
+      Number.isInteger(rawReviewQueue) &&
+      rawReviewQueue >= 0
+        ? rawReviewQueue
+        : 0;
+
+    const newReviewQueue =
+      Math.max(
+        0,
+        currentReviewQueue - flashcardsSnapshot.size,
+      );
+
+    for (const flashcardDoc of flashcardsSnapshot.docs) {
+      transaction.delete(
+        flashcardDoc.ref,
+      );
+    }
+
+    transaction.delete(
+      subjectRef,
+    );
+
+    transaction.set(
+      studyInfoRef,
+      {
+        reviewQueue: newReviewQueue,
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+      {
+        merge: true,
+      },
+    );
+
+    transaction.update(
+      userRef,
+      {
+        subjectsCount: Math.max(
+          0,
+          subjectsCount - 1,
+        ),
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+    );
+
+    return {
+      alreadyDeleted: false,
+      deletedFlashcards:
+        flashcardsSnapshot.size,
+      reviewQueue:
+        newReviewQueue,
+    };
+  });
 }
 async function createGoalWithQuota({
   userId,
@@ -1488,6 +1852,86 @@ export default async function handler(req, res) {
     // ------------------------------------------------------------------------
 
     const operation = rawBody.operation;
+    if (operation === 'create_subject') {
+  const validation =
+    validateSubjectCreatePayload(rawBody);
+
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: validation.error,
+    });
+  }
+
+  try {
+    await createSubjectWithQuota({
+      userId,
+      subjectId: rawBody.subjectId.trim(),
+      title: rawBody.title,
+      hasExam: rawBody.hasExam,
+      examDate: rawBody.examDate,
+    });
+
+    return res.status(200).json({
+      success: true,
+      operation: 'create_subject',
+    });
+  } catch (error) {
+    console.error(
+      'Erro ao criar matéria server-side:',
+      error?.message ?? 'unknown_error',
+    );
+
+    return res.status(
+      error?.statusCode ?? 500,
+    ).json({
+      error:
+        error?.message ??
+        'Não foi possível criar a matéria.',
+      code:
+        error?.code ??
+        'SUBJECT_CREATE_FAILED',
+    });
+  }
+}
+
+if (operation === 'delete_subject') {
+  const validation =
+    validateSubjectDeletePayload(rawBody);
+
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: validation.error,
+    });
+  }
+
+  try {
+    await deleteSubjectWithQuota({
+  userId,
+  subjectId: rawBody.subjectId.trim(),
+});
+
+    return res.status(200).json({
+      success: true,
+      operation: 'delete_subject',
+    });
+  } catch (error) {
+    console.error(
+      'Erro ao excluir matéria server-side:',
+      error?.message ?? 'unknown_error',
+    );
+
+    return res.status(
+      error?.statusCode ?? 500,
+    ).json({
+      error:
+        error?.message ??
+        'Não foi possível excluir a matéria.',
+      code:
+        error?.code ??
+        'SUBJECT_DELETE_FAILED',
+    });
+  }
+}
     if (operation === 'create_goal') {
   const validation =
     validateGoalCreatePayload(rawBody);

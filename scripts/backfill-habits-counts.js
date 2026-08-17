@@ -131,6 +131,7 @@ for (const userDoc of usersSnapshot.docs) {
   habitsSnapshot,
   tasksSnapshot,
   goalsSnapshot,
+  subjectsSnapshot,
 ] = await Promise.all([
   userDoc.ref
     .collection('habits')
@@ -140,6 +141,9 @@ for (const userDoc of usersSnapshot.docs) {
     .get(),
   userDoc.ref
     .collection('goals')
+    .get(),
+  userDoc.ref
+    .collection('subjects')
     .get(),
 ]);
 
@@ -151,6 +155,9 @@ for (const userDoc of usersSnapshot.docs) {
 
     const goalsCount =
   goalsSnapshot.size;
+
+  const subjectsCount =
+  subjectsSnapshot.size;
 
   const userData =
     userDoc.data() ?? {};
@@ -164,14 +171,18 @@ for (const userDoc of usersSnapshot.docs) {
     const currentGoalsCount =
   userData.goalsCount;
 
+  const currentSubjectsCount =
+  userData.subjectsCount;
+
   if (
   currentHabitsCount === habitsCount &&
   currentTasksCount === tasksCount &&
-  currentGoalsCount === goalsCount
+  currentGoalsCount === goalsCount &&
+  currentSubjectsCount === subjectsCount
 ) {
-    unchanged++;
-    continue;
-  }
+  unchanged++;
+  continue;
+}
 
   batch.update(
     userDoc.ref,
@@ -179,6 +190,7 @@ for (const userDoc of usersSnapshot.docs) {
   habitsCount,
   tasksCount,
   goalsCount,
+  subjectsCount,
   updatedAt:
     FieldValue.serverTimestamp(),
 },
