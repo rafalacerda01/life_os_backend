@@ -74,7 +74,12 @@ const MAX_SUBJECT_TITLE_LENGTH = 200;
 const MAX_SUBJECT_ID_LENGTH = 128;
 const MEDICATIONS_FREE_LIMIT = 3;
 const MEDICATIONS_PREMIUM_LIMIT = 30;
+const TRANSACTIONS_FREE_LIMIT = 3;
 
+const MAX_TRANSACTION_TITLE_LENGTH = 200;
+const MAX_TRANSACTION_CATEGORY_LENGTH = 100;
+const MAX_TRANSACTION_ID_LENGTH = 128;
+const MAX_TRANSACTION_AMOUNT = 1_000_000_000;
 const MAX_MEDICATION_NAME_LENGTH = 200;
 const MAX_MEDICATION_ID_LENGTH = 128;
 const MAX_MEDICATION_DURATION_DAYS = 3650;
@@ -619,6 +624,332 @@ function validateSubjectCreatePayload(body) {
     return {
       valid: false,
       error: 'Data da prova é obrigatória.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
+
+async function createTransactionWithQuota({
+  userId,
+  transactionId,
+  title,
+  amount,
+  type,
+  category,
+  date,
+}) {
+  const userRef =
+    db.collection('users').doc(userId);
+
+  const transactionRef =
+    userRef
+      .collection('transactions')
+      .doc(transactionId);
+
+  return db.runTransaction(
+    async (transaction) => {
+      const userSnapshot =
+        await transaction.get(userRef);
+
+      const transactionSnapshot =
+        await transaction.get(
+          transactionRef,
+        );
+
+      if (!userSnapshot.exists) {
+        const error = new Error(
+          'Usuário não encontrado.',
+        );
+
+        error.statusCode = 404;
+        error.code = 'USER_NOT_FOUND';
+
+        throw error;
+      }
+
+      if (transactionSnapshot.exists) {
+        return {
+          alreadyExisted: true,
+        };
+      }
+
+      const userData =
+        userSnapshot.data() ?? {};
+
+      const isPremium =
+        userData.isPremium === true;
+
+      const transactionsCount =
+        userData.transactionsCount;
+
+      if (
+        typeof transactionsCount !==
+          'number' ||
+        !Number.isInteger(
+          transactionsCount,
+        ) ||
+        transactionsCount < 0
+      ) {
+        const error = new Error(
+          'Contador de transações ainda não foi migrado.',
+        );
+
+        error.statusCode = 412;
+        error.code =
+          'TRANSACTION_QUOTA_MIGRATION_REQUIRED';
+
+        throw error;
+      }
+
+      if (
+        !isPremium &&
+        transactionsCount >=
+          TRANSACTIONS_FREE_LIMIT
+      ) {
+        const error = new Error(
+          'Limite gratuito de 3 transações atingido.',
+        );
+
+        error.statusCode = 403;
+        error.code =
+          'TRANSACTION_QUOTA_EXCEEDED';
+
+        throw error;
+      }
+
+      transaction.set(
+        transactionRef,
+        {
+          id: transactionId,
+          title: title.trim(),
+          amount,
+          type,
+          category: category.trim(),
+          date: new Date(date),
+          createdAt: new Date(date),
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+        {
+          merge: true,
+        },
+      );
+
+      transaction.update(
+        userRef,
+        {
+          transactionsCount:
+            transactionsCount + 1,
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+      );
+
+      return {
+        alreadyExisted: false,
+      };
+    },
+  );
+}
+
+async function deleteTransactionWithQuota({
+  userId,
+  transactionId,
+}) {
+  const userRef =
+    db.collection('users').doc(userId);
+
+  const transactionRef =
+    userRef
+      .collection('transactions')
+      .doc(transactionId);
+
+  return db.runTransaction(
+    async (transaction) => {
+      const userSnapshot =
+        await transaction.get(userRef);
+
+      const transactionSnapshot =
+        await transaction.get(
+          transactionRef,
+        );
+
+      if (!userSnapshot.exists) {
+        const error = new Error(
+          'Usuário não encontrado.',
+        );
+
+        error.statusCode = 404;
+        error.code = 'USER_NOT_FOUND';
+
+        throw error;
+      }
+
+      if (!transactionSnapshot.exists) {
+        return {
+          alreadyDeleted: true,
+        };
+      }
+
+      const userData =
+        userSnapshot.data() ?? {};
+
+      const transactionsCount =
+        userData.transactionsCount;
+
+      if (
+        typeof transactionsCount !==
+          'number' ||
+        !Number.isInteger(
+          transactionsCount,
+        ) ||
+        transactionsCount < 0
+      ) {
+        const error = new Error(
+          'Contador de transações ainda não foi migrado.',
+        );
+
+        error.statusCode = 412;
+        error.code =
+          'TRANSACTION_QUOTA_MIGRATION_REQUIRED';
+
+        throw error;
+      }
+
+      transaction.delete(
+        transactionRef,
+      );
+
+      transaction.update(
+        userRef,
+        {
+          transactionsCount:
+            Math.max(
+              0,
+              transactionsCount - 1,
+            ),
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+      );
+
+      return {
+        alreadyDeleted: false,
+      };
+    },
+  );
+}
+
+function validateTransactionCreatePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const {
+    transactionId,
+    title,
+    amount,
+    type,
+    category,
+    date,
+  } = body;
+
+  if (
+    typeof transactionId !== 'string' ||
+    transactionId.trim().length === 0 ||
+    transactionId.length > MAX_TRANSACTION_ID_LENGTH ||
+    transactionId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'transactionId inválido.',
+    };
+  }
+
+  if (
+    typeof title !== 'string' ||
+    title.trim().length === 0 ||
+    title.length > MAX_TRANSACTION_TITLE_LENGTH
+  ) {
+    return {
+      valid: false,
+      error: 'Título da transação inválido.',
+    };
+  }
+
+  if (
+    typeof amount !== 'number' ||
+    !Number.isFinite(amount) ||
+    amount <= 0 ||
+    amount > MAX_TRANSACTION_AMOUNT
+  ) {
+    return {
+      valid: false,
+      error: 'Valor da transação inválido.',
+    };
+  }
+
+  if (
+    type !== 'income' &&
+    type !== 'expense'
+  ) {
+    return {
+      valid: false,
+      error: 'Tipo da transação inválido.',
+    };
+  }
+
+  if (
+    typeof category !== 'string' ||
+    category.trim().length === 0 ||
+    category.length > MAX_TRANSACTION_CATEGORY_LENGTH
+  ) {
+    return {
+      valid: false,
+      error: 'Categoria da transação inválida.',
+    };
+  }
+
+  if (
+    typeof date !== 'string' ||
+    !Number.isFinite(Date.parse(date))
+  ) {
+    return {
+      valid: false,
+      error: 'Data da transação inválida.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
+
+function validateTransactionDeletePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const { transactionId } = body;
+
+  if (
+    typeof transactionId !== 'string' ||
+    transactionId.trim().length === 0 ||
+    transactionId.length > MAX_TRANSACTION_ID_LENGTH ||
+    transactionId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'transactionId inválido.',
     };
   }
 
@@ -2171,6 +2502,100 @@ export default async function handler(req, res) {
     // ------------------------------------------------------------------------
 
     const operation = rawBody.operation;
+    if (operation === 'create_transaction') {
+  const validation =
+    validateTransactionCreatePayload(
+      rawBody,
+    );
+
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: validation.error,
+    });
+  }
+
+  try {
+    await createTransactionWithQuota({
+      userId,
+      transactionId:
+        rawBody.transactionId.trim(),
+      title: rawBody.title,
+      amount: rawBody.amount,
+      type: rawBody.type,
+      category: rawBody.category,
+      date: rawBody.date,
+    });
+
+    return res.status(200).json({
+      success: true,
+      operation: 'create_transaction',
+    });
+  } catch (error) {
+    console.error(
+      'Erro ao criar transação server-side:',
+      error?.message ??
+        'unknown_error',
+    );
+
+    return res
+      .status(
+        error?.statusCode ?? 500,
+      )
+      .json({
+        error:
+          error?.message ??
+          'Não foi possível criar a transação.',
+        code:
+          error?.code ??
+          'TRANSACTION_CREATE_FAILED',
+      });
+  }
+}
+
+if (operation === 'delete_transaction') {
+  const validation =
+    validateTransactionDeletePayload(
+      rawBody,
+    );
+
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: validation.error,
+    });
+  }
+
+  try {
+    await deleteTransactionWithQuota({
+      userId,
+      transactionId:
+        rawBody.transactionId.trim(),
+    });
+
+    return res.status(200).json({
+      success: true,
+      operation: 'delete_transaction',
+    });
+  } catch (error) {
+    console.error(
+      'Erro ao excluir transação server-side:',
+      error?.message ??
+        'unknown_error',
+    );
+
+    return res
+      .status(
+        error?.statusCode ?? 500,
+      )
+      .json({
+        error:
+          error?.message ??
+          'Não foi possível excluir a transação.',
+        code:
+          error?.code ??
+          'TRANSACTION_DELETE_FAILED',
+      });
+  }
+}
     if (operation === 'create_medication') {
   const validation =
     validateMedicationCreatePayload(rawBody);

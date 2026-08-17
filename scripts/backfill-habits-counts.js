@@ -133,12 +133,14 @@ for (const userDoc of usersSnapshot.docs) {
   goalsSnapshot,
   subjectsSnapshot,
   medicationsSnapshot,
+  transactionsSnapshot,
 ] = await Promise.all([
   userDoc.ref.collection('habits').get(),
   userDoc.ref.collection('tasks').get(),
   userDoc.ref.collection('goals').get(),
   userDoc.ref.collection('subjects').get(),
   userDoc.ref.collection('medications').get(),
+  userDoc.ref.collection('transactions').get(),
 ]);
 
   const habitsCount =
@@ -155,6 +157,9 @@ for (const userDoc of usersSnapshot.docs) {
 
   const medicationsCount =
   medicationsSnapshot.size;
+
+  const transactionsCount =
+  transactionsSnapshot.size;
 
   const userData =
     userDoc.data() ?? {};
@@ -174,12 +179,16 @@ for (const userDoc of usersSnapshot.docs) {
   const currentMedicationsCount =
   userData.medicationsCount;
 
+  const currentTransactionsCount =
+  userData.transactionsCount;
+
   if (
   currentHabitsCount === habitsCount &&
   currentTasksCount === tasksCount &&
   currentGoalsCount === goalsCount &&
   currentSubjectsCount === subjectsCount &&
-  currentMedicationsCount === medicationsCount
+  currentMedicationsCount === medicationsCount &&
+  currentTransactionsCount === transactionsCount
 ) {
   unchanged++;
   continue;
@@ -193,6 +202,7 @@ for (const userDoc of usersSnapshot.docs) {
   goalsCount,
   subjectsCount,
   medicationsCount,
+  transactionsCount,
   updatedAt:
     FieldValue.serverTimestamp(),
 },
