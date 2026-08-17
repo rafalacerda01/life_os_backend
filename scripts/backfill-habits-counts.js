@@ -127,18 +127,36 @@ let batch = db.batch();
 let batchCount = 0;
 
 for (const userDoc of usersSnapshot.docs) {
-  const habitsSnapshot = await userDoc.ref
-    .collection('habits')
-    .get();
+  const [
+    habitsSnapshot,
+    tasksSnapshot,
+  ] = await Promise.all([
+    userDoc.ref
+      .collection('habits')
+      .get(),
+    userDoc.ref
+      .collection('tasks')
+      .get(),
+  ]);
 
   const habitsCount =
     habitsSnapshot.size;
 
-  const current =
-    userDoc.data()?.habitsCount;
+  const tasksCount =
+    tasksSnapshot.size;
+
+  const userData =
+    userDoc.data() ?? {};
+
+  const currentHabitsCount =
+    userData.habitsCount;
+
+  const currentTasksCount =
+    userData.tasksCount;
 
   if (
-    current === habitsCount
+    currentHabitsCount === habitsCount &&
+    currentTasksCount === tasksCount
   ) {
     unchanged++;
     continue;
@@ -148,6 +166,7 @@ for (const userDoc of usersSnapshot.docs) {
     userDoc.ref,
     {
       habitsCount,
+      tasksCount,
       updatedAt:
         FieldValue.serverTimestamp(),
     },

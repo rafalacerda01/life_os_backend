@@ -64,7 +64,15 @@ const ALLOWED_TOP_LEVEL_KEYS = new Set([
 ]);
 const HABITS_FREE_LIMIT = 3;
 const HABITS_PREMIUM_LIMIT = 30;
+const TASKS_FREE_LIMIT = 3;
 
+const MAX_TASK_TITLE_LENGTH = 200;
+const MAX_TASK_ID_LENGTH = 128;
+const ALLOWED_TASK_PRIORITIES = new Set([
+  'low',
+  'medium',
+  'high',
+]);
 const MAX_HABIT_TITLE_LENGTH = 200;
 const MAX_HABIT_DATES = 5000;
 const MAX_HABIT_DATE_LENGTH = 20;
@@ -525,6 +533,95 @@ function validateEntityStructure(
 
   return true;
 }
+function validateTaskCreatePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const {
+    taskId,
+    title,
+    priority,
+    date,
+  } = body;
+
+  if (
+    typeof taskId !== 'string' ||
+    taskId.trim().length === 0 ||
+    taskId.length > MAX_TASK_ID_LENGTH ||
+    taskId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'taskId inválido.',
+    };
+  }
+
+  if (
+    typeof title !== 'string' ||
+    title.trim().length === 0 ||
+    title.length > MAX_TASK_TITLE_LENGTH
+  ) {
+    return {
+      valid: false,
+      error: 'Título da tarefa inválido.',
+    };
+  }
+
+  if (
+    typeof priority !== 'string' ||
+    !ALLOWED_TASK_PRIORITIES.has(priority)
+  ) {
+    return {
+      valid: false,
+      error: 'Prioridade da tarefa inválida.',
+    };
+  }
+
+  if (
+    typeof date !== 'string' ||
+    !Number.isFinite(Date.parse(date))
+  ) {
+    return {
+      valid: false,
+      error: 'Data da tarefa inválida.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
+
+function validateTaskDeletePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const { taskId } = body;
+
+  if (
+    typeof taskId !== 'string' ||
+    taskId.trim().length === 0 ||
+    taskId.length > MAX_TASK_ID_LENGTH ||
+    taskId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'taskId inválido.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
 function validateHabitCreatePayload(body) {
   if (!isPlainObject(body)) {
     return {
@@ -616,7 +713,171 @@ function validateHabitDeletePayload(body) {
     valid: true,
   };
 }
+async function createTaskWithQuota({
+  userId,
+  taskId,
+  title,
+  priority,
+  date,
+}) {
+  const userRef = db.collection('users').doc(userId);
+  const taskRef = userRef.collection('tasks').doc(taskId);
 
+  return db.runTransaction(async (transaction) => {
+    const userSnapshot = await transaction.get(userRef);
+    const taskSnapshot = await transaction.get(taskRef);
+
+    if (!userSnapshot.exists) {
+      const error = new Error(
+        'Usuário não encontrado.',
+      );
+
+      error.statusCode = 404;
+      error.code = 'USER_NOT_FOUND';
+
+      throw error;
+    }
+
+    // Idempotência: retry da mesma criação não aumenta o contador.
+    if (taskSnapshot.exists) {
+      return {
+        alreadyExisted: true,
+      };
+    }
+
+    const userData = userSnapshot.data() ?? {};
+
+    const isPremium =
+      userData.isPremium === true;
+
+    const tasksCount =
+      userData.tasksCount;
+
+    if (
+      typeof tasksCount !== 'number' ||
+      !Number.isInteger(tasksCount) ||
+      tasksCount < 0
+    ) {
+      const error = new Error(
+        'Contador de tarefas ainda não foi migrado.',
+      );
+
+      error.statusCode = 412;
+      error.code =
+        'TASK_QUOTA_MIGRATION_REQUIRED';
+
+      throw error;
+    }
+
+    if (
+      !isPremium &&
+      tasksCount >= TASKS_FREE_LIMIT
+    ) {
+      const error = new Error(
+        'Limite gratuito de 3 tarefas atingido.',
+      );
+
+      error.statusCode = 403;
+      error.code = 'TASK_QUOTA_EXCEEDED';
+
+      throw error;
+    }
+
+    transaction.set(
+      taskRef,
+      {
+        title: title.trim(),
+        priority,
+        isCompleted: false,
+        date: new Date(date),
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      {
+        merge: true,
+      },
+    );
+
+    transaction.update(
+      userRef,
+      {
+        tasksCount: tasksCount + 1,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+    );
+
+    return {
+      alreadyExisted: false,
+    };
+  });
+}
+
+async function deleteTaskWithQuota({
+  userId,
+  taskId,
+}) {
+  const userRef = db.collection('users').doc(userId);
+  const taskRef = userRef.collection('tasks').doc(taskId);
+
+  return db.runTransaction(async (transaction) => {
+    const userSnapshot = await transaction.get(userRef);
+    const taskSnapshot = await transaction.get(taskRef);
+
+    if (!userSnapshot.exists) {
+      const error = new Error(
+        'Usuário não encontrado.',
+      );
+
+      error.statusCode = 404;
+      error.code = 'USER_NOT_FOUND';
+
+      throw error;
+    }
+
+    // Idempotência: retry da exclusão não decrementa duas vezes.
+    if (!taskSnapshot.exists) {
+      return {
+        alreadyDeleted: true,
+      };
+    }
+
+    const userData = userSnapshot.data() ?? {};
+    const tasksCount = userData.tasksCount;
+
+    if (
+      typeof tasksCount !== 'number' ||
+      !Number.isInteger(tasksCount) ||
+      tasksCount < 0
+    ) {
+      const error = new Error(
+        'Contador de tarefas ainda não foi migrado.',
+      );
+
+      error.statusCode = 412;
+      error.code =
+        'TASK_QUOTA_MIGRATION_REQUIRED';
+
+      throw error;
+    }
+
+    transaction.delete(taskRef);
+
+    transaction.update(
+      userRef,
+      {
+        tasksCount: Math.max(
+          0,
+          tasksCount - 1,
+        ),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+    );
+
+    return {
+      alreadyDeleted: false,
+    };
+  });
+}
 async function createHabitWithQuota({
   userId,
   habitId,
@@ -923,7 +1184,86 @@ export default async function handler(req, res) {
     // ------------------------------------------------------------------------
 
     const operation = rawBody.operation;
+if (operation === 'create_task') {
+  const validation =
+    validateTaskCreatePayload(rawBody);
 
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: validation.error,
+    });
+  }
+
+  try {
+    await createTaskWithQuota({
+      userId,
+      taskId: rawBody.taskId.trim(),
+      title: rawBody.title,
+      priority: rawBody.priority,
+      date: rawBody.date,
+    });
+
+    return res.status(200).json({
+      success: true,
+      operation: 'create_task',
+    });
+  } catch (error) {
+    console.error(
+      'Erro ao criar tarefa server-side:',
+      error?.message ?? 'unknown_error',
+    );
+
+    return res.status(
+      error?.statusCode ?? 500,
+    ).json({
+      error:
+        error?.message ??
+        'Não foi possível criar a tarefa.',
+      code:
+        error?.code ??
+        'TASK_CREATE_FAILED',
+    });
+  }
+}
+
+if (operation === 'delete_task') {
+  const validation =
+    validateTaskDeletePayload(rawBody);
+
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: validation.error,
+    });
+  }
+
+  try {
+    await deleteTaskWithQuota({
+      userId,
+      taskId: rawBody.taskId.trim(),
+    });
+
+    return res.status(200).json({
+      success: true,
+      operation: 'delete_task',
+    });
+  } catch (error) {
+    console.error(
+      'Erro ao excluir tarefa server-side:',
+      error?.message ?? 'unknown_error',
+    );
+
+    return res.status(
+      error?.statusCode ?? 500,
+    ).json({
+      error:
+        error?.message ??
+        'Não foi possível excluir a tarefa.',
+      code:
+        error?.code ??
+        'TASK_DELETE_FAILED',
+    });
+  }
+}
     if (operation === 'create_habit') {
       const validation =
         validateHabitCreatePayload(rawBody);
