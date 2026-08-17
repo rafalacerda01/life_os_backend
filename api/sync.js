@@ -65,6 +65,17 @@ const ALLOWED_TOP_LEVEL_KEYS = new Set([
 const HABITS_FREE_LIMIT = 3;
 const HABITS_PREMIUM_LIMIT = 30;
 const TASKS_FREE_LIMIT = 3;
+const GOALS_FREE_LIMIT = 3;
+const GOALS_PREMIUM_LIMIT = 30;
+
+const MAX_GOAL_TITLE_LENGTH = 200;
+const MAX_GOAL_ID_LENGTH = 128;
+
+const ALLOWED_GOAL_PERIODS = new Set([
+  'DIÁRIA',
+  'SEMANAL',
+  'MENSAL',
+]);
 
 const MAX_TASK_TITLE_LENGTH = 200;
 const MAX_TASK_ID_LENGTH = 128;
@@ -533,6 +544,107 @@ function validateEntityStructure(
 
   return true;
 }
+function validateGoalCreatePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const {
+    goalId,
+    title,
+    period,
+    targetValue,
+    createdAt,
+  } = body;
+
+  if (
+    typeof goalId !== 'string' ||
+    goalId.trim().length === 0 ||
+    goalId.length > MAX_GOAL_ID_LENGTH ||
+    goalId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'goalId inválido.',
+    };
+  }
+
+  if (
+    typeof title !== 'string' ||
+    title.trim().length === 0 ||
+    title.length > MAX_GOAL_TITLE_LENGTH
+  ) {
+    return {
+      valid: false,
+      error: 'Título da meta inválido.',
+    };
+  }
+
+  if (
+    typeof period !== 'string' ||
+    !ALLOWED_GOAL_PERIODS.has(period)
+  ) {
+    return {
+      valid: false,
+      error: 'Período da meta inválido.',
+    };
+  }
+
+  if (
+    typeof targetValue !== 'number' ||
+    !Number.isInteger(targetValue) ||
+    targetValue <= 0
+  ) {
+    return {
+      valid: false,
+      error: 'Objetivo numérico inválido.',
+    };
+  }
+
+  if (
+    typeof createdAt !== 'string' ||
+    !Number.isFinite(Date.parse(createdAt))
+  ) {
+    return {
+      valid: false,
+      error: 'Data da meta inválida.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
+
+function validateGoalDeletePayload(body) {
+  if (!isPlainObject(body)) {
+    return {
+      valid: false,
+      error: 'Payload inválido.',
+    };
+  }
+
+  const { goalId } = body;
+
+  if (
+    typeof goalId !== 'string' ||
+    goalId.trim().length === 0 ||
+    goalId.length > MAX_GOAL_ID_LENGTH ||
+    goalId.includes('/')
+  ) {
+    return {
+      valid: false,
+      error: 'goalId inválido.',
+    };
+  }
+
+  return {
+    valid: true,
+  };
+}
 function validateTaskCreatePayload(body) {
   if (!isPlainObject(body)) {
     return {
@@ -712,6 +824,198 @@ function validateHabitDeletePayload(body) {
   return {
     valid: true,
   };
+}
+async function createGoalWithQuota({
+  userId,
+  goalId,
+  title,
+  period,
+  targetValue,
+  createdAt,
+}) {
+  const userRef =
+    db.collection('users').doc(userId);
+
+  const goalRef =
+    userRef.collection('goals').doc(goalId);
+
+  return db.runTransaction(async (transaction) => {
+    const userSnapshot =
+      await transaction.get(userRef);
+
+    const goalSnapshot =
+      await transaction.get(goalRef);
+
+    if (!userSnapshot.exists) {
+      const error = new Error(
+        'Usuário não encontrado.',
+      );
+
+      error.statusCode = 404;
+      error.code = 'USER_NOT_FOUND';
+
+      throw error;
+    }
+
+    // Retry da mesma criação não incrementa novamente.
+    if (goalSnapshot.exists) {
+      return {
+        alreadyExisted: true,
+      };
+    }
+
+    const userData =
+      userSnapshot.data() ?? {};
+
+    const isPremium =
+      userData.isPremium === true;
+
+    const goalsCount =
+      userData.goalsCount;
+
+    if (
+      typeof goalsCount !== 'number' ||
+      !Number.isInteger(goalsCount) ||
+      goalsCount < 0
+    ) {
+      const error = new Error(
+        'Contador de metas ainda não foi migrado.',
+      );
+
+      error.statusCode = 412;
+      error.code =
+        'GOAL_QUOTA_MIGRATION_REQUIRED';
+
+      throw error;
+    }
+
+    const limit = isPremium
+      ? GOALS_PREMIUM_LIMIT
+      : GOALS_FREE_LIMIT;
+
+    if (goalsCount >= limit) {
+      const error = new Error(
+        isPremium
+          ? 'Limite Premium de 30 metas atingido.'
+          : 'Limite gratuito de 3 metas atingido.',
+      );
+
+      error.statusCode = 403;
+      error.code = 'GOAL_QUOTA_EXCEEDED';
+
+      throw error;
+    }
+
+    const createdDate =
+      new Date(createdAt);
+
+    transaction.set(
+      goalRef,
+      {
+        title: title.trim(),
+        period,
+        currentValue: 0,
+        targetValue,
+        createdAt: createdDate,
+        lastReset: createdDate,
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+      {
+        merge: true,
+      },
+    );
+
+    transaction.update(
+      userRef,
+      {
+        goalsCount: goalsCount + 1,
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+    );
+
+    return {
+      alreadyExisted: false,
+    };
+  });
+}
+
+async function deleteGoalWithQuota({
+  userId,
+  goalId,
+}) {
+  const userRef =
+    db.collection('users').doc(userId);
+
+  const goalRef =
+    userRef.collection('goals').doc(goalId);
+
+  return db.runTransaction(async (transaction) => {
+    const userSnapshot =
+      await transaction.get(userRef);
+
+    const goalSnapshot =
+      await transaction.get(goalRef);
+
+    if (!userSnapshot.exists) {
+      const error = new Error(
+        'Usuário não encontrado.',
+      );
+
+      error.statusCode = 404;
+      error.code = 'USER_NOT_FOUND';
+
+      throw error;
+    }
+
+    // Retry da exclusão não decrementa novamente.
+    if (!goalSnapshot.exists) {
+      return {
+        alreadyDeleted: true,
+      };
+    }
+
+    const userData =
+      userSnapshot.data() ?? {};
+
+    const goalsCount =
+      userData.goalsCount;
+
+    if (
+      typeof goalsCount !== 'number' ||
+      !Number.isInteger(goalsCount) ||
+      goalsCount < 0
+    ) {
+      const error = new Error(
+        'Contador de metas ainda não foi migrado.',
+      );
+
+      error.statusCode = 412;
+      error.code =
+        'GOAL_QUOTA_MIGRATION_REQUIRED';
+
+      throw error;
+    }
+
+    transaction.delete(goalRef);
+
+    transaction.update(
+      userRef,
+      {
+        goalsCount: Math.max(
+          0,
+          goalsCount - 1,
+        ),
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      },
+    );
+
+    return {
+      alreadyDeleted: false,
+    };
+  });
 }
 async function createTaskWithQuota({
   userId,
@@ -1184,6 +1488,87 @@ export default async function handler(req, res) {
     // ------------------------------------------------------------------------
 
     const operation = rawBody.operation;
+    if (operation === 'create_goal') {
+  const validation =
+    validateGoalCreatePayload(rawBody);
+
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: validation.error,
+    });
+  }
+
+  try {
+    await createGoalWithQuota({
+      userId,
+      goalId: rawBody.goalId.trim(),
+      title: rawBody.title,
+      period: rawBody.period,
+      targetValue: rawBody.targetValue,
+      createdAt: rawBody.createdAt,
+    });
+
+    return res.status(200).json({
+      success: true,
+      operation: 'create_goal',
+    });
+  } catch (error) {
+    console.error(
+      'Erro ao criar meta server-side:',
+      error?.message ?? 'unknown_error',
+    );
+
+    return res.status(
+      error?.statusCode ?? 500,
+    ).json({
+      error:
+        error?.message ??
+        'Não foi possível criar a meta.',
+      code:
+        error?.code ??
+        'GOAL_CREATE_FAILED',
+    });
+  }
+}
+
+if (operation === 'delete_goal') {
+  const validation =
+    validateGoalDeletePayload(rawBody);
+
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: validation.error,
+    });
+  }
+
+  try {
+    await deleteGoalWithQuota({
+      userId,
+      goalId: rawBody.goalId.trim(),
+    });
+
+    return res.status(200).json({
+      success: true,
+      operation: 'delete_goal',
+    });
+  } catch (error) {
+    console.error(
+      'Erro ao excluir meta server-side:',
+      error?.message ?? 'unknown_error',
+    );
+
+    return res.status(
+      error?.statusCode ?? 500,
+    ).json({
+      error:
+        error?.message ??
+        'Não foi possível excluir a meta.',
+      code:
+        error?.code ??
+        'GOAL_DELETE_FAILED',
+    });
+  }
+}
 if (operation === 'create_task') {
   const validation =
     validateTaskCreatePayload(rawBody);
