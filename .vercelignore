@@ -1,0 +1,5 @@
+/*
+!api/
+!api/**
+!package.json
+!package-lock.json

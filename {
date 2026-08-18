@@ -1,1 +1,0 @@
-const handleSync = async (req, res) = try { const userId = req.user ? req.user.id 
