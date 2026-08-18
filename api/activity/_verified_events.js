@@ -1,4 +1,8 @@
 import { ActivityHttpError, hasExactKeys, isPlainObject } from './_shared.js';
+import {
+  applyActivityCircleProgressPlan,
+  readActivityCircleProgressPlan,
+} from './_circle_progress.js';
 
 export const ACTIVITY_EVENT_SCHEMA_VERSION = 1;
 export const ACTIVITY_EVENT_SOURCE = 'SERVER_CONFIRMED_ACTIVITY';
@@ -168,24 +172,45 @@ export async function recordVerifiedActivity({
     if (!validResource) throw resourceConflict();
 
     const expected = { type, uid, resourceId, dayKey };
+    let event;
+    let replayed;
     if (eventSnapshot.exists) {
-      const storedEvent = eventSnapshot.data();
-      if (!isValidStoredEvent(storedEvent, expected, now)) {
+      event = eventSnapshot.data();
+      if (!isValidStoredEvent(event, expected, now)) {
         throw stateConflict();
       }
-      return { event: storedEvent, replayed: true, eventId };
+      replayed = true;
+    } else {
+      event = {
+        schemaVersion: ACTIVITY_EVENT_SCHEMA_VERSION,
+        type,
+        source: ACTIVITY_EVENT_SOURCE,
+        uid,
+        resourceId,
+        ...(dayKey === undefined ? {} : { dayKey }),
+        occurredAt: now,
+      };
+      replayed = false;
     }
 
-    const event = {
-      schemaVersion: ACTIVITY_EVENT_SCHEMA_VERSION,
-      type,
-      source: ACTIVITY_EVENT_SOURCE,
+    const circlePlan = await readActivityCircleProgressPlan({
+      transaction,
+      db,
       uid,
-      resourceId,
-      ...(dayKey === undefined ? {} : { dayKey }),
-      occurredAt: now,
-    };
-    transaction.create(eventRef, event);
-    return { event, replayed: false, eventId };
+      userSnapshot,
+      event,
+      activityEventId: eventId,
+    });
+
+    if (!replayed) transaction.create(eventRef, event);
+    applyActivityCircleProgressPlan({
+      transaction,
+      plan: circlePlan,
+      uid,
+      event,
+      activityEventId: eventId,
+      processedAt: now,
+    });
+    return { event, replayed, eventId };
   });
 }
