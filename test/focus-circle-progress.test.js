@@ -238,7 +238,7 @@ function seedCircle(
   }
 }
 
-async function processCircle(db, session) {
+async function processCircle(db, session, processedAt = session.completedAt) {
   const userRef = db.collection('users').doc(UID);
   return db.runTransaction(async (transaction) => {
     const plan = await readCircleProgressPlan({
@@ -253,7 +253,7 @@ async function processCircle(db, session) {
       plan,
       uid: UID,
       session,
-      processedAt: session.completedAt,
+      processedAt,
     });
     return plan;
   });
@@ -617,6 +617,198 @@ test('valid existing progress increments exactly once', async () => {
   assert.equal(db.data(progressPath('focus')).value, 10);
 });
 
+test('existing newer lastEventAt never regresses', async () => {
+  const session = completedSession();
+  const newerLastEventAt = timestamp(session.completedAt.toMillis() + 60_000);
+  const db = new FakeFirestore();
+  seedCircle(db, session, {
+    challenges: [['focus', challenge(session, 'FOCUS_MINUTES')]],
+  });
+  db.seed(progressPath('focus'), {
+    value: 7,
+    updatedAt: newerLastEventAt,
+    lastEventAt: newerLastEventAt,
+  });
+
+  await processCircle(
+    db,
+    session,
+    timestamp(newerLastEventAt.toMillis() + 60_000),
+  );
+
+  const progress = db.data(progressPath('focus'));
+  assert.equal(progress.value, 8);
+  assert.equal(progress.lastEventAt, newerLastEventAt);
+});
+
+test('existing older lastEventAt advances to session completedAt', async () => {
+  const session = completedSession();
+  const db = new FakeFirestore();
+  seedCircle(db, session, {
+    challenges: [['focus', challenge(session, 'FOCUS_MINUTES')]],
+  });
+  db.seed(progressPath('focus'), {
+    value: 7,
+    updatedAt: session.startedAt,
+    lastEventAt: session.startedAt,
+  });
+
+  await processCircle(db, session);
+
+  const progress = db.data(progressPath('focus'));
+  assert.equal(progress.value, 8);
+  assert.equal(progress.lastEventAt, session.completedAt);
+});
+
+test('existing progress without lastEventAt adopts session completedAt', async () => {
+  const session = completedSession();
+  const db = new FakeFirestore();
+  seedCircle(db, session, {
+    challenges: [['focus', challenge(session, 'FOCUS_MINUTES')]],
+  });
+  db.seed(progressPath('focus'), {
+    value: 7,
+    updatedAt: session.startedAt,
+  });
+
+  await processCircle(db, session);
+
+  const progress = db.data(progressPath('focus'));
+  assert.equal(progress.value, 8);
+  assert.equal(progress.lastEventAt, session.completedAt);
+});
+
+test('equal lastEventAt remains equal and increments only once', async () => {
+  const session = completedSession();
+  const db = new FakeFirestore();
+  seedCircle(db, session, {
+    challenges: [['focus', challenge(session, 'FOCUS_MINUTES')]],
+  });
+  db.seed(progressPath('focus'), {
+    value: 7,
+    updatedAt: session.completedAt,
+    lastEventAt: session.completedAt,
+  });
+
+  await processCircle(db, session);
+  await processCircle(db, session);
+
+  const progress = db.data(progressPath('focus'));
+  assert.equal(progress.value, 8);
+  assert.equal(progress.lastEventAt, session.completedAt);
+});
+
+test('out-of-order sessions preserve the newest progress timestamp', async () => {
+  const olderSession = completedSession({
+    sessionId: 'session-a',
+    startedAtMillis: 1_000_000,
+  });
+  const newerSession = completedSession({
+    sessionId: 'session-b',
+    startedAtMillis: 1_100_000,
+  });
+  const processedAt = timestamp(newerSession.completedAt.toMillis() + 60_000);
+  const db = new FakeFirestore();
+  seedCircle(db, olderSession, {
+    challenges: [[
+      'focus',
+      challenge(olderSession, 'FOCUS_MINUTES', {
+        endAt: newerSession.completedAt,
+      }),
+    ]],
+  });
+
+  await processCircle(db, newerSession);
+  await processCircle(db, olderSession, processedAt);
+
+  const progress = db.data(progressPath('focus'));
+  const olderEvent = db.data(eventPath('focus', olderSession.sessionId));
+  assert.equal(progress.value, 2);
+  assert.equal(progress.lastEventAt, newerSession.completedAt);
+  assert.equal(olderEvent.sessionCompletedAt, olderSession.completedAt);
+});
+
+test('MAX_SAFE_INTEGER progress fails closed before overflow', async () => {
+  const session = completedSession();
+  const db = new FakeFirestore();
+  seedCircle(db, session, {
+    challenges: [['focus', challenge(session, 'FOCUS_MINUTES')]],
+  });
+  const originalProgress = {
+    value: Number.MAX_SAFE_INTEGER,
+    updatedAt: session.startedAt,
+    lastEventAt: session.startedAt,
+  };
+  db.seed(progressPath('focus'), originalProgress);
+
+  await processCircle(db, session);
+
+  assert.equal(db.data(progressPath('focus')), originalProgress);
+  assert.equal(db.data(eventPath('focus')), undefined);
+});
+
+test('unsafe existing progress fails closed', async () => {
+  const session = completedSession();
+  const db = new FakeFirestore();
+  seedCircle(db, session, {
+    challenges: [['focus', challenge(session, 'FOCUS_MINUTES')]],
+  });
+  const originalProgress = {
+    value: Number.MAX_SAFE_INTEGER + 1,
+    updatedAt: session.startedAt,
+    lastEventAt: session.startedAt,
+  };
+  db.seed(progressPath('focus'), originalProgress);
+
+  await processCircle(db, session);
+
+  assert.equal(db.data(progressPath('focus')), originalProgress);
+  assert.equal(db.data(eventPath('focus')), undefined);
+});
+
+test('safe current value with unsafe next value fails closed', async () => {
+  const session = completedSession({ durationSeconds: 180 });
+  const db = new FakeFirestore();
+  seedCircle(db, session, {
+    challenges: [['focus', challenge(session, 'FOCUS_MINUTES')]],
+  });
+  const originalProgress = {
+    value: Number.MAX_SAFE_INTEGER - 1,
+    updatedAt: session.startedAt,
+    lastEventAt: session.startedAt,
+  };
+  db.seed(progressPath('focus'), originalProgress);
+
+  await processCircle(db, session);
+
+  assert.equal(db.data(progressPath('focus')), originalProgress);
+  assert.equal(db.data(eventPath('focus')), undefined);
+});
+
+test('overflow in one Challenge does not block another valid Challenge', async () => {
+  const session = completedSession();
+  const db = new FakeFirestore();
+  seedCircle(db, session, {
+    challenges: [
+      ['overflow', challenge(session, 'FOCUS_MINUTES')],
+      ['valid', challenge(session, 'FOCUS_MINUTES')],
+    ],
+  });
+  const originalProgress = {
+    value: Number.MAX_SAFE_INTEGER,
+    updatedAt: session.startedAt,
+    lastEventAt: session.startedAt,
+  };
+  db.seed(progressPath('overflow'), originalProgress);
+
+  await processCircle(db, session);
+
+  assert.equal(db.data(progressPath('overflow')), originalProgress);
+  assert.equal(db.data(eventPath('overflow')), undefined);
+  assert.equal(db.data(progressPath('valid')).value, 1);
+  assert.ok(db.data(eventPath('valid')));
+});
+
 test('malformed progress is not overwritten and does not block processing', async () => {
   const session = completedSession();
   const db = new FakeFirestore();
@@ -738,6 +930,26 @@ test('malformed challenges are ignored without affecting valid challenges', asyn
   assert.equal(db.data(progressPath('bad-window')), undefined);
   assert.equal(db.data(progressPath('bad-time')), undefined);
   assert.equal(db.data(progressPath('valid')).value, 1);
+});
+
+test('exactly 240 eligible Challenges are processed for Focus', async () => {
+  const session = completedSession();
+  const challenges = [];
+  for (let index = 0; index < MAX_CIRCLE_PROGRESS_CHALLENGES; index++) {
+    challenges.push([
+      'focus-' + index,
+      challenge(session, 'FOCUS_MINUTES'),
+    ]);
+  }
+  const db = new FakeFirestore();
+  seedCircle(db, session, { challenges });
+
+  await processCircle(db, session);
+
+  for (let index = 0; index < MAX_CIRCLE_PROGRESS_CHALLENGES; index++) {
+    assert.equal(db.data(progressPath('focus-' + index)).value, 1);
+    assert.ok(db.data(eventPath('focus-' + index)));
+  }
 });
 
 test('write budget overflow gives zero Circle credit but completes Focus', async () => {

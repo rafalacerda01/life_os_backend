@@ -119,9 +119,9 @@ function isEligibleChallenge(challenge, session) {
   );
 }
 
-function validProgressValue(progress) {
+function validProgressUpdate(progress, contribution, completedAt) {
   if (!isPlainObject(progress)) return null;
-  if (!Number.isInteger(progress.value) || progress.value < 0) return null;
+  if (!Number.isSafeInteger(progress.value) || progress.value < 0) return null;
   if (progress.updatedAt !== undefined && !isTimestamp(progress.updatedAt)) {
     return null;
   }
@@ -136,7 +136,15 @@ function validProgressValue(progress) {
     return null;
   }
 
-  return progress.value;
+  const nextValue = progress.value + contribution;
+  if (!Number.isSafeInteger(nextValue)) return null;
+
+  const nextLastEventAt =
+    isTimestamp(progress.lastEventAt) &&
+    progress.lastEventAt.toMillis() > completedAt.toMillis()
+      ? progress.lastEventAt
+      : completedAt;
+  return Object.freeze({ nextValue, nextLastEventAt });
 }
 
 function emptyPlan() {
@@ -206,10 +214,17 @@ export async function readCircleProgressPlan({
 
     if (eventSnapshot.exists) continue;
 
-    let currentValue = 0;
+    let progressUpdate = Object.freeze({
+      nextValue: contribution,
+      nextLastEventAt: session.completedAt,
+    });
     if (progressSnapshot.exists) {
-      currentValue = validProgressValue(progressSnapshot.data());
-      if (currentValue === null) continue;
+      progressUpdate = validProgressUpdate(
+        progressSnapshot.data(),
+        contribution,
+        session.completedAt,
+      );
+      if (progressUpdate === null) continue;
     }
 
     entries.push(
@@ -218,7 +233,8 @@ export async function readCircleProgressPlan({
         eventRef,
         progressRef,
         progressExists: progressSnapshot.exists,
-        nextValue: currentValue + contribution,
+        nextValue: progressUpdate.nextValue,
+        nextLastEventAt: progressUpdate.nextLastEventAt,
         contribution,
       }),
     );
@@ -250,7 +266,7 @@ export function applyCircleProgressPlan({
     const progressData = {
       value: entry.nextValue,
       updatedAt: processedAt,
-      lastEventAt: session.completedAt,
+      lastEventAt: entry.nextLastEventAt,
     };
     if (entry.progressExists) {
       transaction.update(entry.progressRef, progressData);
