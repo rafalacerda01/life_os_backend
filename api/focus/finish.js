@@ -11,6 +11,10 @@ import {
   timestampToIso,
   validateSessionPayload,
 } from './_shared.js';
+import {
+  applyCircleProgressPlan,
+  readCircleProgressPlan,
+} from './_circle_progress.js';
 
 function completedResponse(session, replayed) {
   return {
@@ -22,7 +26,7 @@ function completedResponse(session, replayed) {
   };
 }
 
-async function finishFocus({ body, db, uid }) {
+export async function finishFocus({ body, db, uid }) {
   const { sessionId } = validateSessionPayload(body);
   const userRef = db.collection('users').doc(uid);
   const sessionRef = userRef
@@ -43,67 +47,93 @@ async function finishFocus({ body, db, uid }) {
     const session = sessionSnapshot.data();
     assertStoredSessionIntegrity(session, uid, sessionId);
 
+    let action;
+    let completedSession;
+
     if (session.status === FOCUS_STATUS.COMPLETED) {
       assertCompletedSessionIntegrity(session);
-      return { action: 'REPLAY', session };
-    }
-    if (session.status === FOCUS_STATUS.CANCELLED) {
+      action = 'REPLAY';
+      completedSession = session;
+    } else if (session.status === FOCUS_STATUS.CANCELLED) {
       throw new FocusHttpError(
         409,
         'FOCUS_SESSION_CANCELLED',
         'A sessão Focus foi cancelada.',
       );
-    }
-    if (session.status === FOCUS_STATUS.EXPIRED) {
+    } else if (session.status === FOCUS_STATUS.EXPIRED) {
       throw new FocusHttpError(
         409,
         'FOCUS_SESSION_EXPIRED',
         'A sessão Focus expirou.',
       );
+    } else {
+      if (session.status !== FOCUS_STATUS.RUNNING) throw stateConflict();
+
+      const activeSnapshot = await transaction.get(activeRef);
+      if (!activeSnapshot.exists) throw stateConflict();
+      assertPointerMatchesSession(activeSnapshot.data(), session);
+
+      const now = getNowTimestamp();
+      const finishAction = decideFinishAction({
+        status: session.status,
+        startedAtMillis: session.startedAt.toMillis(),
+        expiresAtMillis: session.expiresAt.toMillis(),
+        plannedDurationSeconds: session.plannedDurationSeconds,
+        nowMillis: now.toMillis(),
+      });
+
+      if (finishAction === 'NOT_READY') {
+        throw new FocusHttpError(
+          409,
+          'SESSION_NOT_READY',
+          'A duração planejada ainda não foi concluída.',
+        );
+      }
+      if (finishAction === 'STATE_CONFLICT') throw stateConflict();
+      if (finishAction === 'MARK_EXPIRED') {
+        transaction.update(sessionRef, { status: FOCUS_STATUS.EXPIRED });
+        transaction.delete(activeRef);
+        return { action: 'EXPIRED' };
+      }
+      if (finishAction !== 'COMPLETE') throw stateConflict();
+
+      action = 'COMPLETED';
+      completedSession = {
+        ...session,
+        status: FOCUS_STATUS.COMPLETED,
+        verifiedDurationSeconds: session.plannedDurationSeconds,
+        completedAt: now,
+      };
     }
-    if (session.status !== FOCUS_STATUS.RUNNING) throw stateConflict();
 
-    const activeSnapshot = await transaction.get(activeRef);
-    if (!activeSnapshot.exists) throw stateConflict();
-    assertPointerMatchesSession(activeSnapshot.data(), session);
-
-    const now = getNowTimestamp();
-    const action = decideFinishAction({
-      status: session.status,
-      startedAtMillis: session.startedAt.toMillis(),
-      expiresAtMillis: session.expiresAt.toMillis(),
-      plannedDurationSeconds: session.plannedDurationSeconds,
-      nowMillis: now.toMillis(),
+    const circleProgressPlan = await readCircleProgressPlan({
+      transaction,
+      db,
+      userRef,
+      uid,
+      session: completedSession,
     });
+    const circleProcessedAt =
+      action === 'COMPLETED' ? completedSession.completedAt : getNowTimestamp();
 
-    if (action === 'NOT_READY') {
-      throw new FocusHttpError(
-        409,
-        'SESSION_NOT_READY',
-        'A duração planejada ainda não foi concluída.',
-      );
-    }
-    if (action === 'STATE_CONFLICT') throw stateConflict();
-    if (action === 'MARK_EXPIRED') {
-      transaction.update(sessionRef, { status: FOCUS_STATUS.EXPIRED });
+    // Write phase: all Focus and Circle reads above are complete.
+    if (action === 'COMPLETED') {
+      transaction.update(sessionRef, {
+        status: completedSession.status,
+        verifiedDurationSeconds: completedSession.verifiedDurationSeconds,
+        completedAt: completedSession.completedAt,
+      });
       transaction.delete(activeRef);
-      return { action: 'EXPIRED' };
     }
-    if (action !== 'COMPLETE') throw stateConflict();
-
-    const completedSession = {
-      ...session,
-      status: FOCUS_STATUS.COMPLETED,
-      verifiedDurationSeconds: session.plannedDurationSeconds,
-      completedAt: now,
-    };
-    transaction.update(sessionRef, {
-      status: completedSession.status,
-      verifiedDurationSeconds: completedSession.verifiedDurationSeconds,
-      completedAt: completedSession.completedAt,
+    applyCircleProgressPlan({
+      transaction,
+      plan: circleProgressPlan,
+      uid,
+      session: completedSession,
+      processedAt: circleProcessedAt,
     });
-    transaction.delete(activeRef);
-    return { action: 'COMPLETED', session: completedSession };
+
+    return { action, session: completedSession };
   });
 
   if (result.action === 'EXPIRED') {
