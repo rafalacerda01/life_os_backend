@@ -54,6 +54,7 @@ function isValidCircle(circle) {
   return (
     isPlainObject(circle) &&
     circle.schemaVersion === CIRCLE_SCHEMA_VERSION &&
+    circle.deletionState === undefined &&
     isNonEmptyStringWithin(circle.name, 100) &&
     isNonEmptyStringWithin(circle.description, 500) &&
     isSafeDocumentId(circle.adminId) &&

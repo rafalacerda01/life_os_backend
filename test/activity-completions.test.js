@@ -3,24 +3,57 @@ import test from 'node:test';
 
 import { Timestamp } from 'firebase-admin/firestore';
 
+import { validateHabitPayload } from '../api/activity/_shared.js';
 import taskHandler, {
   completeTaskActivity,
 } from '../api/activity/task-complete.js';
 import habitHandler, {
-  completeHabitActivity,
+  completeHabitActivity as retiredHabitCompletion,
 } from '../api/activity/habit-complete.js';
 import {
   ACTIVITY_EVENT_SOURCE,
   ACTIVITY_EVENT_TYPES,
   habitEventId,
+  recordVerifiedActivity,
   taskEventId,
+  utcDayKey,
 } from '../api/activity/_verified_events.js';
+import {
+  syncHabitCompletionUpdate,
+  syncHabitUpdate,
+  syncTaskUpdate,
+} from '../api/activity/_sync_updates.js';
 
 const UID = 'user-1';
 const TASK_ID = 'task-1';
 const HABIT_ID = 'habit-1';
+const HABIT_COMPLETION_ID = '7d287d4e-190f-42ab-90a8-a93696f8c462';
 const TASK_NOW = Timestamp.fromDate(new Date('2026-08-18T12:34:56.000Z'));
 const HABIT_NOW = Timestamp.fromDate(new Date('2026-08-18T23:59:59.000Z'));
+
+async function completeHabitActivity({ body, db, uid, now }) {
+  const { habitId } = validateHabitPayload(body);
+  const dayKey = utcDayKey(now);
+  const result = await recordVerifiedActivity({
+    db,
+    uid,
+    resourceId: habitId,
+    resourceKind: 'habit',
+    type: ACTIVITY_EVENT_TYPES.HABIT,
+    eventId: habitEventId(habitId, dayKey),
+    dayKey,
+    now,
+  });
+  return {
+    body: {
+      type: ACTIVITY_EVENT_TYPES.HABIT,
+      resourceId: habitId,
+      dayKey,
+      occurredAt: result.event.occurredAt.toDate().toISOString(),
+      replayed: result.replayed,
+    },
+  };
+}
 
 class FakeDocumentReference {
   constructor(db, path) {
@@ -73,16 +106,32 @@ class FakeTransaction {
   create(ref, data) {
     this.hasWritten = true;
     this.operations.push({ type: 'write', operation: 'create', path: ref.path });
-    this.writes.push({ ref, data });
+    this.writes.push({ type: 'create', ref, data });
+  }
+
+  update(ref, data) {
+    this.hasWritten = true;
+    this.operations.push({ type: 'write', operation: 'update', path: ref.path });
+    this.writes.push({ type: 'update', ref, data });
   }
 
   commit() {
     const nextStore = new Map(this.db.store);
     for (const write of this.writes) {
-      if (nextStore.has(write.ref.path)) {
-        throw new Error(`already exists: ${write.ref.path}`);
+      if (write.type === 'create') {
+        if (nextStore.has(write.ref.path)) {
+          throw new Error(`already exists: ${write.ref.path}`);
+        }
+        nextStore.set(write.ref.path, write.data);
+      } else {
+        if (!nextStore.has(write.ref.path)) {
+          throw new Error(`missing update: ${write.ref.path}`);
+        }
+        nextStore.set(write.ref.path, {
+          ...nextStore.get(write.ref.path),
+          ...write.data,
+        });
       }
-      nextStore.set(write.ref.path, write.data);
     }
     this.db.store = nextStore;
   }
@@ -119,7 +168,7 @@ function validTask(overrides = {}) {
   return {
     title: 'Ship verified activity',
     priority: 'high',
-    isCompleted: false,
+    isCompleted: true,
     date: Timestamp.fromDate(new Date('2026-08-20T09:00:00.000Z')),
     ...overrides,
   };
@@ -128,7 +177,7 @@ function validTask(overrides = {}) {
 function validHabit(overrides = {}) {
   return {
     title: 'Read every day',
-    completedDates: ['2026-08-17'],
+    completedDates: ['2026-08-18', '2026-08-19'],
     ...overrides,
   };
 }
@@ -168,6 +217,10 @@ function habitPath(habitId = HABIT_ID) {
 
 function activityPath(eventId) {
   return `users/${UID}/verified_activity_events/${eventId}`;
+}
+
+function activityOperationPath(operationId = HABIT_COMPLETION_ID) {
+  return `users/${UID}/verified_activity_operations/${operationId}`;
 }
 
 function seedTask(db, { user = {}, task = validTask(), taskId = TASK_ID } = {}) {
@@ -326,6 +379,32 @@ test('TASK with invalid priority fails closed', async () => {
   );
 });
 
+test('TASK isCompleted=false creates no event or progress', async () => {
+  const db = new FakeFirestore();
+  seedTask(db, { task: validTask({ isCompleted: false }) });
+
+  await expectActivityError(
+    completeTaskActivity({ body: { taskId: TASK_ID }, db, uid: UID, now: TASK_NOW }),
+    409,
+    'ACTIVITY_RESOURCE_STATE_CONFLICT',
+  );
+  assert.equal(db.data(activityPath(taskEventId(TASK_ID))), undefined);
+});
+
+test('TASK without isCompleted creates no event or progress', async () => {
+  const db = new FakeFirestore();
+  const task = validTask();
+  delete task.isCompleted;
+  seedTask(db, { task });
+
+  await expectActivityError(
+    completeTaskActivity({ body: { taskId: TASK_ID }, db, uid: UID, now: TASK_NOW }),
+    409,
+    'ACTIVITY_RESOURCE_STATE_CONFLICT',
+  );
+  assert.equal(db.data(activityPath(taskEventId(TASK_ID))), undefined);
+});
+
 test('two logical TASK executions persist exactly one event', async () => {
   const db = new FakeFirestore();
   seedTask(db);
@@ -340,12 +419,12 @@ test('two logical TASK executions persist exactly one event', async () => {
 
 test('TASK event never changes personal isCompleted', async () => {
   const db = new FakeFirestore();
-  const task = validTask({ isCompleted: false });
+  const task = validTask({ isCompleted: true });
   seedTask(db, { task });
 
   await completeTaskActivity({ body: { taskId: TASK_ID }, db, uid: UID, now: TASK_NOW });
 
-  assert.equal(db.data(taskPath()).isCompleted, false);
+  assert.equal(db.data(taskPath()).isCompleted, true);
   assert.deepEqual(db.data(taskPath()), task);
 });
 
@@ -499,6 +578,23 @@ test('HABIT with malformed completedDates fails closed', async () => {
   }
 });
 
+test('HABIT without the server dayKey creates no event or progress', async () => {
+  const db = new FakeFirestore();
+  seedHabit(db, {
+    habit: validHabit({ completedDates: ['2026-08-17'] }),
+  });
+
+  await expectActivityError(
+    completeHabitActivity({ body: { habitId: HABIT_ID }, db, uid: UID, now: HABIT_NOW }),
+    409,
+    'ACTIVITY_RESOURCE_STATE_CONFLICT',
+  );
+  assert.equal(
+    db.data(activityPath(habitEventId(HABIT_ID, '2026-08-18'))),
+    undefined,
+  );
+});
+
 test('retroactive HABIT history creates no additional events', async () => {
   const db = new FakeFirestore();
   seedHabit(db, {
@@ -513,7 +609,7 @@ test('retroactive HABIT history creates no additional events', async () => {
 
 test('HABIT event never changes completedDates', async () => {
   const db = new FakeFirestore();
-  const habit = validHabit({ completedDates: ['2026-08-01'] });
+  const habit = validHabit({ completedDates: ['2026-08-18'] });
   seedHabit(db, { habit });
 
   await completeHabitActivity({ body: { habitId: HABIT_ID }, db, uid: UID, now: HABIT_NOW });
@@ -642,7 +738,26 @@ test('activity endpoint modules export runtime handlers', () => {
   assert.equal(typeof taskHandler, 'function');
   assert.equal(typeof habitHandler, 'function');
   assert.equal(typeof completeTaskActivity, 'function');
-  assert.equal(typeof completeHabitActivity, 'function');
+  assert.equal(typeof retiredHabitCompletion, 'function');
+});
+
+test('legacy HABIT completion is retired before any Firestore access', async () => {
+  const db = new FakeFirestore();
+  seedHabit(db);
+
+  await expectActivityError(
+    retiredHabitCompletion({
+      body: { habitId: HABIT_ID },
+      db,
+      uid: UID,
+      now: HABIT_NOW,
+    }),
+    410,
+    'HABIT_ACTIVITY_ENDPOINT_RETIRED',
+  );
+
+  assert.equal(db.transactions.length, 0);
+  assert.equal(countEvents(db), 0);
 });
 
 test('HABIT replay rejects occurredAt from the previous UTC day', async () => {
@@ -788,6 +903,235 @@ test('TASK replay accepts stored occurredAt at or before now', async () => {
     assert.equal(result.body.occurredAt, occurredAt.toDate().toISOString());
     assert.equal(db.transactions[0].writes.length, 0);
   }
+});
+
+test('sync TASK false confirms remote state without competitive event', async () => {
+  const db = new FakeFirestore();
+  seedTask(db, { task: validTask({ isCompleted: true }) });
+
+  const result = await syncTaskUpdate({
+    body: { operation: 'update_task', taskId: TASK_ID, isCompleted: false },
+    db,
+    uid: UID,
+    now: TASK_NOW,
+  });
+
+  assert.equal(result.body.activityRecorded, false);
+  assert.equal(db.data(taskPath()).isCompleted, false);
+  assert.equal(db.data(activityPath(taskEventId(TASK_ID))), undefined);
+});
+
+test('sync TASK true confirms state and records one idempotent event', async () => {
+  const db = new FakeFirestore();
+  seedTask(db, { task: validTask({ isCompleted: false }) });
+
+  const first = await syncTaskUpdate({
+    body: { operation: 'update_task', taskId: TASK_ID, isCompleted: true },
+    db,
+    uid: UID,
+    now: TASK_NOW,
+  });
+  const replay = await syncTaskUpdate({
+    body: { operation: 'update_task', taskId: TASK_ID, isCompleted: true },
+    db,
+    uid: UID,
+    now: TASK_NOW,
+  });
+
+  assert.equal(first.body.activityRecorded, true);
+  assert.equal(first.body.replayed, false);
+  assert.equal(replay.body.replayed, true);
+  assert.equal(countEvents(db), 1);
+});
+
+test('normal HABIT updates never create competitive activity', async () => {
+  const db = new FakeFirestore();
+  seedHabit(db, { habit: validHabit({ completedDates: [] }) });
+
+  const historical = await syncHabitUpdate({
+    body: {
+      operation: 'update_habit',
+      habitId: HABIT_ID,
+      completedDates: ['2026-08-17'],
+    },
+    db,
+    uid: UID,
+    now: HABIT_NOW,
+  });
+  const matrixToday = await syncHabitUpdate({
+    body: {
+      operation: 'update_habit',
+      habitId: HABIT_ID,
+      completedDates: ['2026-08-18'],
+    },
+    db,
+    uid: UID,
+    now: HABIT_NOW,
+  });
+
+  assert.equal(historical.body.activityRecorded, false);
+  assert.equal(matrixToday.body.activityRecorded, false);
+  assert.deepEqual(db.data(habitPath()).completedDates, ['2026-08-18']);
+  assert.equal(countEvents(db), 0);
+  assert.equal(db.data(activityOperationPath()), undefined);
+});
+
+test('first HABIT completion after UTC midnight records exactly one server-day event', async () => {
+  const db = new FakeFirestore();
+  seedHabit(db, { habit: validHabit({ completedDates: [] }) });
+  const afterMidnight = Timestamp.fromDate(
+    new Date('2026-08-24T00:05:00.000Z'),
+  );
+
+  const result = await syncHabitCompletionUpdate({
+    body: {
+      operation: 'update_habit_completion',
+      habitId: HABIT_ID,
+      completedDates: ['2026-08-23'],
+      competitiveCompletionId: HABIT_COMPLETION_ID,
+    },
+    db,
+    uid: UID,
+    now: afterMidnight,
+  });
+
+  assert.equal(result.body.activityRecorded, true);
+  assert.equal(countEvents(db), 1);
+  assert.ok(db.data(activityPath(habitEventId(HABIT_ID, '2026-08-24'))));
+  assert.equal(
+    db.data(activityPath(habitEventId(HABIT_ID, '2026-08-23'))),
+    undefined,
+  );
+  assert.equal(db.data(activityOperationPath()).dayKey, '2026-08-24');
+});
+
+test('HABIT completion retry on the same day is receipt-idempotent', async () => {
+  const db = new FakeFirestore();
+  seedHabit(db, { habit: validHabit({ completedDates: [] }) });
+  const body = {
+    operation: 'update_habit_completion',
+    habitId: HABIT_ID,
+    completedDates: ['2026-08-18'],
+    competitiveCompletionId: HABIT_COMPLETION_ID,
+  };
+
+  await syncHabitCompletionUpdate({ body, db, uid: UID, now: HABIT_NOW });
+  const replay = await syncHabitCompletionUpdate({
+    body,
+    db,
+    uid: UID,
+    now: Timestamp.fromDate(new Date('2026-08-18T23:59:59.999Z')),
+  });
+
+  assert.equal(replay.body.replayed, true);
+  assert.equal(countEvents(db), 1);
+  assert.equal(db.transactions[1].writes.length, 0);
+});
+
+test('HABIT completion retry after UTC midnight never creates a new-day event', async () => {
+  const db = new FakeFirestore();
+  seedHabit(db, { habit: validHabit({ completedDates: [] }) });
+  const body = {
+    operation: 'update_habit_completion',
+    habitId: HABIT_ID,
+    completedDates: ['2026-08-18'],
+    competitiveCompletionId: HABIT_COMPLETION_ID,
+  };
+
+  await syncHabitCompletionUpdate({ body, db, uid: UID, now: HABIT_NOW });
+  const replay = await syncHabitCompletionUpdate({
+    body,
+    db,
+    uid: UID,
+    now: Timestamp.fromDate(new Date('2026-08-19T00:05:00.000Z')),
+  });
+
+  assert.equal(replay.body.replayed, true);
+  assert.equal(countEvents(db), 1);
+  assert.ok(db.data(activityPath(habitEventId(HABIT_ID, '2026-08-18'))));
+  assert.equal(
+    db.data(activityPath(habitEventId(HABIT_ID, '2026-08-19'))),
+    undefined,
+  );
+  assert.equal(db.transactions[1].writes.length, 0);
+});
+
+test('invalid HABIT competitive transition fails closed without activity', async () => {
+  for (const completedDates of [
+    [],
+    ['2026-08-17', '2026-08-18'],
+    ['2026-08-18', '2026-08-18'],
+  ]) {
+    const db = new FakeFirestore();
+    seedHabit(db, { habit: validHabit({ completedDates: [] }) });
+
+    await expectActivityError(
+      syncHabitCompletionUpdate({
+        body: {
+          operation: 'update_habit_completion',
+          habitId: HABIT_ID,
+          completedDates,
+          competitiveCompletionId: HABIT_COMPLETION_ID,
+        },
+        db,
+        uid: UID,
+        now: HABIT_NOW,
+      }),
+      409,
+      'ACTIVITY_RESOURCE_STATE_CONFLICT',
+    );
+    assert.equal(countEvents(db), 0);
+    assert.equal(db.data(activityOperationPath()), undefined);
+  }
+});
+
+test('HABIT completion receipt rejects payload mutation on replay', async () => {
+  const db = new FakeFirestore();
+  seedHabit(db, { habit: validHabit({ completedDates: [] }) });
+  const body = {
+    operation: 'update_habit_completion',
+    habitId: HABIT_ID,
+    completedDates: ['2026-08-18'],
+    competitiveCompletionId: HABIT_COMPLETION_ID,
+  };
+  await syncHabitCompletionUpdate({ body, db, uid: UID, now: HABIT_NOW });
+
+  await expectActivityError(
+    syncHabitCompletionUpdate({
+      body: { ...body, completedDates: ['2026-08-19'] },
+      db,
+      uid: UID,
+      now: Timestamp.fromDate(new Date('2026-08-19T12:00:00.000Z')),
+    }),
+    409,
+    'ACTIVITY_OPERATION_STATE_CONFLICT',
+  );
+  assert.deepEqual(db.data(habitPath()).completedDates, ['2026-08-18']);
+  assert.equal(countEvents(db), 1);
+});
+
+test('rejected competitive sync payload performs no write', async () => {
+  const db = new FakeFirestore();
+  seedTask(db, { task: validTask({ isCompleted: false }) });
+
+  await expectActivityError(
+    syncTaskUpdate({
+      body: {
+        operation: 'update_task',
+        taskId: TASK_ID,
+        isCompleted: true,
+        uid: 'attacker',
+      },
+      db,
+      uid: UID,
+      now: TASK_NOW,
+    }),
+    400,
+    'INVALID_SYNC_PAYLOAD',
+  );
+  assert.equal(db.transactions.length, 0);
+  assert.equal(db.data(taskPath()).isCompleted, false);
+  assert.equal(countEvents(db), 0);
 });
 
 function countEvents(db) {

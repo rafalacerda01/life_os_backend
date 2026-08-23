@@ -1,44 +1,16 @@
 import {
+  ActivityHttpError,
   createActivityHandler,
-  getNowTimestamp,
-  timestampToIso,
   validateHabitPayload,
 } from './_shared.js';
-import {
-  ACTIVITY_EVENT_TYPES,
-  habitEventId,
-  recordVerifiedActivity,
-  utcDayKey,
-} from './_verified_events.js';
 
-export async function completeHabitActivity({
-  body,
-  db,
-  uid,
-  now = getNowTimestamp(),
-}) {
-  const { habitId } = validateHabitPayload(body);
-  const dayKey = utcDayKey(now);
-  const result = await recordVerifiedActivity({
-    db,
-    uid,
-    resourceId: habitId,
-    resourceKind: 'habit',
-    type: ACTIVITY_EVENT_TYPES.HABIT,
-    eventId: habitEventId(habitId, dayKey),
-    dayKey,
-    now,
-  });
-
-  return {
-    body: {
-      type: ACTIVITY_EVENT_TYPES.HABIT,
-      resourceId: habitId,
-      dayKey,
-      occurredAt: timestampToIso(result.event.occurredAt),
-      replayed: result.replayed,
-    },
-  };
+export async function completeHabitActivity({ body }) {
+  validateHabitPayload(body);
+  throw new ActivityHttpError(
+    410,
+    'HABIT_ACTIVITY_ENDPOINT_RETIRED',
+    'Use a sincronizacao de conclusao de habito.',
+  );
 }
 
 export default createActivityHandler(

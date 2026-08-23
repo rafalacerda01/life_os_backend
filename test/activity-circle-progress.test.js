@@ -3,13 +3,21 @@ import test from 'node:test';
 
 import { Timestamp } from 'firebase-admin/firestore';
 
-import { completeHabitActivity } from '../api/activity/habit-complete.js';
+import {
+  completeHabitActivity as retiredHabitCompletion,
+} from '../api/activity/habit-complete.js';
 import { completeTaskActivity } from '../api/activity/task-complete.js';
 import { MAX_CIRCLE_PROGRESS_CHALLENGES } from '../api/activity/_circle_progress.js';
+import {
+  syncHabitCompletionUpdate,
+  syncHabitUpdate,
+  syncTaskUpdate,
+} from '../api/activity/_sync_updates.js';
 import {
   ACTIVITY_EVENT_SOURCE,
   ACTIVITY_EVENT_TYPES,
   habitEventId,
+  recordVerifiedActivity,
   taskEventId,
   utcDayKey,
 } from '../api/activity/_verified_events.js';
@@ -179,7 +187,7 @@ function validTask(overrides = {}) {
   return {
     title: 'Complete secure task',
     priority: 'high',
-    isCompleted: false,
+    isCompleted: true,
     ...overrides,
   };
 }
@@ -187,7 +195,7 @@ function validTask(overrides = {}) {
 function validHabit(overrides = {}) {
   return {
     title: 'Complete secure habit',
-    completedDates: ['2026-08-17'],
+    completedDates: ['2026-08-18'],
     ...overrides,
   };
 }
@@ -251,12 +259,26 @@ async function complete(fixture, now = EVENT_AT) {
       now,
     });
   }
-  return completeHabitActivity({
-    body: { habitId: HABIT_ID },
+  const dayKey = utcDayKey(now);
+  const result = await recordVerifiedActivity({
     db: fixture.db,
     uid: UID,
+    resourceId: HABIT_ID,
+    resourceKind: 'habit',
+    type: ACTIVITY_EVENT_TYPES.HABIT,
+    eventId: habitEventId(HABIT_ID, dayKey),
+    dayKey,
     now,
   });
+  return {
+    body: {
+      type: ACTIVITY_EVENT_TYPES.HABIT,
+      resourceId: HABIT_ID,
+      dayKey,
+      occurredAt: result.event.occurredAt.toDate().toISOString(),
+      replayed: result.replayed,
+    },
+  };
 }
 
 function activityId(kind, occurredAt = EVENT_AT) {
@@ -637,13 +659,13 @@ test('verified event and Circle writes share one logical commit', async () => {
 
 test('personal Task isCompleted remains untouched', async () => {
   const fixture = createFixture({
-    resourceOverrides: { isCompleted: false },
+    resourceOverrides: { isCompleted: true },
     challenges: [['task', challenge('TASK_COMPLETIONS')]],
   });
   const before = fixture.db.data(`users/${UID}/tasks/${TASK_ID}`);
   await complete(fixture);
   assert.equal(fixture.db.data(`users/${UID}/tasks/${TASK_ID}`), before);
-  assert.equal(before.isCompleted, false);
+  assert.equal(before.isCompleted, true);
 });
 
 test('personal Habit completedDates remains untouched', async () => {
@@ -654,7 +676,7 @@ test('personal Habit completedDates remains untouched', async () => {
   const before = fixture.db.data(`users/${UID}/habits/${HABIT_ID}`);
   await complete(fixture);
   assert.equal(fixture.db.data(`users/${UID}/habits/${HABIT_ID}`), before);
-  assert.deepEqual(before.completedDates, ['2026-08-17']);
+  assert.deepEqual(before.completedDates, ['2026-08-18']);
 });
 
 test('tasksCount and habitsCount remain untouched', async () => {
@@ -855,4 +877,163 @@ test('equal progress lastEventAt stays equal and increments only once', async ()
 
   assert.equal(fixture.db.data(progressPath('task')).value, 12);
   assert.equal(fixture.db.data(progressPath('task')).lastEventAt, EVENT_AT);
+});
+
+test('sync update confirms Task before verified event and Circle progress', async () => {
+  const fixture = createFixture({
+    resourceOverrides: { isCompleted: false },
+    challenges: [['task', challenge('TASK_COMPLETIONS')]],
+  });
+
+  const result = await syncTaskUpdate({
+    body: { operation: 'update_task', taskId: TASK_ID, isCompleted: true },
+    db: fixture.db,
+    uid: UID,
+    now: EVENT_AT,
+  });
+
+  assert.equal(result.body.activityRecorded, true);
+  assert.equal(fixture.db.data(`users/${UID}/tasks/${TASK_ID}`).isCompleted, true);
+  assert.ok(fixture.db.data(activityPath('task')));
+  assert.equal(fixture.db.data(progressPath('task')).value, 1);
+  assert.ok(fixture.db.data(processedPath('task')));
+});
+
+test('rejected sync payload produces no event or Circle progress', async () => {
+  const fixture = createFixture({
+    resourceOverrides: { isCompleted: false },
+    challenges: [['task', challenge('TASK_COMPLETIONS')]],
+  });
+
+  await assert.rejects(
+    syncTaskUpdate({
+      body: {
+        operation: 'update_task',
+        taskId: TASK_ID,
+        isCompleted: true,
+        uid: 'attacker',
+      },
+      db: fixture.db,
+      uid: UID,
+      now: EVENT_AT,
+    }),
+    (error) => error.code === 'INVALID_SYNC_PAYLOAD',
+  );
+
+  assert.equal(fixture.db.data(activityPath('task')), undefined);
+  assert.equal(fixture.db.data(progressPath('task')), undefined);
+  assert.equal(fixture.db.data(processedPath('task')), undefined);
+});
+
+test('weekly matrix HABIT update cannot create competitive progress', async () => {
+  const fixture = createFixture({
+    kind: 'habit',
+    resourceOverrides: { completedDates: [] },
+    challenges: [['habit', challenge('HABIT_COMPLETIONS')]],
+  });
+
+  const result = await syncHabitUpdate({
+    body: {
+      operation: 'update_habit',
+      habitId: HABIT_ID,
+      completedDates: ['2026-08-18'],
+    },
+    db: fixture.db,
+    uid: UID,
+    now: EVENT_AT,
+  });
+
+  assert.equal(result.body.activityRecorded, false);
+  assert.equal(fixture.db.data(activityPath('habit')), undefined);
+  assert.equal(fixture.db.data(progressPath('habit')), undefined);
+  assert.equal(fixture.db.data(processedPath('habit', 'habit')), undefined);
+});
+
+test('legacy HABIT endpoint cannot promote a normal update to competition', async () => {
+  const fixture = createFixture({
+    kind: 'habit',
+    resourceOverrides: { completedDates: [] },
+    challenges: [['habit', challenge('HABIT_COMPLETIONS')]],
+  });
+
+  const normalUpdate = await syncHabitUpdate({
+    body: {
+      operation: 'update_habit',
+      habitId: HABIT_ID,
+      completedDates: ['2026-08-18'],
+    },
+    db: fixture.db,
+    uid: UID,
+    now: EVENT_AT,
+  });
+  await assert.rejects(
+    retiredHabitCompletion({
+      body: { habitId: HABIT_ID },
+      db: fixture.db,
+      uid: UID,
+      now: EVENT_AT,
+    }),
+    (error) =>
+      error.statusCode === 410 &&
+      error.code === 'HABIT_ACTIVITY_ENDPOINT_RETIRED',
+  );
+
+  assert.equal(normalUpdate.body.activityRecorded, false);
+  assert.deepEqual(
+    fixture.db.data(`users/${UID}/habits/${HABIT_ID}`).completedDates,
+    ['2026-08-18'],
+  );
+  assert.equal(fixture.db.data(activityPath('habit')), undefined);
+  assert.equal(fixture.db.data(progressPath('habit')), undefined);
+  assert.equal(fixture.db.data(processedPath('habit', 'habit')), undefined);
+});
+
+test('HABIT completion retry across UTC midnight never duplicates progress', async () => {
+  const beforeMidnight = Timestamp.fromDate(
+    new Date('2026-08-18T23:59:59.000Z'),
+  );
+  const afterMidnight = Timestamp.fromDate(
+    new Date('2026-08-19T00:05:00.000Z'),
+  );
+  const fixture = createFixture({
+    kind: 'habit',
+    resourceOverrides: { completedDates: [] },
+    challenges: [
+      [
+        'habit',
+        challenge('HABIT_COMPLETIONS', {
+          startAt: Timestamp.fromDate(new Date('2026-08-18T00:00:00.000Z')),
+          endAt: Timestamp.fromDate(new Date('2026-08-19T23:59:59.000Z')),
+        }),
+      ],
+    ],
+  });
+  const body = {
+    operation: 'update_habit_completion',
+    habitId: HABIT_ID,
+    completedDates: ['2026-08-18'],
+    competitiveCompletionId: '7d287d4e-190f-42ab-90a8-a93696f8c462',
+  };
+
+  await syncHabitCompletionUpdate({
+    body,
+    db: fixture.db,
+    uid: UID,
+    now: beforeMidnight,
+  });
+  const replay = await syncHabitCompletionUpdate({
+    body,
+    db: fixture.db,
+    uid: UID,
+    now: afterMidnight,
+  });
+
+  assert.equal(replay.body.replayed, true);
+  assert.equal(fixture.db.data(progressPath('habit')).value, 1);
+  assert.ok(fixture.db.data(activityPath('habit', beforeMidnight)));
+  assert.equal(fixture.db.data(activityPath('habit', afterMidnight)), undefined);
+  assert.ok(
+    fixture.db.data(processedPath('habit', 'habit', beforeMidnight)),
+  );
+  assert.equal(fixture.db.transactions[1].writes.length, 0);
 });

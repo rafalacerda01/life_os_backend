@@ -4,6 +4,12 @@ import {
   getFirestore,
   FieldValue,
 } from 'firebase-admin/firestore';
+import { ActivityHttpError } from './activity/_shared.js';
+import {
+  syncHabitCompletionUpdate,
+  syncHabitUpdate,
+  syncTaskUpdate,
+} from './activity/_sync_updates.js';
 // ============================================================================
 // LIFE OS - SYNC ENDPOINT
 // ============================================================================
@@ -2502,6 +2508,41 @@ export default async function handler(req, res) {
     // ------------------------------------------------------------------------
 
     const operation = rawBody.operation;
+    if (
+      operation === 'update_task' ||
+      operation === 'update_habit' ||
+      operation === 'update_habit_completion'
+    ) {
+      try {
+        let result;
+        if (operation === 'update_task') {
+          result = await syncTaskUpdate({ body: rawBody, db, uid: userId });
+        } else if (operation === 'update_habit_completion') {
+          result = await syncHabitCompletionUpdate({
+            body: rawBody,
+            db,
+            uid: userId,
+          });
+        } else {
+          result = await syncHabitUpdate({ body: rawBody, db, uid: userId });
+        }
+
+        return res.status(200).json(result.body);
+      } catch (error) {
+        console.error('[sync] Falha em update competitivo server-side.');
+        if (error instanceof ActivityHttpError) {
+          return res.status(error.statusCode).json({
+            error: error.message,
+            code: error.code,
+          });
+        }
+        return res.status(500).json({
+          error: 'Nao foi possivel confirmar a atualizacao.',
+          code: 'COMPETITIVE_SYNC_FAILED',
+        });
+      }
+    }
+
     if (operation === 'create_transaction') {
   const validation =
     validateTransactionCreatePayload(
