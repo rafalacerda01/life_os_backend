@@ -1,4 +1,5 @@
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
+import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 
@@ -71,7 +72,7 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Authorization',
+    'Content-Type, Authorization, X-Firebase-AppCheck',
   );
 }
 async function hasAiConsent(userId) {
@@ -253,7 +254,7 @@ function sanitizeUntrustedContext(value, depth = 0) {
 // HANDLER
 // ============================================================================
 
-export default async function handler(req, res) {
+export async function chatHandler(req, res, runtime = {}) {
   applyCors(req, res);
 
   // --------------------------------------------------------------------------
@@ -286,6 +287,38 @@ export default async function handler(req, res) {
   ) {
     return res.status(413).json({
       error: 'Payload excede o limite permitido.',
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // APP CHECK
+  // --------------------------------------------------------------------------
+
+  const rawAppCheckToken = req.headers['x-firebase-appcheck'];
+
+  if (
+    typeof rawAppCheckToken !== 'string' ||
+    rawAppCheckToken.trim().length === 0
+  ) {
+    return res.status(401).json({
+      code: 'APP_CHECK_REQUIRED',
+      error: 'Verificação de segurança do aplicativo necessária.',
+    });
+  }
+
+  const appCheckToken = rawAppCheckToken.trim();
+  const verifyAppCheckToken =
+    runtime.verifyAppCheckToken ??
+    ((token) => getAppCheck().verifyToken(token));
+
+  try {
+    await verifyAppCheckToken(appCheckToken);
+  } catch (_) {
+    console.error('[chat] Falha na verificação do App Check.');
+
+    return res.status(401).json({
+      code: 'APP_CHECK_INVALID',
+      error: 'Verificação de segurança do aplicativo inválida.',
     });
   }
 
@@ -643,3 +676,5 @@ REGRAS DE ESCOPO E SEGURANÇA:
     });
   }
 }
+
+export default chatHandler;
