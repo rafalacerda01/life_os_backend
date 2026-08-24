@@ -49,6 +49,7 @@ const MAX_CONTEXT_DEPTH = 6;
 const MAX_CONTEXT_KEYS = 80;
 const MAX_CONTEXT_ARRAY_ITEMS = 100;
 const MAX_CONTEXT_STRING_LENGTH = 2_000;
+const GEMINI_REQUEST_TIMEOUT_MS = 12_000;
 
 // ============================================================================
 // CORS
@@ -598,43 +599,70 @@ REGRAS DE ESCOPO E SEGURANÇA:
     // ------------------------------------------------------------------------
 
     const fetchRequest = runtime.fetch ?? fetch;
-    const response = await fetchRequest(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent',
-      {
-        method: 'POST',
+    const configuredTimeoutMs = runtime.geminiTimeoutMs;
+    const timeoutMs =
+      Number.isInteger(configuredTimeoutMs) && configuredTimeoutMs > 0
+        ? configuredTimeoutMs
+        : GEMINI_REQUEST_TIMEOUT_MS;
+    const controller = new AbortController();
+    let didTimeout = false;
+    const timeoutId = setTimeout(() => {
+      didTimeout = true;
+      controller.abort();
+    }, timeoutMs);
 
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
+    let response;
+    let data;
+    try {
+      response = await fetchRequest(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent',
+        {
+          method: 'POST',
 
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [
-              {
-                text: systemInstruction,
-              },
-            ],
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': apiKey,
           },
 
-          contents: [
-            {
-              role: 'user',
-
+          body: JSON.stringify({
+            systemInstruction: {
               parts: [
                 {
-                  text:
-                    '[DADOS NÃO CONFIÁVEIS DO USUÁRIO]\n' +
-                    untrustedUserPayload,
+                  text: systemInstruction,
                 },
               ],
             },
-          ],
-        }),
-      },
-    );
 
-    const data = await response.json();
+            contents: [
+              {
+                role: 'user',
+
+                parts: [
+                  {
+                    text:
+                      '[DADOS NÃO CONFIÁVEIS DO USUÁRIO]\n' +
+                      untrustedUserPayload,
+                  },
+                ],
+              },
+            ],
+          }),
+          signal: controller.signal,
+        },
+      );
+      data = await response.json();
+    } catch (error) {
+      if (didTimeout) {
+        console.error('[chat] Timeout na chamada à API do Google.');
+        return res.status(504).json({
+          error: 'O serviço de IA demorou para responder.',
+        });
+      }
+
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     const reply =
       data?.candidates?.[0]?.content?.parts?.[0]?.text;

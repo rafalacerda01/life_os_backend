@@ -309,3 +309,179 @@ test('Chat usa exatamente o endpoint Gemini configurado', async () => {
   );
   assert.equal(response.statusCode, 200);
 });
+
+test('timeout do Gemini aborta o fetch e retorna 504 controlado', async () => {
+  let receivedSignal;
+  let abortObserved = false;
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  try {
+    const response = await invoke(
+      post({
+        'x-firebase-appcheck': APP_CHECK_TOKEN,
+        authorization: 'Bearer firebase-id-token',
+      }),
+      {
+        verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+        verifyIdToken: async () => ({ uid: 'gemini-timeout-test' }),
+        hasAiConsent: async () => true,
+        hasPremiumAccess: async () => true,
+        geminiApiKey: 'test-api-key',
+        geminiTimeoutMs: 5,
+        fetch: async (_, options) => {
+          receivedSignal = options.signal;
+          assert.ok(receivedSignal instanceof AbortSignal);
+
+          return new Promise((_, reject) => {
+            receivedSignal.addEventListener(
+              'abort',
+              () => {
+                abortObserved = true;
+                reject(new Error('abort detail must stay private'));
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+    );
+
+    assert.equal(receivedSignal.aborted, true);
+    assert.equal(abortObserved, true);
+    assert.equal(response.statusCode, 504);
+    assert.deepEqual(response.body, {
+      error: 'O serviço de IA demorou para responder.',
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
+test('timeout do Gemini aborta durante a leitura de response.json', async () => {
+  let receivedSignal;
+  let abortObserved = false;
+  const privateError = 'private response body error';
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  try {
+    const response = await invoke(
+      post({
+        'x-firebase-appcheck': APP_CHECK_TOKEN,
+        authorization: 'Bearer firebase-id-token',
+      }),
+      {
+        verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+        verifyIdToken: async () => ({ uid: 'gemini-json-timeout-test' }),
+        hasAiConsent: async () => true,
+        hasPremiumAccess: async () => true,
+        geminiApiKey: 'test-api-key',
+        geminiTimeoutMs: 5,
+        fetch: async (_, options) => {
+          receivedSignal = options.signal;
+          assert.ok(receivedSignal instanceof AbortSignal);
+
+          return {
+            ok: true,
+            status: 200,
+            json: () =>
+              new Promise((_, reject) => {
+                receivedSignal.addEventListener(
+                  'abort',
+                  () => {
+                    abortObserved = true;
+                    reject(new Error(privateError));
+                  },
+                  { once: true },
+                );
+              }),
+          };
+        },
+      },
+    );
+
+    assert.equal(receivedSignal.aborted, true);
+    assert.equal(abortObserved, true);
+    assert.equal(response.statusCode, 504);
+    assert.deepEqual(response.body, {
+      error: 'O serviço de IA demorou para responder.',
+    });
+    assert.doesNotMatch(JSON.stringify(response.body), new RegExp(privateError));
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
+test('sucesso do Gemini limpa o timer e não aborta depois', async () => {
+  let receivedSignal;
+  const response = await invoke(
+    post({
+      'x-firebase-appcheck': APP_CHECK_TOKEN,
+      authorization: 'Bearer firebase-id-token',
+    }),
+    {
+      verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+      verifyIdToken: async () => ({ uid: 'gemini-timeout-cleanup-test' }),
+      hasAiConsent: async () => true,
+      hasPremiumAccess: async () => true,
+      geminiApiKey: 'test-api-key',
+      geminiTimeoutMs: 5,
+      fetch: async (_, options) => {
+        receivedSignal = options.signal;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [{ text: 'Resposta sem timeout' }],
+                },
+              },
+            ],
+          }),
+        };
+      },
+    },
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body, { reply: 'Resposta sem timeout' });
+  assert.equal(receivedSignal.aborted, false);
+});
+
+test('erro normal do fetch não é classificado como timeout', async () => {
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  try {
+    const response = await invoke(
+      post({
+        'x-firebase-appcheck': APP_CHECK_TOKEN,
+        authorization: 'Bearer firebase-id-token',
+      }),
+      {
+        verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+        verifyIdToken: async () => ({ uid: 'gemini-fetch-error-test' }),
+        hasAiConsent: async () => true,
+        hasPremiumAccess: async () => true,
+        geminiApiKey: 'test-api-key',
+        geminiTimeoutMs: 50,
+        fetch: async () => {
+          throw new Error('private upstream error');
+        },
+      },
+    );
+
+    assert.equal(response.statusCode, 500);
+    assert.deepEqual(response.body, {
+      error: 'Não foi possível processar sua solicitação.',
+    });
+    assert.doesNotMatch(JSON.stringify(response.body), /private upstream error/);
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
