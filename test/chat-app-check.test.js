@@ -133,6 +133,89 @@ test('App Check válido permite continuar para Firebase Auth', async () => {
   assert.match(response.body.error, /Token de segurança ausente/);
 });
 
+test('Chat verifica Auth válido com checkRevoked=true após App Check', async () => {
+  const verifyCalls = [];
+  const response = await invoke(
+    post({
+      'x-firebase-appcheck': APP_CHECK_TOKEN,
+      authorization: 'Bearer firebase-id-token',
+    }),
+    {
+      verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+      verifyIdToken: async (token, checkRevoked) => {
+        verifyCalls.push({ token, checkRevoked });
+        return { uid: 'chat-revocation-check' };
+      },
+      hasAiConsent: async () => false,
+    },
+  );
+
+  assert.deepEqual(verifyCalls, [
+    { token: 'firebase-id-token', checkRevoked: true },
+  ]);
+  assert.equal(response.statusCode, 451);
+});
+
+test('Chat rejeita token Auth revogado com resposta sanitizada', async () => {
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  try {
+    const response = await invoke(
+      post({
+        'x-firebase-appcheck': APP_CHECK_TOKEN,
+        authorization: 'Bearer firebase-id-token-secret',
+      }),
+      {
+        verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+        verifyIdToken: async () => {
+          throw new Error(
+            'firebase-id-token-secret sensitive-uid user@example.com stack',
+          );
+        },
+      },
+    );
+
+    assert.equal(response.statusCode, 401);
+    assert.doesNotMatch(
+      JSON.stringify(response.body),
+      /firebase-id-token-secret|sensitive-uid|example\.com|stack/i,
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
+test('App Check inválido impede qualquer chamada ao Auth', async () => {
+  let authCalls = 0;
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  try {
+    const response = await invoke(
+      post({
+        'x-firebase-appcheck': APP_CHECK_TOKEN,
+        authorization: 'Bearer firebase-id-token',
+      }),
+      {
+        verifyAppCheckToken: async () => {
+          throw new Error('invalid App Check');
+        },
+        verifyIdToken: async () => {
+          authCalls += 1;
+          return { uid: 'must-not-run' };
+        },
+      },
+    );
+
+    assert.equal(response.statusCode, 401);
+    assert.equal(response.body.code, 'APP_CHECK_INVALID');
+    assert.equal(authCalls, 0);
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
 test('OPTIONS retorna 204 sem exigir App Check', async () => {
   let verificationCalls = 0;
   const response = await invoke(

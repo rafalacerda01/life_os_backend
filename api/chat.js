@@ -348,9 +348,13 @@ export async function chatHandler(req, res, runtime = {}) {
   }
 
   let decodedToken;
+  const verifyIdToken =
+    runtime.verifyIdToken ??
+    ((token, checkRevoked) =>
+      getAuth().verifyIdToken(token, checkRevoked));
 
   try {
-    decodedToken = await getAuth().verifyIdToken(idToken);
+    decodedToken = await verifyIdToken(idToken, true);
   } catch (error) {
     console.error(
       'Falha na verificação do token Firebase:',
@@ -371,7 +375,7 @@ export async function chatHandler(req, res, runtime = {}) {
 let consentGranted;
 
 try {
-  consentGranted = await hasAiConsent(userId);
+  consentGranted = await (runtime.hasAiConsent ?? hasAiConsent)(userId);
 } catch (error) {
   console.error(
     'Falha ao verificar consentimento da IA:',

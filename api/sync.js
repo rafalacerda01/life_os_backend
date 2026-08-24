@@ -2387,7 +2387,7 @@ async function deleteHabitWithQuota({
 // HANDLER
 // ============================================================================
 
-export default async function handler(req, res) {
+export async function syncHandler(req, res, runtime = {}) {
   applyCors(req, res);
 
   // --------------------------------------------------------------------------
@@ -2454,10 +2454,14 @@ export default async function handler(req, res) {
   }
 
   let decodedToken;
+  const verifyIdToken =
+    runtime.verifyIdToken ??
+    ((idToken, checkRevoked) =>
+      getAuth().verifyIdToken(idToken, checkRevoked));
 
   try {
     decodedToken =
-      await getAuth().verifyIdToken(token);
+      await verifyIdToken(token, true);
   } catch (error) {
     console.error(
       'Erro ao verificar o token Firebase:',
@@ -3218,3 +3222,5 @@ if (operation === 'delete_task') {
     });
   }
 }
+
+export default syncHandler;

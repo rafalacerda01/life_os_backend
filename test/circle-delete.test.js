@@ -369,6 +369,35 @@ test('second call after completion returns stable CIRCLE_NOT_FOUND', async () =>
   assert.equal(db.data(markerPath()), undefined);
 });
 
+test('Circle continua verificando o ID token com checkRevoked=true', async () => {
+  const db = seedCircle(new FakeFirestore());
+  const verifyCalls = [];
+  const response = await invoke(
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer circle-token',
+      },
+      body: { circleId: CIRCLE_ID },
+    },
+    {
+      auth: {
+        verifyIdToken: async (token, checkRevoked) => {
+          verifyCalls.push({ token, checkRevoked });
+          return { uid: ADMIN_UID };
+        },
+      },
+      db,
+    },
+  );
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(verifyCalls, [
+    { token: 'circle-token', checkRevoked: true },
+  ]);
+});
+
 test('handler takes uid only from verified token and validates JSON body', async () => {
   const db = seedCircle(new FakeFirestore());
   const response = await invoke(

@@ -464,7 +464,7 @@ function sendError(res, error, fallbackCode) {
 }
 
 export function createFocusHandler(operation, fallbackCode, execute) {
-  return async function focusHandler(req, res) {
+  return async function focusHandler(req, res, runtime = {}) {
     applyCors(req, res);
     if (req.method === 'OPTIONS') return res.status(204).end();
     if (req.method !== 'POST') {
@@ -477,10 +477,12 @@ export function createFocusHandler(operation, fallbackCode, execute) {
     try {
       assertBodyWithinLimit(req);
       const token = extractBearerToken(req);
-      const { auth, db: firestore } = getFirebaseServices();
+      const { auth, db: firestore } = (
+        runtime.getServices ?? getFirebaseServices
+      )();
       let decodedToken;
       try {
-        decodedToken = await auth.verifyIdToken(token);
+        decodedToken = await auth.verifyIdToken(token, true);
       } catch (_) {
         throw new FocusHttpError(
           401,
