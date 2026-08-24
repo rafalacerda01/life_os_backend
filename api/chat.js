@@ -355,11 +355,8 @@ export async function chatHandler(req, res, runtime = {}) {
 
   try {
     decodedToken = await verifyIdToken(idToken, true);
-  } catch (error) {
-    console.error(
-      'Falha na verificação do token Firebase:',
-      error?.message ?? 'unknown_error',
-    );
+  } catch (_) {
+    console.error('[chat] Falha ao verificar Firebase Auth.');
 
     return res.status(401).json({
       error: 'Token inválido ou expirado.',
@@ -376,11 +373,8 @@ let consentGranted;
 
 try {
   consentGranted = await (runtime.hasAiConsent ?? hasAiConsent)(userId);
-} catch (error) {
-  console.error(
-    'Falha ao verificar consentimento da IA:',
-    error?.message ?? 'unknown_error',
-  );
+} catch (_) {
+  console.error('[chat] Falha ao verificar consentimento da IA.');
 
   return res.status(500).json({
     error: 'Não foi possível verificar a autorização para uso da IA.',
@@ -403,12 +397,11 @@ if (!consentGranted) {
 let premiumGranted;
 
 try {
-  premiumGranted = await hasPremiumAccess(userId);
-} catch (error) {
-  console.error(
-    'Falha ao verificar status Premium:',
-    error?.message ?? 'unknown_error',
+  premiumGranted = await (runtime.hasPremiumAccess ?? hasPremiumAccess)(
+    userId,
   );
+} catch (_) {
+  console.error('[chat] Falha ao verificar status Premium.');
 
   return res.status(500).json({
     error: 'Não foi possível verificar a autorização Premium.',
@@ -503,7 +496,7 @@ if (!checkRateLimit(userId)) {
   // GEMINI KEY
   // --------------------------------------------------------------------------
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = runtime.geminiApiKey ?? process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
     console.error('GEMINI_API_KEY não configurada.');
@@ -604,7 +597,8 @@ REGRAS DE ESCOPO E SEGURANÇA:
     // GEMINI REQUEST
     // ------------------------------------------------------------------------
 
-    const response = await fetch(
+    const fetchRequest = runtime.fetch ?? fetch;
+    const response = await fetchRequest(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent',
       {
         method: 'POST',
@@ -656,24 +650,20 @@ REGRAS DE ESCOPO E SEGURANÇA:
     }
 
     // Nunca devolve o erro bruto da API ao cliente.
-    console.error(
-      'Erro retornado pela API do Google:',
-      JSON.stringify({
-        status: response.status,
-        code: data?.error?.code,
-        statusText: data?.error?.status,
-      }),
-    );
+    const googleErrorCode = Number.isInteger(data?.error?.code)
+      ? data.error.code
+      : undefined;
+    console.error('[chat] Erro estruturado da API do Google.', {
+      status: response.status,
+      code: googleErrorCode,
+    });
 
     return res.status(502).json({
       error:
         'Não foi possível processar sua solicitação no momento.',
     });
-  } catch (error) {
-    console.error(
-      'Erro interno no endpoint de IA:',
-      error?.message ?? 'unknown_error',
-    );
+  } catch (_) {
+    console.error('[chat] Falha interna no endpoint de IA.');
 
     return res.status(500).json({
       error: 'Não foi possível processar sua solicitação.',

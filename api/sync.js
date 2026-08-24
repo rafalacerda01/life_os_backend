@@ -108,6 +108,144 @@ const ALLOWED_TASK_PRIORITIES = new Set([
 const MAX_HABIT_TITLE_LENGTH = 200;
 const MAX_HABIT_DATES = 5000;
 const MAX_HABIT_DATE_LENGTH = 20;
+
+const SAFE_SYNC_DOMAIN_ERRORS = Object.freeze({
+  USER_NOT_FOUND: Object.freeze({
+    statusCode: 404,
+    messages: Object.freeze(['Usuário não encontrado.']),
+  }),
+  TRANSACTION_QUOTA_MIGRATION_REQUIRED: Object.freeze({
+    statusCode: 412,
+    messages: Object.freeze([
+      'Contador de transações ainda não foi migrado.',
+    ]),
+  }),
+  TRANSACTION_QUOTA_EXCEEDED: Object.freeze({
+    statusCode: 403,
+    messages: Object.freeze([
+      'Limite gratuito de 3 transações atingido.',
+    ]),
+  }),
+  MEDICATION_QUOTA_MIGRATION_REQUIRED: Object.freeze({
+    statusCode: 412,
+    messages: Object.freeze([
+      'Contador de medicamentos ainda não foi migrado.',
+    ]),
+  }),
+  MEDICATION_QUOTA_EXCEEDED: Object.freeze({
+    statusCode: 403,
+    messages: Object.freeze([
+      'Limite Premium de 30 medicamentos atingido.',
+      'Limite gratuito de 3 medicamentos atingido.',
+    ]),
+  }),
+  SUBJECT_QUOTA_MIGRATION_REQUIRED: Object.freeze({
+    statusCode: 412,
+    messages: Object.freeze([
+      'Contador de matérias ainda não foi migrado.',
+    ]),
+  }),
+  SUBJECT_QUOTA_EXCEEDED: Object.freeze({
+    statusCode: 403,
+    messages: Object.freeze([
+      'Limite Premium de 30 matérias atingido.',
+      'Limite gratuito de 3 matérias atingido.',
+    ]),
+  }),
+  SUBJECT_DELETE_TOO_MANY_FLASHCARDS: Object.freeze({
+    statusCode: 409,
+    messages: Object.freeze([
+      'A matéria possui flashcards demais para exclusão transacional.',
+    ]),
+  }),
+  GOAL_QUOTA_MIGRATION_REQUIRED: Object.freeze({
+    statusCode: 412,
+    messages: Object.freeze([
+      'Contador de metas ainda não foi migrado.',
+    ]),
+  }),
+  GOAL_QUOTA_EXCEEDED: Object.freeze({
+    statusCode: 403,
+    messages: Object.freeze([
+      'Limite Premium de 30 metas atingido.',
+      'Limite gratuito de 3 metas atingido.',
+    ]),
+  }),
+  TASK_QUOTA_MIGRATION_REQUIRED: Object.freeze({
+    statusCode: 412,
+    messages: Object.freeze([
+      'Contador de tarefas ainda não foi migrado.',
+    ]),
+  }),
+  TASK_QUOTA_EXCEEDED: Object.freeze({
+    statusCode: 403,
+    messages: Object.freeze([
+      'Limite gratuito de 3 tarefas atingido.',
+    ]),
+  }),
+  HABIT_QUOTA_MIGRATION_REQUIRED: Object.freeze({
+    statusCode: 412,
+    messages: Object.freeze([
+      'Contador de hábitos ainda não foi migrado.',
+    ]),
+  }),
+  HABIT_QUOTA_EXCEEDED: Object.freeze({
+    statusCode: 403,
+    messages: Object.freeze([
+      'Limite Premium de hábitos atingido.',
+      'Limite gratuito de 3 hábitos atingido.',
+    ]),
+  }),
+});
+
+function getSafeSyncDomainError(error) {
+  try {
+    const code = error?.code;
+    if (!Object.hasOwn(SAFE_SYNC_DOMAIN_ERRORS, code)) {
+      return null;
+    }
+
+    const definition = SAFE_SYNC_DOMAIN_ERRORS[code];
+    const safeMessage = definition.messages.find(
+      (message) => message === error?.message,
+    );
+    if (
+      error?.statusCode !== definition.statusCode ||
+      safeMessage === undefined
+    ) {
+      return null;
+    }
+
+    return {
+      statusCode: definition.statusCode,
+      code,
+      message: safeMessage,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function sendSyncOperationError(
+  res,
+  error,
+  { logMessage, fallbackError, fallbackCode },
+) {
+  console.error(logMessage);
+
+  const safeError = getSafeSyncDomainError(error);
+  if (safeError !== null) {
+    return res.status(safeError.statusCode).json({
+      error: safeError.message,
+      code: safeError.code,
+    });
+  }
+
+  return res.status(500).json({
+    error: fallbackError,
+    code: fallbackCode,
+  });
+}
 // ============================================================================
 // SCHEMA ALLOWLIST
 // ============================================================================
@@ -2462,12 +2600,8 @@ export async function syncHandler(req, res, runtime = {}) {
   try {
     decodedToken =
       await verifyIdToken(token, true);
-  } catch (error) {
-    console.error(
-      'Erro ao verificar o token Firebase:',
-      error?.message ??
-        'unknown_error',
-    );
+  } catch (_) {
+    console.error('[sync] Falha ao verificar Firebase Auth.');
 
     return res.status(401).json({
       error:
@@ -2560,7 +2694,9 @@ export async function syncHandler(req, res, runtime = {}) {
   }
 
   try {
-    await createTransactionWithQuota({
+    await (
+      runtime.createTransactionWithQuota ?? createTransactionWithQuota
+    )({
       userId,
       transactionId:
         rawBody.transactionId.trim(),
@@ -2576,24 +2712,11 @@ export async function syncHandler(req, res, runtime = {}) {
       operation: 'create_transaction',
     });
   } catch (error) {
-    console.error(
-      'Erro ao criar transação server-side:',
-      error?.message ??
-        'unknown_error',
-    );
-
-    return res
-      .status(
-        error?.statusCode ?? 500,
-      )
-      .json({
-        error:
-          error?.message ??
-          'Não foi possível criar a transação.',
-        code:
-          error?.code ??
-          'TRANSACTION_CREATE_FAILED',
-      });
+    return sendSyncOperationError(res, error, {
+      logMessage: '[sync] Falha ao criar transação server-side.',
+      fallbackError: 'Não foi possível criar a transação.',
+      fallbackCode: 'TRANSACTION_CREATE_FAILED',
+    });
   }
 }
 
@@ -2621,24 +2744,11 @@ if (operation === 'delete_transaction') {
       operation: 'delete_transaction',
     });
   } catch (error) {
-    console.error(
-      'Erro ao excluir transação server-side:',
-      error?.message ??
-        'unknown_error',
-    );
-
-    return res
-      .status(
-        error?.statusCode ?? 500,
-      )
-      .json({
-        error:
-          error?.message ??
-          'Não foi possível excluir a transação.',
-        code:
-          error?.code ??
-          'TRANSACTION_DELETE_FAILED',
-      });
+    return sendSyncOperationError(res, error, {
+      logMessage: '[sync] Falha ao excluir transação server-side.',
+      fallbackError: 'Não foi possível excluir a transação.',
+      fallbackCode: 'TRANSACTION_DELETE_FAILED',
+    });
   }
 }
     if (operation === 'create_medication') {
@@ -2667,20 +2777,10 @@ if (operation === 'delete_transaction') {
       operation: 'create_medication',
     });
   } catch (error) {
-    console.error(
-      'Erro ao criar medicamento server-side:',
-      error?.message ?? 'unknown_error',
-    );
-
-    return res.status(
-      error?.statusCode ?? 500,
-    ).json({
-      error:
-        error?.message ??
-        'Não foi possível criar o medicamento.',
-      code:
-        error?.code ??
-        'MEDICATION_CREATE_FAILED',
+    return sendSyncOperationError(res, error, {
+      logMessage: '[sync] Falha ao criar medicamento server-side.',
+      fallbackError: 'Não foi possível criar o medicamento.',
+      fallbackCode: 'MEDICATION_CREATE_FAILED',
     });
   }
 }
@@ -2707,20 +2807,10 @@ if (operation === 'delete_medication') {
       operation: 'delete_medication',
     });
   } catch (error) {
-    console.error(
-      'Erro ao excluir medicamento server-side:',
-      error?.message ?? 'unknown_error',
-    );
-
-    return res.status(
-      error?.statusCode ?? 500,
-    ).json({
-      error:
-        error?.message ??
-        'Não foi possível excluir o medicamento.',
-      code:
-        error?.code ??
-        'MEDICATION_DELETE_FAILED',
+    return sendSyncOperationError(res, error, {
+      logMessage: '[sync] Falha ao excluir medicamento server-side.',
+      fallbackError: 'Não foi possível excluir o medicamento.',
+      fallbackCode: 'MEDICATION_DELETE_FAILED',
     });
   }
 }
@@ -2748,20 +2838,10 @@ if (operation === 'delete_medication') {
       operation: 'create_subject',
     });
   } catch (error) {
-    console.error(
-      'Erro ao criar matéria server-side:',
-      error?.message ?? 'unknown_error',
-    );
-
-    return res.status(
-      error?.statusCode ?? 500,
-    ).json({
-      error:
-        error?.message ??
-        'Não foi possível criar a matéria.',
-      code:
-        error?.code ??
-        'SUBJECT_CREATE_FAILED',
+    return sendSyncOperationError(res, error, {
+      logMessage: '[sync] Falha ao criar matéria server-side.',
+      fallbackError: 'Não foi possível criar a matéria.',
+      fallbackCode: 'SUBJECT_CREATE_FAILED',
     });
   }
 }
@@ -2787,20 +2867,10 @@ if (operation === 'delete_subject') {
       operation: 'delete_subject',
     });
   } catch (error) {
-    console.error(
-      'Erro ao excluir matéria server-side:',
-      error?.message ?? 'unknown_error',
-    );
-
-    return res.status(
-      error?.statusCode ?? 500,
-    ).json({
-      error:
-        error?.message ??
-        'Não foi possível excluir a matéria.',
-      code:
-        error?.code ??
-        'SUBJECT_DELETE_FAILED',
+    return sendSyncOperationError(res, error, {
+      logMessage: '[sync] Falha ao excluir matéria server-side.',
+      fallbackError: 'Não foi possível excluir a matéria.',
+      fallbackCode: 'SUBJECT_DELETE_FAILED',
     });
   }
 }
@@ -2829,20 +2899,10 @@ if (operation === 'delete_subject') {
       operation: 'create_goal',
     });
   } catch (error) {
-    console.error(
-      'Erro ao criar meta server-side:',
-      error?.message ?? 'unknown_error',
-    );
-
-    return res.status(
-      error?.statusCode ?? 500,
-    ).json({
-      error:
-        error?.message ??
-        'Não foi possível criar a meta.',
-      code:
-        error?.code ??
-        'GOAL_CREATE_FAILED',
+    return sendSyncOperationError(res, error, {
+      logMessage: '[sync] Falha ao criar meta server-side.',
+      fallbackError: 'Não foi possível criar a meta.',
+      fallbackCode: 'GOAL_CREATE_FAILED',
     });
   }
 }
@@ -2868,20 +2928,10 @@ if (operation === 'delete_goal') {
       operation: 'delete_goal',
     });
   } catch (error) {
-    console.error(
-      'Erro ao excluir meta server-side:',
-      error?.message ?? 'unknown_error',
-    );
-
-    return res.status(
-      error?.statusCode ?? 500,
-    ).json({
-      error:
-        error?.message ??
-        'Não foi possível excluir a meta.',
-      code:
-        error?.code ??
-        'GOAL_DELETE_FAILED',
+    return sendSyncOperationError(res, error, {
+      logMessage: '[sync] Falha ao excluir meta server-side.',
+      fallbackError: 'Não foi possível excluir a meta.',
+      fallbackCode: 'GOAL_DELETE_FAILED',
     });
   }
 }
@@ -2909,20 +2959,10 @@ if (operation === 'create_task') {
       operation: 'create_task',
     });
   } catch (error) {
-    console.error(
-      'Erro ao criar tarefa server-side:',
-      error?.message ?? 'unknown_error',
-    );
-
-    return res.status(
-      error?.statusCode ?? 500,
-    ).json({
-      error:
-        error?.message ??
-        'Não foi possível criar a tarefa.',
-      code:
-        error?.code ??
-        'TASK_CREATE_FAILED',
+    return sendSyncOperationError(res, error, {
+      logMessage: '[sync] Falha ao criar tarefa server-side.',
+      fallbackError: 'Não foi possível criar a tarefa.',
+      fallbackCode: 'TASK_CREATE_FAILED',
     });
   }
 }
@@ -2948,20 +2988,10 @@ if (operation === 'delete_task') {
       operation: 'delete_task',
     });
   } catch (error) {
-    console.error(
-      'Erro ao excluir tarefa server-side:',
-      error?.message ?? 'unknown_error',
-    );
-
-    return res.status(
-      error?.statusCode ?? 500,
-    ).json({
-      error:
-        error?.message ??
-        'Não foi possível excluir a tarefa.',
-      code:
-        error?.code ??
-        'TASK_DELETE_FAILED',
+    return sendSyncOperationError(res, error, {
+      logMessage: '[sync] Falha ao excluir tarefa server-side.',
+      fallbackError: 'Não foi possível excluir a tarefa.',
+      fallbackCode: 'TASK_DELETE_FAILED',
     });
   }
 }
@@ -2988,21 +3018,10 @@ if (operation === 'delete_task') {
           operation: 'create_habit',
         });
       } catch (error) {
-        console.error(
-          'Erro ao criar hábito server-side:',
-          error?.message ??
-            'unknown_error',
-        );
-
-        return res.status(
-          error?.statusCode ?? 500,
-        ).json({
-          error:
-            error?.message ??
-            'Não foi possível criar o hábito.',
-          code:
-            error?.code ??
-            'HABIT_CREATE_FAILED',
+        return sendSyncOperationError(res, error, {
+          logMessage: '[sync] Falha ao criar hábito server-side.',
+          fallbackError: 'Não foi possível criar o hábito.',
+          fallbackCode: 'HABIT_CREATE_FAILED',
         });
       }
     }
@@ -3028,21 +3047,10 @@ if (operation === 'delete_task') {
           operation: 'delete_habit',
         });
       } catch (error) {
-        console.error(
-          'Erro ao excluir hábito server-side:',
-          error?.message ??
-            'unknown_error',
-        );
-
-        return res.status(
-          error?.statusCode ?? 500,
-        ).json({
-          error:
-            error?.message ??
-            'Não foi possível excluir o hábito.',
-          code:
-            error?.code ??
-            'HABIT_DELETE_FAILED',
+        return sendSyncOperationError(res, error, {
+          logMessage: '[sync] Falha ao excluir hábito server-side.',
+          fallbackError: 'Não foi possível excluir o hábito.',
+          fallbackCode: 'HABIT_DELETE_FAILED',
         });
       }
     }
@@ -3209,12 +3217,8 @@ if (operation === 'delete_task') {
       serverTimestamp:
         serverIsoString,
     });
-  } catch (error) {
-    console.error(
-      'Erro crítico no processo de sincronização:',
-      error?.message ??
-        'unknown_error',
-    );
+  } catch (_) {
+    console.error('[sync] Falha crítica no processo de sincronização.');
 
     return res.status(500).json({
       error:

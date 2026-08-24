@@ -215,7 +215,7 @@ function sendError(res, error, fallbackCode) {
     });
   }
 
-  console.error(`[account] ${fallbackCode}`, error?.code ?? 'unknown_error');
+  console.error(`[account] ${fallbackCode}`);
   return res.status(500).json({
     error: 'Nao foi possivel excluir a conta.',
     code: fallbackCode,

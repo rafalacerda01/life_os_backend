@@ -270,3 +270,42 @@ test('header X-Firebase-AppCheck em formato inesperado é rejeitado', async () =
   assert.equal(response.statusCode, 401);
   assert.equal(response.body.code, 'APP_CHECK_REQUIRED');
 });
+
+test('Chat usa exatamente o endpoint Gemini configurado', async () => {
+  let receivedUrl;
+  const response = await invoke(
+    post({
+      'x-firebase-appcheck': APP_CHECK_TOKEN,
+      authorization: 'Bearer firebase-id-token',
+    }),
+    {
+      verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+      verifyIdToken: async () => ({ uid: 'gemini-endpoint-test' }),
+      hasAiConsent: async () => true,
+      hasPremiumAccess: async () => true,
+      geminiApiKey: 'test-api-key',
+      fetch: async (url) => {
+        receivedUrl = url;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [{ text: 'Resposta de teste' }],
+                },
+              },
+            ],
+          }),
+        };
+      },
+    },
+  );
+
+  assert.equal(
+    receivedUrl,
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent',
+  );
+  assert.equal(response.statusCode, 200);
+});

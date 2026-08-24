@@ -456,7 +456,7 @@ function sendError(res, error, fallbackCode) {
     });
   }
 
-  console.error(`[focus] ${fallbackCode}`, error?.code ?? 'unknown_error');
+  console.error(`[focus] ${fallbackCode}`);
   return res.status(500).json({
     error: 'Não foi possível processar a sessão Focus.',
     code: fallbackCode,

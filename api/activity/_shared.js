@@ -204,7 +204,7 @@ function sendError(res, error, fallbackCode) {
     });
   }
 
-  console.error(`[activity] ${fallbackCode}`, error?.code ?? 'unknown_error');
+  console.error(`[activity] ${fallbackCode}`);
   return res.status(500).json({
     error: 'Nao foi possivel registrar a atividade.',
     code: fallbackCode,
