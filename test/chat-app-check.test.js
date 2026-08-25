@@ -44,7 +44,7 @@ function post(headers = {}) {
   return {
     method: 'POST',
     headers,
-    body: { message: 'Olá', context: {} },
+    body: { message: 'Como melhorar meu foco nos estudos?', context: {} },
   };
 }
 
