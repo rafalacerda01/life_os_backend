@@ -1,4 +1,5 @@
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
+import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import {
   getFirestore,
@@ -319,7 +320,7 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Authorization',
+    'Content-Type, Authorization, X-Firebase-AppCheck',
   );
 }
 
@@ -2560,6 +2561,38 @@ export async function syncHandler(req, res, runtime = {}) {
     return res.status(413).json({
       error:
         'Payload de sincronização excede o limite permitido.',
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // APP CHECK
+  // --------------------------------------------------------------------------
+
+  const rawAppCheckToken = req.headers['x-firebase-appcheck'];
+
+  if (
+    typeof rawAppCheckToken !== 'string' ||
+    rawAppCheckToken.trim().length === 0
+  ) {
+    return res.status(401).json({
+      code: 'APP_CHECK_REQUIRED',
+      error: 'Verificação de segurança do aplicativo necessária.',
+    });
+  }
+
+  const appCheckToken = rawAppCheckToken.trim();
+  const verifyAppCheckToken =
+    runtime.verifyAppCheckToken ??
+    ((token) => getAppCheck().verifyToken(token));
+
+  try {
+    await verifyAppCheckToken(appCheckToken);
+  } catch (_) {
+    console.error('[sync] Falha na verificação do App Check.');
+
+    return res.status(401).json({
+      code: 'APP_CHECK_INVALID',
+      error: 'Verificação de segurança do aplicativo inválida.',
     });
   }
 

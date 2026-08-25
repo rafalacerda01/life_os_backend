@@ -45,7 +45,10 @@ async function invoke(handler, req, runtime = {}) {
 function authenticatedPost(body = {}) {
   return {
     method: 'POST',
-    headers: { authorization: `Bearer ${TOKEN}` },
+    headers: {
+      'x-firebase-appcheck': 'valid-app-check',
+      authorization: `Bearer ${TOKEN}`,
+    },
     body,
   };
 }
@@ -157,6 +160,7 @@ test('Focus rejeita token revogado com resposta sanitizada', async () => {
 test('Sync verifica o ID token com checkRevoked=true', async () => {
   const verifyCalls = [];
   const response = await invoke(syncHandler, authenticatedPost(null), {
+    verifyAppCheckToken: async () => ({ appId: 'test-app' }),
     verifyIdToken: async (token, checkRevoked) => {
       verifyCalls.push({ token, checkRevoked });
       return { uid: 'sync-revocation-check' };
@@ -173,6 +177,7 @@ test('Sync rejeita token revogado com resposta sanitizada', async () => {
 
   try {
     const response = await invoke(syncHandler, authenticatedPost(null), {
+      verifyAppCheckToken: async () => ({ appId: 'test-app' }),
       verifyIdToken: async () => {
         throw new Error(
           `${TOKEN} revoked-user user@example.com stack`,

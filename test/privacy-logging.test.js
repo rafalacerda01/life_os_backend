@@ -96,7 +96,10 @@ function chatRuntime(overrides = {}) {
 function syncPost(body) {
   return {
     method: 'POST',
-    headers: { authorization: 'Bearer firebase-id-token-secret' },
+    headers: {
+      'x-firebase-appcheck': 'valid-app-check',
+      authorization: 'Bearer firebase-id-token-secret',
+    },
     body,
   };
 }
@@ -207,6 +210,7 @@ test('Chat não registra mensagem textual retornada pelo Google', async () => {
 test('Sync sanitiza falha de Firebase Auth em log e resposta', async () => {
   await captureBackendLogs(async (logs) => {
     const response = await invoke(syncHandler, syncPost(null), {
+      verifyAppCheckToken: async () => ({ appId: 'test-app' }),
       verifyIdToken: async () => {
         throw sensitiveError();
       },
@@ -237,6 +241,7 @@ test('Sync preserva contrato de erro de domínio allowlisted', async () => {
         date: '2026-08-24T12:00:00.000Z',
       }),
       {
+        verifyAppCheckToken: async () => ({ appId: 'test-app' }),
         verifyIdToken: async () => ({ uid: 'safe-test-user' }),
         createTransactionWithQuota: async () => {
           throw domainError;
@@ -271,6 +276,7 @@ test('Sync usa fallback fixo para erro inesperado de operação', async () => {
         date: '2026-08-24T12:00:00.000Z',
       }),
       {
+        verifyAppCheckToken: async () => ({ appId: 'test-app' }),
         verifyIdToken: async () => ({ uid: 'safe-test-user-2' }),
         createTransactionWithQuota: async () => {
           throw error;
