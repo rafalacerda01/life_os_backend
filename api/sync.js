@@ -3087,6 +3087,13 @@ if (operation === 'delete_task') {
         });
       }
     }
+
+    // O bulk sync legado permanece desabilitado; somente as operações acima.
+    return res.status(400).json({
+      code: 'SYNC_OPERATION_REQUIRED',
+      error: 'Operação de sincronização inválida ou não suportada.',
+    });
+
     // ------------------------------------------------------------------------
     // TOP LEVEL ALLOWLIST
     // ------------------------------------------------------------------------
