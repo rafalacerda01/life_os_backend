@@ -83,6 +83,7 @@ async function invokeChat({
       verifyIdToken: async () => ({ uid }),
       hasAiConsent: async () => true,
       hasPremiumAccess: async () => true,
+      checkRateLimit: async () => true,
       geminiApiKey: 'test-api-key',
       fetch,
     },

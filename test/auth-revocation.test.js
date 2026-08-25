@@ -165,6 +165,7 @@ test('Sync verifica o ID token com checkRevoked=true', async () => {
       verifyCalls.push({ token, checkRevoked });
       return { uid: 'sync-revocation-check' };
     },
+    checkRateLimit: async () => true,
   });
 
   assert.equal(response.statusCode, 400);

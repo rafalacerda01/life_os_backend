@@ -88,6 +88,7 @@ function chatRuntime(overrides = {}) {
     verifyIdToken: async () => ({ uid: 'safe-test-user' }),
     hasAiConsent: async () => true,
     hasPremiumAccess: async () => true,
+    checkRateLimit: async () => true,
     geminiApiKey: 'test-api-key',
     ...overrides,
   };
@@ -243,6 +244,7 @@ test('Sync preserva contrato de erro de domínio allowlisted', async () => {
       {
         verifyAppCheckToken: async () => ({ appId: 'test-app' }),
         verifyIdToken: async () => ({ uid: 'safe-test-user' }),
+        checkRateLimit: async () => true,
         createTransactionWithQuota: async () => {
           throw domainError;
         },
@@ -278,6 +280,7 @@ test('Sync usa fallback fixo para erro inesperado de operação', async () => {
       {
         verifyAppCheckToken: async () => ({ appId: 'test-app' }),
         verifyIdToken: async () => ({ uid: 'safe-test-user-2' }),
+        checkRateLimit: async () => true,
         createTransactionWithQuota: async () => {
           throw error;
         },

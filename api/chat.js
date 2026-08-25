@@ -2,6 +2,7 @@ import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
+import { checkDistributedRateLimit } from './_distributed_rate_limit.js';
 
 // ============================================================================
 // LIFE OS - AI CHAT ENDPOINT
@@ -35,11 +36,8 @@ db = getFirestore();
 // LIMITES
 // ============================================================================
 
-const requestTracker = new Map();
-
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const MAX_REQUESTS_PER_WINDOW = 15;
-const MAX_TRACKED_USERS = 10_000;
 
 const MAX_CONTENT_LENGTH_BYTES = 64 * 1024;
 const MAX_MESSAGE_LENGTH = 2_000;
@@ -302,47 +300,6 @@ function minimizeContextForModel(context, domains) {
 }
 
 // ============================================================================
-// RATE LIMIT
-// ============================================================================
-
-function checkRateLimit(userId) {
-  const now = Date.now();
-
-  // Evita crescimento infinito do Map.
-  if (requestTracker.size > MAX_TRACKED_USERS) {
-    for (const [key, value] of requestTracker) {
-      if (now - value.startTime > RATE_LIMIT_WINDOW_MS) {
-        requestTracker.delete(key);
-      }
-    }
-  }
-
-  const current = requestTracker.get(userId);
-
-  if (
-    !current ||
-    now - current.startTime >= RATE_LIMIT_WINDOW_MS
-  ) {
-    requestTracker.set(userId, {
-      count: 1,
-      startTime: now,
-    });
-
-    return true;
-  }
-
-  if (current.count >= MAX_REQUESTS_PER_WINDOW) {
-    return false;
-  }
-
-  current.count += 1;
-
-  requestTracker.set(userId, current);
-
-  return true;
-}
-
-// ============================================================================
 // SANITIZAÇÃO DO CONTEXTO
 //
 // IMPORTANTE:
@@ -587,7 +544,27 @@ if (!premiumGranted) {
 // RATE LIMIT
 // --------------------------------------------------------------------------
 
-if (!checkRateLimit(userId)) {
+let rateLimitAllowed;
+const checkRateLimit =
+  runtime.checkRateLimit ??
+  ((parameters) => checkDistributedRateLimit({ db, ...parameters }));
+
+try {
+  rateLimitAllowed = await checkRateLimit({
+    scope: 'chat',
+    uid: userId,
+    limit: MAX_REQUESTS_PER_WINDOW,
+    windowMs: RATE_LIMIT_WINDOW_MS,
+  });
+} catch (_) {
+  console.error('[chat] Falha ao verificar rate limit.');
+
+  return res.status(503).json({
+    error: 'Não foi possível verificar o limite de solicitações.',
+  });
+}
+
+if (!rateLimitAllowed) {
   return res.status(429).json({
     error:
       'Muitas solicitações. Tente novamente em alguns instantes.',

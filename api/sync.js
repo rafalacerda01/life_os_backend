@@ -11,6 +11,7 @@ import {
   syncHabitUpdate,
   syncTaskUpdate,
 } from './activity/_sync_updates.js';
+import { checkDistributedRateLimit } from './_distributed_rate_limit.js';
 // ============================================================================
 // LIFE OS - SYNC ENDPOINT
 // ============================================================================
@@ -41,11 +42,8 @@ const db = getFirestore();
 // RATE LIMIT
 // ============================================================================
 
-const syncRequestTracker = new Map();
-
 const SYNC_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const SYNC_MAX_REQUESTS_PER_WINDOW = 30;
-const MAX_TRACKED_USERS = 10_000;
 
 // ============================================================================
 // LIMITES
@@ -360,53 +358,6 @@ function isSafePrimitive(value) {
       Number.isFinite(value)
     )
   );
-}
-
-// ============================================================================
-// RATE LIMIT
-// ============================================================================
-
-function checkSyncRateLimit(userId) {
-  const now = Date.now();
-
-  if (syncRequestTracker.size > MAX_TRACKED_USERS) {
-    for (const [key, value] of syncRequestTracker) {
-      if (
-        now - value.startTime >
-        SYNC_RATE_LIMIT_WINDOW_MS
-      ) {
-        syncRequestTracker.delete(key);
-      }
-    }
-  }
-
-  const current = syncRequestTracker.get(userId);
-
-  if (
-    !current ||
-    now - current.startTime >=
-      SYNC_RATE_LIMIT_WINDOW_MS
-  ) {
-    syncRequestTracker.set(userId, {
-      count: 1,
-      startTime: now,
-    });
-
-    return true;
-  }
-
-  if (
-    current.count >=
-    SYNC_MAX_REQUESTS_PER_WINDOW
-  ) {
-    return false;
-  }
-
-  current.count += 1;
-
-  syncRequestTracker.set(userId, current);
-
-  return true;
 }
 
 // ============================================================================
@@ -2653,7 +2604,27 @@ export async function syncHandler(req, res, runtime = {}) {
   // RATE LIMIT
   // --------------------------------------------------------------------------
 
-  if (!checkSyncRateLimit(userId)) {
+  let rateLimitAllowed;
+  const checkRateLimit =
+    runtime.checkRateLimit ??
+    ((parameters) => checkDistributedRateLimit({ db, ...parameters }));
+
+  try {
+    rateLimitAllowed = await checkRateLimit({
+      scope: 'sync',
+      uid: userId,
+      limit: SYNC_MAX_REQUESTS_PER_WINDOW,
+      windowMs: SYNC_RATE_LIMIT_WINDOW_MS,
+    });
+  } catch (_) {
+    console.error('[sync] Falha ao verificar rate limit.');
+
+    return res.status(503).json({
+      error: 'Não foi possível verificar o limite de sincronização.',
+    });
+  }
+
+  if (!rateLimitAllowed) {
     return res.status(429).json({
       error:
         'Muitas solicitações de sincronização. Tente novamente mais tarde.',

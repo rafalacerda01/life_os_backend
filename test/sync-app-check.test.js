@@ -150,6 +150,10 @@ test('App Check válido precede Auth e permite a operação Sync', async () => {
       assert.equal(checkRevoked, true);
       return { uid: 'user-1' };
     },
+    checkRateLimit: async () => {
+      order.push('rate-limit');
+      return true;
+    },
     createTransactionWithQuota: async () => {
       order.push('operation');
     },
@@ -160,7 +164,7 @@ test('App Check válido precede Auth e permite a operação Sync', async () => {
     success: true,
     operation: 'create_transaction',
   });
-  assert.deepEqual(order, ['app-check', 'auth', 'operation']);
+  assert.deepEqual(order, ['app-check', 'auth', 'rate-limit', 'operation']);
 });
 
 test('OPTIONS preserva CORS e permite X-Firebase-AppCheck', async () => {

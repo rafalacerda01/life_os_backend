@@ -52,6 +52,7 @@ function validRuntime(overrides = {}) {
       assert.equal(checkRevoked, true);
       return { uid: 'modern-sync-user' };
     },
+    checkRateLimit: async () => true,
     ...overrides,
   };
 }

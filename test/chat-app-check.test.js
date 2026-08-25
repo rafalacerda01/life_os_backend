@@ -283,6 +283,7 @@ test('Chat usa exatamente o endpoint Gemini configurado', async () => {
       verifyIdToken: async () => ({ uid: 'gemini-endpoint-test' }),
       hasAiConsent: async () => true,
       hasPremiumAccess: async () => true,
+      checkRateLimit: async () => true,
       geminiApiKey: 'test-api-key',
       fetch: async (url) => {
         receivedUrl = url;
@@ -327,6 +328,7 @@ test('timeout do Gemini aborta o fetch e retorna 504 controlado', async () => {
         verifyIdToken: async () => ({ uid: 'gemini-timeout-test' }),
         hasAiConsent: async () => true,
         hasPremiumAccess: async () => true,
+        checkRateLimit: async () => true,
         geminiApiKey: 'test-api-key',
         geminiTimeoutMs: 5,
         fetch: async (_, options) => {
@@ -376,6 +378,7 @@ test('timeout do Gemini aborta durante a leitura de response.json', async () => 
         verifyIdToken: async () => ({ uid: 'gemini-json-timeout-test' }),
         hasAiConsent: async () => true,
         hasPremiumAccess: async () => true,
+        checkRateLimit: async () => true,
         geminiApiKey: 'test-api-key',
         geminiTimeoutMs: 5,
         fetch: async (_, options) => {
@@ -425,6 +428,7 @@ test('sucesso do Gemini limpa o timer e não aborta depois', async () => {
       verifyIdToken: async () => ({ uid: 'gemini-timeout-cleanup-test' }),
       hasAiConsent: async () => true,
       hasPremiumAccess: async () => true,
+      checkRateLimit: async () => true,
       geminiApiKey: 'test-api-key',
       geminiTimeoutMs: 5,
       fetch: async (_, options) => {
@@ -468,6 +472,7 @@ test('erro normal do fetch não é classificado como timeout', async () => {
         verifyIdToken: async () => ({ uid: 'gemini-fetch-error-test' }),
         hasAiConsent: async () => true,
         hasPremiumAccess: async () => true,
+        checkRateLimit: async () => true,
         geminiApiKey: 'test-api-key',
         geminiTimeoutMs: 50,
         fetch: async () => {
