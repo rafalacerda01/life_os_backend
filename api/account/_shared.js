@@ -1,4 +1,5 @@
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 
@@ -107,7 +108,7 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Authorization',
+    'Content-Type, Authorization, X-Firebase-AppCheck',
   );
 }
 
@@ -161,7 +162,7 @@ function getFirebaseServices() {
   }
 
   db ??= getFirestore();
-  return { auth: getAuth(), db };
+  return { auth: getAuth(), appCheck: getAppCheck(), db };
 }
 
 function extractBearerToken(req) {
@@ -244,8 +245,33 @@ export function createAccountHandler(
     try {
       assertBodyWithinLimit(req);
       validateDeletePayload(req.body);
+      const rawAppCheckToken = req.headers?.['x-firebase-appcheck'];
+      if (
+        typeof rawAppCheckToken !== 'string' ||
+        rawAppCheckToken.trim().length === 0
+      ) {
+        throw new AccountHttpError(
+          401,
+          'APP_CHECK_REQUIRED',
+          'Verificação de segurança do aplicativo necessária.',
+        );
+      }
+
+      const { auth, appCheck, db: firestore } = resolvedGetServices();
+      const verifyAppCheckToken =
+        runtime.verifyAppCheckToken ?? ((token) => appCheck.verifyToken(token));
+      try {
+        await verifyAppCheckToken(rawAppCheckToken.trim());
+      } catch (_) {
+        console.error('[account] Falha na verificação do App Check.');
+        throw new AccountHttpError(
+          401,
+          'APP_CHECK_INVALID',
+          'Verificação de segurança do aplicativo inválida.',
+        );
+      }
+
       const token = extractBearerToken(req);
-      const { auth, db: firestore } = resolvedGetServices();
       const nowMillis = resolvedNowProvider();
 
       let decodedToken;

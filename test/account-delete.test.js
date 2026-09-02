@@ -15,6 +15,7 @@ import { deleteAccount } from '../api/account/delete.js';
 const UID = 'user-1';
 const CIRCLE_ID = 'circle-1';
 const ADMIN_UID = 'admin-1';
+const APP_CHECK_TOKEN = 'mock-app-check-token';
 const ACCOUNT_DELETION_MARKER_PATH =
   'users/user-1/runtime/account_deletion';
 
@@ -423,17 +424,124 @@ function handlerFixture({
 }) {
   const auth = new FakeAuth(decodedToken, { verifyError });
   const db = new FakeFirestore();
+  const appCheckCalls = [];
+  const appCheck = {
+    async verifyToken(token) {
+      appCheckCalls.push(token);
+      assert.equal(token, APP_CHECK_TOKEN);
+      return { appId: 'mock-app-id' };
+    },
+  };
   const handler = createAccountHandler(
     'delete',
     'ACCOUNT_DELETE_FAILED',
     execute,
     {
-      getServices: () => ({ auth, db }),
+      getServices: () => ({ auth, appCheck, db }),
       nowProvider: () => nowMillis,
     },
   );
-  return { auth, db, handler };
+  return { auth, db, handler, appCheckCalls };
 }
+
+for (const [name, value] of [
+  ['missing', undefined],
+  ['empty', ''],
+  ['whitespace', '   '],
+  ['non-string', 123],
+  ['array', [APP_CHECK_TOKEN]],
+]) {
+  test(`App Check ${name} fails before Auth or deletion`, async () => {
+    let executeCalls = 0;
+    const { handler, auth, db, appCheckCalls } = handlerFixture({
+      execute: async () => {
+        executeCalls += 1;
+        return { body: { deleted: true } };
+      },
+    });
+    const headers = { authorization: 'Bearer secret-token' };
+    if (value !== undefined) headers['x-firebase-appcheck'] = value;
+    const response = await invoke(handler, { method: 'POST', headers, body: {} });
+
+    assert.equal(response.statusCode, 401);
+    assert.deepEqual(response.body, {
+      code: 'APP_CHECK_REQUIRED',
+      error: 'Verificação de segurança do aplicativo necessária.',
+    });
+    assert.deepEqual(appCheckCalls, []);
+    assert.deepEqual(auth.verifyCalls, []);
+    assert.deepEqual(auth.deleteCalls, []);
+    assert.deepEqual(db.recursiveDeletes, []);
+    assert.equal(executeCalls, 0);
+  });
+}
+
+test('invalid App Check fails before Auth and sanitizes logs and response', async (t) => {
+  const log = t.mock.method(console, 'error', () => {});
+  let executeCalls = 0;
+  let appCheckCalls = 0;
+  const { handler, auth, db } = handlerFixture({
+    execute: async () => {
+      executeCalls += 1;
+      return { body: { deleted: true } };
+    },
+  });
+  const response = await invoke(handler, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer secret-token',
+      'x-firebase-appcheck': APP_CHECK_TOKEN,
+    },
+    body: {},
+  }, {
+    verifyAppCheckToken: async (token) => {
+      appCheckCalls += 1;
+      assert.equal(token, APP_CHECK_TOKEN);
+      throw new Error(`private Firebase error ${token} secret-token user@example.com`);
+    },
+  });
+
+  assert.equal(response.statusCode, 401);
+  assert.deepEqual(response.body, {
+    code: 'APP_CHECK_INVALID',
+    error: 'Verificação de segurança do aplicativo inválida.',
+  });
+  assert.equal(appCheckCalls, 1);
+  assert.deepEqual(auth.verifyCalls, []);
+  assert.deepEqual(auth.deleteCalls, []);
+  assert.deepEqual(db.recursiveDeletes, []);
+  assert.equal(executeCalls, 0);
+  const logs = log.mock.calls.map((call) => call.arguments);
+  assert.deepEqual(logs, [['[account] Falha na verificação do App Check.']]);
+  for (const privateValue of [APP_CHECK_TOKEN, 'secret-token', 'private Firebase error', 'user@example.com']) {
+    assert.equal(JSON.stringify({ body: response.body, logs }).includes(privateValue), false);
+  }
+});
+
+test('valid App Check and Auth allow the existing account deletion flow', async () => {
+  const uid = 'app-check-delete-user';
+  const { handler, auth, db, appCheckCalls } = handlerFixture({
+    decodedToken: { uid, auth_time: 1000 },
+    nowMillis: 1_000_000,
+    execute: deleteAccount,
+  });
+  db.seed(path('users', uid), { activeCircleId: null });
+  const response = await invoke(handler, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer secret-token',
+      'x-firebase-appcheck': ` ${APP_CHECK_TOKEN} `,
+    },
+    body: {},
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body, { deleted: true, circleDeleted: false });
+  assert.deepEqual(appCheckCalls, [APP_CHECK_TOKEN]);
+  assert.deepEqual(auth.verifyCalls, [{ token: 'secret-token', checkRevoked: true }]);
+  assert.deepEqual(auth.deleteCalls, [uid]);
+  assert.deepEqual(db.recursiveDeletes, [path('users', uid)]);
+});
 
 test('delete payload accepts exactly {}', () => {
   assert.deepEqual(validateDeletePayload({}), {});
@@ -453,7 +561,7 @@ test('handler verifies revocation and accepts auth_time exactly five minutes old
   });
   const response = await invoke(handler, {
     method: 'POST',
-    headers: { authorization: 'Bearer secret-token' },
+    headers: { authorization: 'Bearer secret-token', 'x-firebase-appcheck': APP_CHECK_TOKEN },
     body: {},
   });
 
@@ -463,20 +571,22 @@ test('handler verifies revocation and accepts auth_time exactly five minutes old
   ]);
 });
 
-test('revoked or invalid token returns sanitized 401', async () => {
+test('valid App Check with revoked or invalid Auth token returns sanitized 401', async () => {
   const nowMillis = 2_000_000;
-  const { handler } = handlerFixture({
+  const { handler, auth, appCheckCalls } = handlerFixture({
     decodedToken: null,
     verifyError: new Error('revoked secret-token user@example.com'),
     nowMillis,
   });
   const response = await invoke(handler, {
     method: 'POST',
-    headers: { authorization: 'Bearer secret-token' },
+    headers: { authorization: 'Bearer secret-token', 'x-firebase-appcheck': APP_CHECK_TOKEN },
     body: {},
   });
   assert.equal(response.statusCode, 401);
   assert.equal(response.body.code, 'UNAUTHENTICATED');
+  assert.deepEqual(appCheckCalls, [APP_CHECK_TOKEN]);
+  assert.deepEqual(auth.verifyCalls, [{ token: 'secret-token', checkRevoked: true }]);
   assert.doesNotMatch(JSON.stringify(response.body), /secret-token|example\.com|stack/i);
 });
 
@@ -496,7 +606,7 @@ test('missing, invalid, future, and older auth_time require reauthentication', a
     });
     const response = await invoke(handler, {
       method: 'POST',
-      headers: { authorization: 'Bearer token' },
+      headers: { authorization: 'Bearer token', 'x-firebase-appcheck': APP_CHECK_TOKEN },
       body: {},
     });
     assert.equal(response.statusCode, 401, name);
@@ -517,6 +627,10 @@ test('HTTP contract accepts OPTIONS and rejects methods or extra body fields', a
   });
   assert.equal(options.statusCode, 204);
   assert.equal(
+    options.headers['Access-Control-Allow-Headers'],
+    'Content-Type, Authorization, X-Firebase-AppCheck',
+  );
+  assert.equal(
     options.headers['Access-Control-Allow-Origin'],
     'https://app.life-os.com',
   );
@@ -530,7 +644,7 @@ test('HTTP contract accepts OPTIONS and rejects methods or extra body fields', a
 
   const payload = await invoke(handler, {
     method: 'POST',
-    headers: { authorization: 'Bearer token' },
+    headers: { authorization: 'Bearer token', 'x-firebase-appcheck': APP_CHECK_TOKEN },
     body: { uid: 'attacker-selected' },
   });
   assert.equal(payload.statusCode, 400);
@@ -958,7 +1072,7 @@ test('unexpected failures return no token, email, UID, or stack', async () => {
   try {
     const response = await invoke(handler, {
       method: 'POST',
-      headers: { authorization: 'Bearer secret-token' },
+      headers: { authorization: 'Bearer secret-token', 'x-firebase-appcheck': APP_CHECK_TOKEN },
       body: {},
     });
     const serialized = JSON.stringify(response.body);
