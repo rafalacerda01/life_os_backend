@@ -2,11 +2,11 @@ import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
+import { checkDistributedRateLimit } from '../_distributed_rate_limit.js';
 
 export const MAX_ACCOUNT_BODY_BYTES = 64;
 export const ACCOUNT_AUTH_RECENCY_WINDOW_MS = 5 * 60 * 1000;
 export const ACCOUNT_RATE_LIMIT_PER_MINUTE = 5;
-export const MAX_TRACKED_RATE_KEYS = 10_000;
 export const MAX_CIRCLE_CHALLENGES_TO_SCAN = 240;
 export const MAX_PROCESSED_EVENTS_PER_CHALLENGE = 20_000;
 export const PROCESSED_EVENT_DELETE_PAGE_SIZE = 200;
@@ -17,7 +17,6 @@ const ALLOWED_ORIGINS = new Set([
   'https://app.life-os.com',
   'http://localhost:3000',
 ]);
-const requestTracker = new Map();
 
 let db;
 
@@ -187,27 +186,6 @@ function extractBearerToken(req) {
   return token;
 }
 
-function checkRateLimit(uid, operation, nowMillis = Date.now()) {
-  const key = `${uid}:${operation}`;
-  if (requestTracker.size >= MAX_TRACKED_RATE_KEYS) {
-    for (const [trackedKey, entry] of requestTracker) {
-      if (nowMillis - entry.windowStartedAt >= RATE_LIMIT_WINDOW_MS) {
-        requestTracker.delete(trackedKey);
-      }
-    }
-  }
-
-  const current = requestTracker.get(key);
-  if (!current || nowMillis - current.windowStartedAt >= RATE_LIMIT_WINDOW_MS) {
-    if (!current && requestTracker.size >= MAX_TRACKED_RATE_KEYS) return false;
-    requestTracker.set(key, { count: 1, windowStartedAt: nowMillis });
-    return true;
-  }
-  if (current.count >= ACCOUNT_RATE_LIMIT_PER_MINUTE) return false;
-  current.count += 1;
-  return true;
-}
-
 function sendError(res, error, fallbackCode) {
   if (error instanceof AccountHttpError) {
     return res.status(error.statusCode).json({
@@ -295,7 +273,26 @@ export function createAccountHandler(
           'Token Firebase ausente, invalido ou expirado.',
         );
       }
-      if (!checkRateLimit(uid, operation, nowMillis)) {
+      const checkRateLimit = runtime.checkRateLimit ?? checkDistributedRateLimit;
+      let rateLimitAllowed;
+      try {
+        rateLimitAllowed = await checkRateLimit({
+          db: firestore,
+          scope: `account_${operation}`,
+          uid,
+          limit: ACCOUNT_RATE_LIMIT_PER_MINUTE,
+          windowMs: RATE_LIMIT_WINDOW_MS,
+          nowMs: nowMillis,
+        });
+      } catch (_) {
+        console.error('[account] Falha ao verificar rate limit.');
+        throw new AccountHttpError(
+          503,
+          'RATE_LIMIT_UNAVAILABLE',
+          'Não foi possível verificar o limite de solicitações.',
+        );
+      }
+      if (!rateLimitAllowed) {
         throw new AccountHttpError(
           429,
           'RATE_LIMITED',

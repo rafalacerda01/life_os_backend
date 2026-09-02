@@ -11,6 +11,7 @@ import {
   validateDeletePayload,
 } from '../api/account/_shared.js';
 import { deleteAccount } from '../api/account/delete.js';
+import { checkDistributedRateLimit } from '../api/_distributed_rate_limit.js';
 
 const UID = 'user-1';
 const CIRCLE_ID = 'circle-1';
@@ -171,6 +172,13 @@ class FakeTransaction extends FakeWriter {
     return super.update(ref, data);
   }
 
+  set(ref, data) {
+    this.hasWritten = true;
+    this.operations.push({ type: 'write', operation: 'set', path: ref.path });
+    this.writes.push({ type: 'set', ref, data });
+    return this;
+  }
+
   commit() {
     this.db.applyWrites(this.writes);
   }
@@ -241,6 +249,8 @@ class FakeFirestore {
     for (const write of writes) {
       if (write.type === 'delete') {
         nextStore.delete(write.ref.path);
+      } else if (write.type === 'set') {
+        nextStore.set(write.ref.path, { ...write.data });
       } else {
         if (!nextStore.has(write.ref.path)) {
           throw new Error('missing update: ' + write.ref.path);
@@ -444,6 +454,17 @@ function handlerFixture({
   return { auth, db, handler, appCheckCalls };
 }
 
+function authenticatedAccountPost() {
+  return {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer secret-token',
+      'x-firebase-appcheck': APP_CHECK_TOKEN,
+    },
+    body: {},
+  };
+}
+
 for (const [name, value] of [
   ['missing', undefined],
   ['empty', ''],
@@ -453,6 +474,7 @@ for (const [name, value] of [
 ]) {
   test(`App Check ${name} fails before Auth or deletion`, async () => {
     let executeCalls = 0;
+    let rateLimitCalls = 0;
     const { handler, auth, db, appCheckCalls } = handlerFixture({
       execute: async () => {
         executeCalls += 1;
@@ -461,7 +483,12 @@ for (const [name, value] of [
     });
     const headers = { authorization: 'Bearer secret-token' };
     if (value !== undefined) headers['x-firebase-appcheck'] = value;
-    const response = await invoke(handler, { method: 'POST', headers, body: {} });
+    const response = await invoke(handler, { method: 'POST', headers, body: {} }, {
+      checkRateLimit: async () => {
+        rateLimitCalls += 1;
+        return true;
+      },
+    });
 
     assert.equal(response.statusCode, 401);
     assert.deepEqual(response.body, {
@@ -470,6 +497,7 @@ for (const [name, value] of [
     });
     assert.deepEqual(appCheckCalls, []);
     assert.deepEqual(auth.verifyCalls, []);
+    assert.equal(rateLimitCalls, 0);
     assert.deepEqual(auth.deleteCalls, []);
     assert.deepEqual(db.recursiveDeletes, []);
     assert.equal(executeCalls, 0);
@@ -480,6 +508,7 @@ test('invalid App Check fails before Auth and sanitizes logs and response', asyn
   const log = t.mock.method(console, 'error', () => {});
   let executeCalls = 0;
   let appCheckCalls = 0;
+  let rateLimitCalls = 0;
   const { handler, auth, db } = handlerFixture({
     execute: async () => {
       executeCalls += 1;
@@ -494,6 +523,10 @@ test('invalid App Check fails before Auth and sanitizes logs and response', asyn
     },
     body: {},
   }, {
+    checkRateLimit: async () => {
+      rateLimitCalls += 1;
+      return true;
+    },
     verifyAppCheckToken: async (token) => {
       appCheckCalls += 1;
       assert.equal(token, APP_CHECK_TOKEN);
@@ -507,6 +540,7 @@ test('invalid App Check fails before Auth and sanitizes logs and response', asyn
     error: 'Verificação de segurança do aplicativo inválida.',
   });
   assert.equal(appCheckCalls, 1);
+  assert.equal(rateLimitCalls, 0);
   assert.deepEqual(auth.verifyCalls, []);
   assert.deepEqual(auth.deleteCalls, []);
   assert.deepEqual(db.recursiveDeletes, []);
@@ -520,6 +554,7 @@ test('invalid App Check fails before Auth and sanitizes logs and response', asyn
 
 test('valid App Check and Auth allow the existing account deletion flow', async () => {
   const uid = 'app-check-delete-user';
+  const rateLimitCalls = [];
   const { handler, auth, db, appCheckCalls } = handlerFixture({
     decodedToken: { uid, auth_time: 1000 },
     nowMillis: 1_000_000,
@@ -533,9 +568,25 @@ test('valid App Check and Auth allow the existing account deletion flow', async 
       'x-firebase-appcheck': ` ${APP_CHECK_TOKEN} `,
     },
     body: {},
+  }, {
+    checkRateLimit: async (parameters) => {
+      rateLimitCalls.push(parameters);
+      assert.deepEqual(appCheckCalls, [APP_CHECK_TOKEN]);
+      assert.deepEqual(auth.verifyCalls, [{ token: 'secret-token', checkRevoked: true }]);
+      assert.deepEqual(auth.deleteCalls, []);
+      return checkDistributedRateLimit(parameters);
+    },
   });
 
   assert.equal(response.statusCode, 200);
+  assert.deepEqual(rateLimitCalls, [{
+    db,
+    scope: 'account_delete',
+    uid,
+    limit: 5,
+    windowMs: 60_000,
+    nowMs: 1_000_000,
+  }]);
   assert.deepEqual(response.body, { deleted: true, circleDeleted: false });
   assert.deepEqual(appCheckCalls, [APP_CHECK_TOKEN]);
   assert.deepEqual(auth.verifyCalls, [{ token: 'secret-token', checkRevoked: true }]);
@@ -573,6 +624,7 @@ test('handler verifies revocation and accepts auth_time exactly five minutes old
 
 test('valid App Check with revoked or invalid Auth token returns sanitized 401', async () => {
   const nowMillis = 2_000_000;
+  let rateLimitCalls = 0;
   const { handler, auth, appCheckCalls } = handlerFixture({
     decodedToken: null,
     verifyError: new Error('revoked secret-token user@example.com'),
@@ -582,9 +634,15 @@ test('valid App Check with revoked or invalid Auth token returns sanitized 401',
     method: 'POST',
     headers: { authorization: 'Bearer secret-token', 'x-firebase-appcheck': APP_CHECK_TOKEN },
     body: {},
+  }, {
+    checkRateLimit: async () => {
+      rateLimitCalls += 1;
+      return true;
+    },
   });
   assert.equal(response.statusCode, 401);
   assert.equal(response.body.code, 'UNAUTHENTICATED');
+  assert.equal(rateLimitCalls, 0);
   assert.deepEqual(appCheckCalls, [APP_CHECK_TOKEN]);
   assert.deepEqual(auth.verifyCalls, [{ token: 'secret-token', checkRevoked: true }]);
   assert.doesNotMatch(JSON.stringify(response.body), /secret-token|example\.com|stack/i);
@@ -600,9 +658,14 @@ test('missing, invalid, future, and older auth_time require reauthentication', a
   ];
 
   for (const [name, authTime] of cases) {
-    const { handler } = handlerFixture({
+    let executeCalls = 0;
+    const { handler, db } = handlerFixture({
       decodedToken: { uid: 'auth-' + name, auth_time: authTime },
       nowMillis,
+      execute: async () => {
+        executeCalls += 1;
+        return { body: { deleted: true } };
+      },
     });
     const response = await invoke(handler, {
       method: 'POST',
@@ -611,7 +674,139 @@ test('missing, invalid, future, and older auth_time require reauthentication', a
     });
     assert.equal(response.statusCode, 401, name);
     assert.equal(response.body.code, 'REAUTHENTICATION_REQUIRED', name);
+    assert.equal(db.transactionCount, 1);
+    assert.equal(executeCalls, 0);
   }
+});
+
+test('invalid UID never reaches the distributed limiter or deletion', async () => {
+  for (const uid of [undefined, '', 'bad/path', ' user ']) {
+    let rateLimitCalls = 0;
+    let executeCalls = 0;
+    const { handler } = handlerFixture({
+      decodedToken: { uid, auth_time: 1000 },
+      nowMillis: 1_000_000,
+      execute: async () => {
+        executeCalls += 1;
+        return { body: { deleted: true } };
+      },
+    });
+    const response = await invoke(handler, authenticatedAccountPost(), {
+      checkRateLimit: async () => {
+        rateLimitCalls += 1;
+        return true;
+      },
+    });
+    assert.equal(response.statusCode, 401);
+    assert.equal(response.body.code, 'UNAUTHENTICATED');
+    assert.equal(rateLimitCalls, 0);
+    assert.equal(executeCalls, 0);
+  }
+});
+
+test('exhausted distributed quota returns 429 before recent auth or deletion', async () => {
+  let executeCalls = 0;
+  let rateLimitCalls = 0;
+  const { handler, auth, db } = handlerFixture({
+    decodedToken: { uid: UID, auth_time: 0 },
+    nowMillis: 1_000_000,
+    execute: async () => {
+      executeCalls += 1;
+      return { body: { deleted: true } };
+    },
+  });
+  const response = await invoke(handler, authenticatedAccountPost(), {
+    checkRateLimit: async () => {
+      rateLimitCalls += 1;
+      return false;
+    },
+  });
+  assert.equal(response.statusCode, 429);
+  assert.deepEqual(response.body, {
+    code: 'RATE_LIMITED',
+    error: 'Muitas solicitacoes de conta. Tente novamente em instantes.',
+  });
+  assert.equal(rateLimitCalls, 1);
+  assert.equal(executeCalls, 0);
+  assert.deepEqual(auth.deleteCalls, []);
+  assert.deepEqual(db.recursiveDeletes, []);
+});
+
+for (const failureSource of ['checker', 'firestore']) {
+  test(`${failureSource} rate limit failure returns sanitized 503 without deletion`, async (t) => {
+    const log = t.mock.method(console, 'error', () => {});
+    const privateDetail = `private-error ${UID} server_rate_limits/private secret-token ${APP_CHECK_TOKEN}`;
+    let executeCalls = 0;
+    let failureCalls = 0;
+    const failRateLimit = async () => {
+      failureCalls += 1;
+      throw new Error(privateDetail);
+    };
+    const { handler, auth, db } = handlerFixture({
+      decodedToken: { uid: UID, auth_time: 1000 },
+      nowMillis: 1_000_000,
+      execute: async () => {
+        executeCalls += 1;
+        return { body: { deleted: true } };
+      },
+    });
+    const runtime = {};
+    if (failureSource === 'firestore') {
+      db.runTransaction = failRateLimit;
+    } else {
+      runtime.checkRateLimit = failRateLimit;
+    }
+    const response = await invoke(handler, authenticatedAccountPost(), runtime);
+
+    assert.equal(response.statusCode, 503);
+    assert.deepEqual(response.body, {
+      code: 'RATE_LIMIT_UNAVAILABLE',
+      error: 'Não foi possível verificar o limite de solicitações.',
+    });
+    assert.equal(failureCalls, 1);
+    assert.equal(executeCalls, 0);
+    assert.deepEqual(auth.deleteCalls, []);
+    assert.deepEqual(db.recursiveDeletes, []);
+    const logs = log.mock.calls.map((call) => call.arguments);
+    assert.deepEqual(logs, [['[account] Falha ao verificar rate limit.']]);
+    for (const secret of [UID, 'server_rate_limits', 'secret-token', APP_CHECK_TOKEN, 'private-error', 'stack']) {
+      assert.equal(JSON.stringify({ body: response.body, logs }).includes(secret), false);
+    }
+  });
+}
+
+test('new account handlers share persisted quota: five allowed, sixth denied, new window allowed', async () => {
+  const db = new FakeFirestore();
+  let executeCalls = 0;
+  const callFromNewHandler = async (nowMillis) => {
+    const { handler, auth } = handlerFixture({
+      decodedToken: { uid: UID, auth_time: nowMillis / 1000 },
+      nowMillis,
+      execute: async () => {
+        executeCalls += 1;
+        return { body: { ok: true } };
+      },
+    });
+    return invoke(handler, authenticatedAccountPost(), {
+      getServices: () => ({
+        auth,
+        db,
+        appCheck: { verifyToken: async () => ({ appId: 'mock-app-id' }) },
+      }),
+    });
+  };
+
+  for (let i = 0; i < 5; i += 1) {
+    assert.equal((await callFromNewHandler(1_000_000)).statusCode, 200);
+  }
+  const denied = await callFromNewHandler(1_059_999);
+  assert.equal(denied.statusCode, 429);
+  assert.equal(denied.body.code, 'RATE_LIMITED');
+  assert.equal(executeCalls, 5);
+  assert.deepEqual([...db.store.values()], [{ windowStartMs: 1_000_000, count: 5 }]);
+  assert.equal((await callFromNewHandler(1_060_000)).statusCode, 200);
+  assert.equal(executeCalls, 6);
+  assert.deepEqual([...db.store.values()], [{ windowStartMs: 1_060_000, count: 1 }]);
 });
 
 test('HTTP contract accepts OPTIONS and rejects methods or extra body fields', async () => {

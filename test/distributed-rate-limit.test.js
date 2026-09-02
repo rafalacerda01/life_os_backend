@@ -95,13 +95,45 @@ test('janela expirada reinicia o contador', async () => {
   ]);
 });
 
-test('scopes chat e sync possuem documentos independentes', async () => {
+test('scopes chat, sync e account_delete possuem documentos independentes', async () => {
   const db = new FakeFirestore();
 
   assert.equal(await check(db, { scope: 'chat', limit: 1 }), true);
   assert.equal(await check(db, { scope: 'chat', limit: 1 }), false);
   assert.equal(await check(db, { scope: 'sync', limit: 1 }), true);
-  assert.equal(db.documents.size, 2);
+  assert.equal(await check(db, { scope: 'account_delete', limit: 1 }), true);
+  assert.equal(await check(db, { scope: 'account_delete', limit: 1 }), false);
+  assert.equal(db.documents.size, 3);
+});
+
+test('account_delete permite cinco concorrentes e renova somente após 60s', async () => {
+  const db = new FakeFirestore();
+  const uid = 'private-account-uid';
+  const parameters = { scope: 'account_delete', uid, limit: 5 };
+  const results = await Promise.all(
+    Array.from({ length: 6 }, () => check(db, parameters)),
+  );
+
+  assert.equal(results.filter(Boolean).length, 5);
+  assert.equal(results.filter((allowed) => !allowed).length, 1);
+  assert.equal(await check(db, { ...parameters, nowMs: 60_999 }), false);
+  assert.deepEqual([...db.documents.values()], [{ windowStartMs: 1_000, count: 5 }]);
+  assert.equal(await check(db, { ...parameters, nowMs: 61_000 }), true);
+  assert.deepEqual([...db.documents.values()], [{ windowStartMs: 61_000, count: 1 }]);
+  const [documentId] = db.documents.keys();
+  assert.match(documentId, /^account_delete_[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify([...db.documents]).includes(uid), false);
+});
+
+test('scopes desconhecidos continuam rejeitados antes de acessar Firestore', async () => {
+  for (const scope of ['account', 'account_update', 'unknown', 'account_delete/unsafe']) {
+    const db = new FakeFirestore();
+    await assert.rejects(check(db, { scope }), {
+      message: 'DISTRIBUTED_RATE_LIMIT_FAILED',
+    });
+    assert.deepEqual(db.documentIds, []);
+    assert.equal(db.transactionCalls, 0);
+  }
 });
 
 test('usuários diferentes possuem contadores independentes', async () => {
