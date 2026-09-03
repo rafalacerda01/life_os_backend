@@ -2,6 +2,7 @@ import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore, Timestamp } from 'firebase-admin/firestore';
+import { checkDistributedRateLimit } from '../_distributed_rate_limit.js';
 
 export const ALLOWED_DURATIONS_SECONDS = Object.freeze([
   60,
@@ -30,16 +31,17 @@ const TARGET_COLLECTIONS = Object.freeze({
   SUBJECT: 'subjects',
 });
 
-// Advisory only: state integrity is enforced by Firestore transactions, not
-// by this per-instance serverless rate limiter.
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMITS = Object.freeze({
   start: 20,
   finish: 30,
   cancel: 30,
 });
-const MAX_TRACKED_RATE_KEYS = 10_000;
-const requestTracker = new Map();
+const RATE_LIMIT_SCOPES = Object.freeze({
+  start: 'focus_start',
+  finish: 'focus_finish',
+  cancel: 'focus_cancel',
+});
 
 const ALLOWED_ORIGINS = new Set([
   'https://painel.life-os.com',
@@ -427,28 +429,6 @@ function extractBearerToken(req) {
   return token;
 }
 
-function checkRateLimit(uid, operation, nowMillis = Date.now()) {
-  const limit = RATE_LIMITS[operation];
-  const key = `${uid}:${operation}`;
-  if (requestTracker.size >= MAX_TRACKED_RATE_KEYS) {
-    for (const [trackedKey, entry] of requestTracker) {
-      if (nowMillis - entry.windowStartedAt >= RATE_LIMIT_WINDOW_MS) {
-        requestTracker.delete(trackedKey);
-      }
-    }
-  }
-
-  const current = requestTracker.get(key);
-  if (!current || nowMillis - current.windowStartedAt >= RATE_LIMIT_WINDOW_MS) {
-    if (!current && requestTracker.size >= MAX_TRACKED_RATE_KEYS) return false;
-    requestTracker.set(key, { count: 1, windowStartedAt: nowMillis });
-    return true;
-  }
-  if (current.count >= limit) return false;
-  current.count += 1;
-  return true;
-}
-
 function sendError(res, error, fallbackCode) {
   if (error instanceof FocusHttpError) {
     return res.status(error.statusCode).json({
@@ -517,7 +497,25 @@ export function createFocusHandler(operation, fallbackCode, execute) {
         );
       }
 
-      if (!checkRateLimit(decodedToken.uid, operation)) {
+      const checkRateLimit = runtime.checkRateLimit ?? checkDistributedRateLimit;
+      let rateLimitAllowed;
+      try {
+        rateLimitAllowed = await checkRateLimit({
+          db: firestore,
+          scope: RATE_LIMIT_SCOPES[operation],
+          uid: decodedToken.uid,
+          limit: RATE_LIMITS[operation],
+          windowMs: RATE_LIMIT_WINDOW_MS,
+        });
+      } catch (_) {
+        console.error('[focus] Falha ao verificar rate limit.');
+        throw new FocusHttpError(
+          503,
+          'RATE_LIMIT_UNAVAILABLE',
+          'Não foi possível verificar o limite de solicitações Focus.',
+        );
+      }
+      if (!rateLimitAllowed) {
         throw new FocusHttpError(
           429,
           'RATE_LIMITED',

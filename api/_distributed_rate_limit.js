@@ -1,7 +1,17 @@
 import { createHash } from 'node:crypto';
 
 const RATE_LIMIT_COLLECTION = 'server_rate_limits';
-const ALLOWED_SCOPES = new Set(['chat', 'sync', 'account_delete']);
+const ALLOWED_SCOPES = new Set([
+  'chat',
+  'sync',
+  'account_delete',
+  'activity_task_complete',
+  'activity_habit_complete',
+  'focus_start',
+  'focus_finish',
+  'focus_cancel',
+  'circle_delete',
+]);
 
 function rateLimitDocumentId(scope, uid) {
   const uidHash = createHash('sha256').update(uid, 'utf8').digest('hex');

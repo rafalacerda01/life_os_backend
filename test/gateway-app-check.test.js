@@ -17,19 +17,16 @@ let fixtureId = 0;
 const gateways = [
   {
     name: 'activity',
-    limit: 30,
     body: { taskId: 'private-task' },
     create: (execute) => createActivityHandler('taskComplete', 'ACTIVITY_FAILED', execute),
   },
   {
     name: 'focus',
-    limit: 20,
     body: { targetId: 'private-task', targetType: 'TASK', plannedDurationSeconds: 60 },
     create: (execute) => createFocusHandler('start', 'FOCUS_FAILED', execute),
   },
   {
     name: 'circles',
-    limit: 5,
     body: { circleId: 'private-circle' },
     create: (execute) => createCircleDeleteHandler(execute),
   },
@@ -93,7 +90,10 @@ function fixture(gateway) {
   });
   return {
     handler, calls, state, uid,
-    runtime: { getServices: () => ({ auth, appCheck, db }) },
+    runtime: {
+      getServices: () => ({ auth, appCheck, db }),
+      checkRateLimit: async () => { calls.push('rateLimit'); return true; },
+    },
   };
 }
 
@@ -166,12 +166,12 @@ for (const gateway of gateways) {
     assert.equal(f.state.uidReads, 0);
   });
 
-  test(`${gateway.name}: App Check, Auth, business execute in order`, async () => {
+  test(`${gateway.name}: App Check, Auth, rate limit, business execute in order`, async () => {
     const f = fixture(gateway);
     const res = await invoke(f.handler, post(gateway.body), f.runtime);
     assert.equal(res.statusCode, 200);
     assert.deepEqual(res.body, { ok: true });
-    assert.deepEqual(f.calls, ['appCheck', 'auth', 'execute']);
+    assert.deepEqual(f.calls, ['appCheck', 'auth', 'rateLimit', 'execute']);
   });
 
   test(`${gateway.name}: runtime verifier seam is used without Firebase`, async () => {
@@ -185,30 +185,24 @@ for (const gateway of gateways) {
       },
     });
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(f.calls, ['runtimeAppCheck', 'auth', 'execute']);
+    assert.deepEqual(f.calls, ['runtimeAppCheck', 'auth', 'rateLimit', 'execute']);
   });
 
-  test(`${gateway.name}: rejected App Check never consumes the existing quota`, async (t) => {
+  test(`${gateway.name}: rejected App Check never calls the distributed limiter`, async (t) => {
     t.mock.method(console, 'error', () => {});
     const f = fixture(gateway);
     const missing = post(gateway.body);
     delete missing.headers['x-firebase-appcheck'];
-    for (let i = 0; i <= gateway.limit; i += 1) {
-      assert.equal((await invoke(f.handler, missing, f.runtime)).body.code, 'APP_CHECK_REQUIRED');
-    }
+    assert.equal((await invoke(f.handler, missing, f.runtime)).body.code, 'APP_CHECK_REQUIRED');
     f.state.appCheckError = new Error('invalid');
-    for (let i = 0; i <= gateway.limit; i += 1) {
-      assert.equal((await invoke(f.handler, post(gateway.body), f.runtime)).body.code, 'APP_CHECK_INVALID');
-    }
+    assert.equal((await invoke(f.handler, post(gateway.body), f.runtime)).body.code, 'APP_CHECK_INVALID');
     assert.equal(f.state.uidReads, 0);
+    assert.equal(f.calls.filter((call) => call === 'rateLimit').length, 0);
+    assert.equal(f.calls.filter((call) => call === 'execute').length, 0);
     f.state.appCheckError = null;
-    for (let i = 0; i < gateway.limit; i += 1) {
-      assert.equal((await invoke(f.handler, post(gateway.body), f.runtime)).statusCode, 200);
-    }
-    const denied = await invoke(f.handler, post(gateway.body), f.runtime);
-    assert.equal(denied.statusCode, 429);
-    assert.equal(denied.body.code, 'RATE_LIMITED');
-    assert.equal(f.calls.filter((call) => call === 'execute').length, gateway.limit);
+    assert.equal((await invoke(f.handler, post(gateway.body), f.runtime)).statusCode, 200);
+    assert.equal(f.calls.filter((call) => call === 'rateLimit').length, 1);
+    assert.equal(f.calls.filter((call) => call === 'execute').length, 1);
   });
 }
 

@@ -243,6 +243,7 @@ async function invoke(request, services) {
   await handler(request, response, {
     getServices: () => services,
     verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+    checkRateLimit: async () => true,
   });
   return response;
 }

@@ -40,6 +40,7 @@ async function invoke(handler, req, runtime = {}) {
   const res = responseStub();
   await handler(req, res, {
     verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+    checkRateLimit: async () => true,
     ...runtime,
   });
   return res;

@@ -2,18 +2,17 @@ import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
+import { checkDistributedRateLimit } from '../_distributed_rate_limit.js';
 
 export const MAX_CIRCLE_DELETE_BODY_BYTES = 256;
 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const MAX_REQUESTS_PER_WINDOW = 5;
-const MAX_TRACKED_KEYS = 10_000;
 const ALLOWED_ORIGINS = new Set([
   'https://painel.life-os.com',
   'https://app.life-os.com',
   'http://localhost:3000',
 ]);
-const requestTracker = new Map();
 
 let db;
 
@@ -176,25 +175,6 @@ function getFirebaseServices() {
   return { auth: getAuth(), appCheck: getAppCheck(), db };
 }
 
-function checkRateLimit(uid, nowMillis) {
-  if (requestTracker.size >= MAX_TRACKED_KEYS) {
-    for (const [key, entry] of requestTracker) {
-      if (nowMillis - entry.startedAt >= RATE_LIMIT_WINDOW_MS) {
-        requestTracker.delete(key);
-      }
-    }
-  }
-  const current = requestTracker.get(uid);
-  if (!current || nowMillis - current.startedAt >= RATE_LIMIT_WINDOW_MS) {
-    if (!current && requestTracker.size >= MAX_TRACKED_KEYS) return false;
-    requestTracker.set(uid, { count: 1, startedAt: nowMillis });
-    return true;
-  }
-  if (current.count >= MAX_REQUESTS_PER_WINDOW) return false;
-  current.count += 1;
-  return true;
-}
-
 function sendError(res, error) {
   if (error instanceof CircleHttpError) {
     return res.status(error.statusCode).json({
@@ -273,7 +253,26 @@ export function createCircleDeleteHandler(
         );
       }
       const nowMillis = (runtime.nowProvider ?? nowProvider)();
-      if (!checkRateLimit(uid, nowMillis)) {
+      const checkRateLimit = runtime.checkRateLimit ?? checkDistributedRateLimit;
+      let rateLimitAllowed;
+      try {
+        rateLimitAllowed = await checkRateLimit({
+          db: services.db,
+          scope: 'circle_delete',
+          uid,
+          limit: MAX_REQUESTS_PER_WINDOW,
+          windowMs: RATE_LIMIT_WINDOW_MS,
+          nowMs: nowMillis,
+        });
+      } catch (_) {
+        console.error('[circles] Falha ao verificar rate limit.');
+        throw new CircleHttpError(
+          503,
+          'RATE_LIMIT_UNAVAILABLE',
+          'Não foi possível verificar o limite de solicitações.',
+        );
+      }
+      if (!rateLimitAllowed) {
         throw new CircleHttpError(
           429,
           'RATE_LIMITED',

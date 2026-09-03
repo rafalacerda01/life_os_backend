@@ -1,7 +1,17 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import { checkDistributedRateLimit } from '../api/_distributed_rate_limit.js';
+
+const GATEWAY_SCOPES = [
+  'activity_task_complete',
+  'activity_habit_complete',
+  'focus_start',
+  'focus_finish',
+  'focus_cancel',
+  'circle_delete',
+];
 
 class FakeFirestore {
   constructor() {
@@ -126,7 +136,11 @@ test('account_delete permite cinco concorrentes e renova somente após 60s', asy
 });
 
 test('scopes desconhecidos continuam rejeitados antes de acessar Firestore', async () => {
-  for (const scope of ['account', 'account_update', 'unknown', 'account_delete/unsafe']) {
+  for (const scope of [
+    'account', 'account_update', 'unknown', 'account_delete/unsafe',
+    'activity', 'taskComplete', 'activity_unknown', 'focus', 'focus_unknown',
+    'circle', 'circles_delete', 'circle_delete/unsafe',
+  ]) {
     const db = new FakeFirestore();
     await assert.rejects(check(db, { scope }), {
       message: 'DISTRIBUTED_RATE_LIMIT_FAILED',
@@ -134,6 +148,27 @@ test('scopes desconhecidos continuam rejeitados antes de acessar Firestore', asy
     assert.deepEqual(db.documentIds, []);
     assert.equal(db.transactionCalls, 0);
   }
+});
+
+for (const scope of ['chat', 'sync', 'account_delete', ...GATEWAY_SCOPES]) {
+  test(`${scope}: scope permitido usa exatamente SHA-256 do UID`, async () => {
+    const db = new FakeFirestore();
+    const uid = 'private-gateway-user';
+    assert.equal(await check(db, { scope, uid }), true);
+    const hash = createHash('sha256').update(uid, 'utf8').digest('hex');
+    assert.deepEqual(db.documentIds, [`${scope}_${hash}`]);
+    assert.deepEqual([...db.documents.values()], [{ windowStartMs: 1_000, count: 1 }]);
+    assert.equal(JSON.stringify([...db.documents]).includes(uid), false);
+  });
+}
+
+test('novos scopes esgotados nao consomem quota das demais operacoes', async () => {
+  const db = new FakeFirestore();
+  for (const scope of GATEWAY_SCOPES) {
+    assert.equal(await check(db, { scope, limit: 1 }), true);
+    assert.equal(await check(db, { scope, limit: 1 }), false);
+  }
+  assert.equal(db.documents.size, GATEWAY_SCOPES.length);
 });
 
 test('usuários diferentes possuem contadores independentes', async () => {
