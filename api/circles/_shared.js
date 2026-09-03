@@ -1,4 +1,5 @@
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 
@@ -84,7 +85,7 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Authorization',
+    'Content-Type, Authorization, X-Firebase-AppCheck',
   );
 }
 
@@ -172,7 +173,7 @@ function getFirebaseServices() {
     initializeApp({ credential: cert({ projectId, clientEmail, privateKey }) });
   }
   db ??= getFirestore();
-  return { auth: getAuth(), db };
+  return { auth: getAuth(), appCheck: getAppCheck(), db };
 }
 
 function checkRateLimit(uid, nowMillis) {
@@ -225,8 +226,34 @@ export function createCircleDeleteHandler(
     try {
       assertJsonRequest(req);
       const body = validateCircleDeletePayload(req.body);
-      const token = extractBearerToken(req);
+      const rawAppCheckToken = req.headers?.['x-firebase-appcheck'];
+      if (
+        typeof rawAppCheckToken !== 'string' ||
+        rawAppCheckToken.trim().length === 0
+      ) {
+        throw new CircleHttpError(
+          401,
+          'APP_CHECK_REQUIRED',
+          'Verificação de segurança do aplicativo necessária.',
+        );
+      }
+
       const services = (runtime.getServices ?? getServices)();
+      const verifyAppCheckToken =
+        runtime.verifyAppCheckToken ??
+        ((token) => services.appCheck.verifyToken(token));
+      try {
+        await verifyAppCheckToken(rawAppCheckToken.trim());
+      } catch (_) {
+        console.error('[circles] Falha na verificação do App Check.');
+        throw new CircleHttpError(
+          401,
+          'APP_CHECK_INVALID',
+          'Verificação de segurança do aplicativo inválida.',
+        );
+      }
+
+      const token = extractBearerToken(req);
       let decodedToken;
       try {
         decodedToken = await services.auth.verifyIdToken(token, true);

@@ -240,7 +240,10 @@ function createResponse() {
 
 async function invoke(request, services) {
   const response = createResponse();
-  await handler(request, response, { getServices: () => services });
+  await handler(request, response, {
+    getServices: () => services,
+    verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+  });
   return response;
 }
 
@@ -249,12 +252,16 @@ test('unauthenticated request is rejected before deletion', async () => {
   const response = await invoke(
     {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-firebase-appcheck': 'test-app-check',
+      },
       body: { circleId: CIRCLE_ID },
     },
     { auth: {}, db },
   );
   assert.equal(response.statusCode, 401);
+  assert.equal(response.body.code, 'UNAUTHENTICATED');
   assert.ok(db.data(`circles/${CIRCLE_ID}`));
 });
 
@@ -378,6 +385,7 @@ test('Circle continua verificando o ID token com checkRevoked=true', async () =>
       headers: {
         'content-type': 'application/json',
         authorization: 'Bearer circle-token',
+        'x-firebase-appcheck': 'test-app-check',
       },
       body: { circleId: CIRCLE_ID },
     },
@@ -406,6 +414,7 @@ test('handler takes uid only from verified token and validates JSON body', async
       headers: {
         'content-type': 'application/json',
         authorization: 'Bearer token',
+        'x-firebase-appcheck': 'test-app-check',
       },
       body: { circleId: CIRCLE_ID, adminUid: OTHER_UID },
     },

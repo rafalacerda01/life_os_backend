@@ -1,4 +1,5 @@
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore, Timestamp } from 'firebase-admin/firestore';
 
@@ -97,7 +98,7 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Authorization',
+    'Content-Type, Authorization, X-Firebase-AppCheck',
   );
 }
 
@@ -150,7 +151,7 @@ function getFirebaseServices() {
   }
 
   db ??= getFirestore();
-  return { auth: getAuth(), db };
+  return { auth: getAuth(), appCheck: getAppCheck(), db };
 }
 
 function extractBearerToken(req) {
@@ -224,10 +225,35 @@ export function createActivityHandler(operation, fallbackCode, execute) {
 
     try {
       assertBodyWithinLimit(req);
-      const token = extractBearerToken(req);
-      const { auth, db: firestore } = (
+      const rawAppCheckToken = req.headers?.['x-firebase-appcheck'];
+      if (
+        typeof rawAppCheckToken !== 'string' ||
+        rawAppCheckToken.trim().length === 0
+      ) {
+        throw new ActivityHttpError(
+          401,
+          'APP_CHECK_REQUIRED',
+          'Verificação de segurança do aplicativo necessária.',
+        );
+      }
+
+      const { auth, appCheck, db: firestore } = (
         runtime.getServices ?? getFirebaseServices
       )();
+      const verifyAppCheckToken =
+        runtime.verifyAppCheckToken ?? ((token) => appCheck.verifyToken(token));
+      try {
+        await verifyAppCheckToken(rawAppCheckToken.trim());
+      } catch (_) {
+        console.error('[activity] Falha na verificação do App Check.');
+        throw new ActivityHttpError(
+          401,
+          'APP_CHECK_INVALID',
+          'Verificação de segurança do aplicativo inválida.',
+        );
+      }
+
+      const token = extractBearerToken(req);
       let decodedToken;
       try {
         decodedToken = await auth.verifyIdToken(token, true);

@@ -38,7 +38,10 @@ function responseStub() {
 
 async function invoke(handler, req, runtime = {}) {
   const res = responseStub();
-  await handler(req, res, runtime);
+  await handler(req, res, {
+    verifyAppCheckToken: async () => ({ appId: 'test-app' }),
+    ...runtime,
+  });
   return res;
 }
 
