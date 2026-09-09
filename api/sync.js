@@ -12,6 +12,10 @@ import {
   syncTaskUpdate,
 } from './activity/_sync_updates.js';
 import { checkDistributedRateLimit } from './_distributed_rate_limit.js';
+import {
+  applyStudyActivity,
+  validateStudyActivityPayload,
+} from './study/_sync_activity.js';
 // ============================================================================
 // LIFE OS - SYNC ENDPOINT
 // ============================================================================
@@ -155,6 +159,18 @@ const SAFE_SYNC_DOMAIN_ERRORS = Object.freeze({
     statusCode: 409,
     messages: Object.freeze([
       'A matéria possui flashcards demais para exclusão transacional.',
+    ]),
+  }),
+  STUDY_ACTIVITY_SUBJECT_NOT_FOUND: Object.freeze({
+    statusCode: 409,
+    messages: Object.freeze([
+      'A matéria da atividade de estudo não foi encontrada.',
+    ]),
+  }),
+  STUDY_ACTIVITY_STATE_INVALID: Object.freeze({
+    statusCode: 409,
+    messages: Object.freeze([
+      'O estado remoto de estudos está inconsistente.',
     ]),
   }),
   GOAL_QUOTA_MIGRATION_REQUIRED: Object.freeze({
@@ -2681,6 +2697,38 @@ export async function syncHandler(req, res, runtime = {}) {
         return res.status(500).json({
           error: 'Nao foi possivel confirmar a atualizacao.',
           code: 'COMPETITIVE_SYNC_FAILED',
+        });
+      }
+    }
+
+    if (operation === 'apply_study_activity') {
+      const validation = validateStudyActivityPayload(rawBody);
+      if (!validation.valid) {
+        return res.status(400).json({
+          error: validation.error,
+          code: 'INVALID_PAYLOAD',
+        });
+      }
+
+      try {
+        const result = await (
+          runtime.applyStudyActivity ?? applyStudyActivity
+        )({
+          db,
+          userId,
+          ...validation.value,
+        });
+
+        return res.status(200).json({
+          success: true,
+          operation: 'apply_study_activity',
+          alreadyApplied: result.alreadyApplied,
+        });
+      } catch (error) {
+        return sendSyncOperationError(res, error, {
+          logMessage: '[sync] Falha ao aplicar atividade de estudo.',
+          fallbackError: 'Não foi possível aplicar a atividade de estudo.',
+          fallbackCode: 'STUDY_ACTIVITY_APPLY_FAILED',
         });
       }
     }
