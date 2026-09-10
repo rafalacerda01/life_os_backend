@@ -16,6 +16,14 @@ import {
   applyStudyActivity,
   validateStudyActivityPayload,
 } from './study/_sync_activity.js';
+import {
+  applyStudyProgressReset,
+  validateStudyProgressResetPayload,
+} from './study/_sync_progress_reset.js';
+import {
+  applyStudyReview,
+  validateStudyReviewPayload,
+} from './study/_sync_review.js';
 // ============================================================================
 // LIFE OS - SYNC ENDPOINT
 // ============================================================================
@@ -171,6 +179,30 @@ const SAFE_SYNC_DOMAIN_ERRORS = Object.freeze({
     statusCode: 409,
     messages: Object.freeze([
       'O estado remoto de estudos está inconsistente.',
+    ]),
+  }),
+  STUDY_PROGRESS_STATE_INVALID: Object.freeze({
+    statusCode: 409,
+    messages: Object.freeze([
+      'O estado remoto do progresso de estudos está inconsistente.',
+    ]),
+  }),
+  STUDY_REVIEW_CARD_NOT_FOUND: Object.freeze({
+    statusCode: 409,
+    messages: Object.freeze([
+      'O flashcard da revisão não foi encontrado.',
+    ]),
+  }),
+  STUDY_REVIEW_SUBJECT_NOT_FOUND: Object.freeze({
+    statusCode: 409,
+    messages: Object.freeze([
+      'A matéria da revisão não foi encontrada.',
+    ]),
+  }),
+  STUDY_REVIEW_STATE_INVALID: Object.freeze({
+    statusCode: 409,
+    messages: Object.freeze([
+      'O estado remoto da revisão de estudo está inconsistente.',
     ]),
   }),
   GOAL_QUOTA_MIGRATION_REQUIRED: Object.freeze({
@@ -2729,6 +2761,72 @@ export async function syncHandler(req, res, runtime = {}) {
           logMessage: '[sync] Falha ao aplicar atividade de estudo.',
           fallbackError: 'Não foi possível aplicar a atividade de estudo.',
           fallbackCode: 'STUDY_ACTIVITY_APPLY_FAILED',
+        });
+      }
+    }
+
+    if (operation === 'apply_study_progress_reset') {
+      const validation = validateStudyProgressResetPayload(rawBody);
+      if (!validation.valid) {
+        return res.status(400).json({
+          error: validation.error,
+          code: 'INVALID_PAYLOAD',
+        });
+      }
+
+      try {
+        const result = await (
+          runtime.applyStudyProgressReset ?? applyStudyProgressReset
+        )({
+          db,
+          userId,
+          ...validation.value,
+        });
+
+        return res.status(200).json({
+          success: true,
+          operation: 'apply_study_progress_reset',
+          alreadyApplied: result.alreadyApplied,
+          skippedAsStale: result.skippedAsStale,
+        });
+      } catch (error) {
+        return sendSyncOperationError(res, error, {
+          logMessage: '[sync] Falha ao aplicar reset de progresso de estudo.',
+          fallbackError: 'Não foi possível aplicar o reset de progresso de estudo.',
+          fallbackCode: 'STUDY_PROGRESS_RESET_FAILED',
+        });
+      }
+    }
+
+    if (operation === 'apply_study_review') {
+      const validation = validateStudyReviewPayload(rawBody);
+      if (!validation.valid) {
+        return res.status(400).json({
+          error: validation.error,
+          code: 'INVALID_PAYLOAD',
+        });
+      }
+
+      try {
+        const result = await (
+          runtime.applyStudyReview ?? applyStudyReview
+        )({
+          db,
+          userId,
+          ...validation.value,
+        });
+
+        return res.status(200).json({
+          success: true,
+          operation: 'apply_study_review',
+          alreadyApplied: result.alreadyApplied,
+          skippedAsStale: result.skippedAsStale,
+        });
+      } catch (error) {
+        return sendSyncOperationError(res, error, {
+          logMessage: '[sync] Falha ao aplicar revisão de estudo.',
+          fallbackError: 'Não foi possível aplicar a revisão de estudo.',
+          fallbackCode: 'STUDY_REVIEW_APPLY_FAILED',
         });
       }
     }

@@ -152,6 +152,18 @@ function readOptionalDate(data, field) {
   return date;
 }
 
+function readProgressState(snapshot) {
+  if (!snapshot.exists) return null;
+  const data = snapshot.data();
+  if (
+    !isPlainObject(data) ||
+    !hasExactKeys(data, new Set(['lastResetAt']))
+  ) {
+    throw stateInvalid();
+  }
+  return readOptionalDate(data, 'lastResetAt');
+}
+
 function localDayOrdinal(date, timeZoneOffsetMinutes) {
   const localTime = new Date(date.getTime() + timeZoneOffsetMinutes * 60 * 1000);
   return Math.floor(
@@ -217,16 +229,26 @@ export async function applyStudyActivity({
   const userRef = db.collection('users').doc(userId);
   const receiptRef = userRef.collection('study_activity_receipts').doc(mutationId);
   const studyInfoRef = userRef.collection('study_info').doc('main');
+  const progressStateRef = userRef.collection('study_progress_state').doc('main');
+  const progressEventRef = userRef
+    .collection('study_progress_events')
+    .doc(mutationId);
   const subjectRef = subjectId === null
     ? null
     : userRef.collection('subjects').doc(subjectId);
 
   return db.runTransaction(async (transaction) => {
-    const [userSnapshot, receiptSnapshot, studyInfoSnapshot, subjectSnapshot] =
-      await Promise.all([
+    const [
+      userSnapshot,
+      receiptSnapshot,
+      studyInfoSnapshot,
+      progressStateSnapshot,
+      subjectSnapshot,
+    ] = await Promise.all([
         transaction.get(userRef),
         transaction.get(receiptRef),
         transaction.get(studyInfoRef),
+        transaction.get(progressStateRef),
         subjectRef === null ? Promise.resolve(null) : transaction.get(subjectRef),
       ]);
 
@@ -251,13 +273,18 @@ export async function applyStudyActivity({
       required: remoteLastStudyDate !== null,
     });
     const currentProgress = readProgress(studyInfoData);
+    const lastResetAt = readProgressState(progressStateSnapshot);
+    const shouldCreditGlobalProgress =
+      lastResetAt === null || occurredAt.getTime() > lastResetAt.getTime();
     const studyState = nextStudyState({
       currentStreak,
       remoteLastStudyDate,
       occurredAt,
       timeZoneOffsetMinutes,
     });
-    const newProgress = Math.min(1, currentProgress + progressDelta);
+    const newProgress = shouldCreditGlobalProgress
+      ? Math.min(1, currentProgress + progressDelta)
+      : currentProgress;
 
     let newSubjectProgress = null;
     let subjectStreakDays = null;
@@ -283,6 +310,15 @@ export async function applyStudyActivity({
       },
       { merge: true },
     );
+
+    if (shouldCreditGlobalProgress) {
+      transaction.set(progressEventRef, {
+        kind: 'study_activity',
+        progressDelta,
+        occurredAt,
+        createdAt: serverTimestamp(),
+      });
+    }
 
     if (subjectRef !== null) {
       transaction.update(subjectRef, {

@@ -168,6 +168,78 @@ test('progress é limitado a um', async () => {
   assert.equal(db.read('users/user-a/study_info/main').progress, 1);
 });
 
+test('atividade posterior ao reset cria ledger mesmo com progress em um', async () => {
+  const db = firestoreWithStudyInfo({ progress: 1 });
+  db.data.set('users/user-a/study_progress_state/main', {
+    lastResetAt: new Date('2026-09-09T10:00:00.000Z'),
+  });
+
+  await apply(db);
+
+  assert.equal(db.read('users/user-a/study_info/main').progress, 1);
+  assert.deepEqual(
+    db.read(`users/user-a/study_progress_events/${mutationA}`),
+    {
+      kind: 'study_activity',
+      progressDelta: .25,
+      occurredAt: new Date('2026-09-09T12:00:00.000Z'),
+      createdAt: 'SERVER_TIMESTAMP',
+    },
+  );
+});
+
+test('atividade anterior ou igual ao reset não credita global nem cria ledger', async () => {
+  for (const resetAt of [
+    '2026-09-09T12:00:00.000Z',
+    '2026-09-09T13:00:00.000Z',
+  ]) {
+    const db = firestoreWithStudyInfo(
+      { progress: .4 },
+      { progress: .3, streakDays: 2 },
+    );
+    db.data.set('users/user-a/study_progress_state/main', {
+      lastResetAt: new Date(resetAt),
+    });
+
+    await apply(db, { subjectId: 'subject-1' });
+
+    assert.equal(db.read('users/user-a/study_info/main').progress, .4);
+    assert.equal(db.read('users/user-a/subjects/subject-1').progress, .55);
+    assert.equal(
+      db.read(`users/user-a/study_progress_events/${mutationA}`),
+      undefined,
+    );
+    assert.deepEqual(
+      db.read(`users/user-a/study_activity_receipts/${mutationA}`),
+      { appliedAt: 'SERVER_TIMESTAMP' },
+    );
+  }
+});
+
+test('progress state inválido falha fechado sem writes ou receipt', async () => {
+  const studyInfo = { progress: .2 };
+  const db = firestoreWithStudyInfo(studyInfo);
+  db.data.set('users/user-a/study_progress_state/main', {
+    lastResetAt: null,
+  });
+
+  await assert.rejects(
+    apply(db),
+    (error) =>
+      error.statusCode === 409 && error.code === 'STUDY_ACTIVITY_STATE_INVALID',
+  );
+
+  assert.deepEqual(db.read('users/user-a/study_info/main'), studyInfo);
+  assert.equal(
+    db.read(`users/user-a/study_activity_receipts/${mutationA}`),
+    undefined,
+  );
+  assert.equal(
+    db.read(`users/user-a/study_progress_events/${mutationA}`),
+    undefined,
+  );
+});
+
 test('subject progress soma server-side na mesma transação', async () => {
   const db = firestoreWithStudyInfo(
     { progress: .2 },
