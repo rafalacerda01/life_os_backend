@@ -154,6 +154,7 @@ test('review normal atualiza card, counters, progress e ledger atomicamente', as
   });
   assert.equal(db.read(paths.info).reviewQueue, 2);
   assert.equal(db.read(paths.info).progress, .25);
+  assert.equal(db.read(paths.info).streak, 1);
   assert.equal(db.read(paths.subject).cardsToReview, 1);
   assert.equal(db.read(paths.card).lastReviewed.toISOString(), occurredAt.toISOString());
   assert.deepEqual(db.read(paths.event), {
@@ -201,6 +202,12 @@ test('review anterior ou igual ao reset conclui sem progress ou ledger', async (
 test('replay exato é no-op sem decremento duplicado', async () => {
   const db = database({
     [paths.card]: { subjectId: 'subject-1', lastReviewed: occurredAt },
+    [paths.info]: {
+      reviewQueue: 3,
+      progress: .2,
+      streak: 5,
+      lastStudyDate: new Date('2026-09-08T12:00:00.000Z'),
+    },
   });
   const before = clone(Object.fromEntries(db.data));
   const result = await apply(db);
@@ -326,6 +333,7 @@ test('study_info ausente usa defaults permitidos', async () => {
   await apply(db);
   assert.deepEqual(db.read(paths.info), {
     reviewQueue: 0,
+    streak: 1,
     lastStudyDate: occurredAt,
     progress: .05,
   });
@@ -338,6 +346,7 @@ test('lastStudyDate ausente recebe occurredAt', async () => {
 
   await apply(db);
 
+  assert.equal(db.read(paths.info).streak, 1);
   assert.equal(
     db.read(paths.info).lastStudyDate.toISOString(),
     occurredAt.toISOString(),
@@ -350,12 +359,14 @@ test('review mais nova avança lastStudyDate', async () => {
     [paths.info]: {
       reviewQueue: 3,
       progress: .2,
+      streak: 5,
       lastStudyDate: previous,
     },
   });
 
   await apply(db);
 
+  assert.equal(db.read(paths.info).streak, 5);
   assert.equal(
     db.read(paths.info).lastStudyDate.toISOString(),
     occurredAt.toISOString(),
@@ -371,6 +382,7 @@ test('review atrasada não regride lastStudyDate global', async () => {
     [paths.info]: {
       reviewQueue: 3,
       progress: .2,
+      streak: 6,
       lastStudyDate: currentGlobal,
     },
   });
@@ -384,6 +396,7 @@ test('review atrasada não regride lastStudyDate global', async () => {
   assert.equal(db.read(paths.info).reviewQueue, 2);
   assert.equal(db.read(paths.subject).cardsToReview, 1);
   assert.equal(db.read(paths.info).progress, .25);
+  assert.equal(db.read(paths.info).streak, 6);
   assert.equal(
     db.read(paths.info).lastStudyDate.toISOString(),
     currentGlobal.toISOString(),
@@ -396,12 +409,14 @@ test('lastStudyDate igual a occurredAt permanece estável', async () => {
     [paths.info]: {
       reviewQueue: 3,
       progress: .2,
+      streak: 5,
       lastStudyDate: occurredAt,
     },
   });
 
   await apply(db);
 
+  assert.equal(db.read(paths.info).streak, 5);
   assert.equal(
     db.read(paths.info).lastStudyDate.toISOString(),
     occurredAt.toISOString(),
@@ -424,6 +439,99 @@ test('lastStudyDate presente null falha fechado', async () => {
     (error) => error.code === 'STUDY_REVIEW_STATE_INVALID',
   );
   assertNoWrites(db, before);
+});
+
+test('review no dia local seguinte incrementa streak uma vez', async () => {
+  const db = database({
+    [paths.info]: {
+      reviewQueue: 3,
+      progress: .2,
+      streak: 5,
+      lastStudyDate: new Date('2026-09-08T12:00:00.000Z'),
+    },
+  });
+
+  await apply(db);
+
+  assert.equal(db.read(paths.info).streak, 6);
+  assert.equal(
+    db.read(paths.info).lastStudyDate.toISOString(),
+    occurredAt.toISOString(),
+  );
+});
+
+test('review no mesmo dia local mantém streak', async () => {
+  const db = database({
+    [paths.info]: {
+      reviewQueue: 3,
+      progress: .2,
+      streak: 5,
+      lastStudyDate: new Date('2026-09-09T10:00:00.000Z'),
+    },
+  });
+
+  await apply(db);
+
+  assert.equal(db.read(paths.info).streak, 5);
+  assert.equal(
+    db.read(paths.info).lastStudyDate.toISOString(),
+    occurredAt.toISOString(),
+  );
+});
+
+test('gap maior que um dia reinicia streak', async () => {
+  const db = database({
+    [paths.info]: {
+      reviewQueue: 3,
+      progress: .2,
+      streak: 5,
+      lastStudyDate: new Date('2026-09-06T12:00:00.000Z'),
+    },
+  });
+
+  await apply(db);
+
+  assert.equal(db.read(paths.info).streak, 1);
+  assert.equal(
+    db.read(paths.info).lastStudyDate.toISOString(),
+    occurredAt.toISOString(),
+  );
+});
+
+test('lastStudyDate presente exige streak', async () => {
+  const db = database({
+    [paths.info]: {
+      reviewQueue: 3,
+      progress: .2,
+      lastStudyDate: new Date('2026-09-08T12:00:00.000Z'),
+    },
+  });
+  const before = clone(Object.fromEntries(db.data));
+
+  await assert.rejects(
+    apply(db),
+    (error) => error.code === 'STUDY_REVIEW_STATE_INVALID',
+  );
+  assertNoWrites(db, before);
+});
+
+test('streak presente inválida falha fechado', async () => {
+  for (const invalidStreak of [null, -1, 1.5, '5']) {
+    const db = database({
+      [paths.info]: {
+        reviewQueue: 3,
+        progress: .2,
+        streak: invalidStreak,
+      },
+    });
+    const before = clone(Object.fromEntries(db.data));
+
+    await assert.rejects(
+      apply(db),
+      (error) => error.code === 'STUDY_REVIEW_STATE_INVALID',
+    );
+    assertNoWrites(db, before);
+  }
 });
 
 test('lastStudyDate presente inválido falha fechado', async () => {

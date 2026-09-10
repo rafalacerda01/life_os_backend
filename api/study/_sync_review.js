@@ -142,6 +142,44 @@ function localDayOrdinal(date, timeZoneOffsetMinutes) {
   );
 }
 
+function nextStudyState({
+  currentStreak,
+  remoteLastStudyDate,
+  occurredAt,
+  timeZoneOffsetMinutes,
+}) {
+  if (remoteLastStudyDate === null) {
+    return { streak: 1, lastStudyDate: occurredAt };
+  }
+
+  const eventDay = localDayOrdinal(occurredAt, timeZoneOffsetMinutes);
+  const remoteDay = localDayOrdinal(
+    remoteLastStudyDate,
+    timeZoneOffsetMinutes,
+  );
+  const dayDifference = eventDay - remoteDay;
+
+  if (dayDifference < 0) {
+    return {
+      streak: currentStreak,
+      lastStudyDate: remoteLastStudyDate,
+    };
+  }
+  if (dayDifference === 0) {
+    return {
+      streak: currentStreak,
+      lastStudyDate:
+        occurredAt.getTime() > remoteLastStudyDate.getTime()
+          ? occurredAt
+          : remoteLastStudyDate,
+    };
+  }
+  if (dayDifference === 1) {
+    return { streak: currentStreak + 1, lastStudyDate: occurredAt };
+  }
+  return { streak: 1, lastStudyDate: occurredAt };
+}
+
 export async function applyStudyReview({
   db,
   userId,
@@ -222,6 +260,9 @@ export async function applyStudyReview({
       studyInfoData,
       'lastStudyDate',
     );
+    const currentStreak = readNonNegativeInteger(studyInfoData, 'streak', {
+      required: currentLastStudyDate !== null,
+    });
     const lastResetAt = readLastResetAt(progressStateSnapshot);
 
     if (currentLastReviewed !== null) {
@@ -244,16 +285,18 @@ export async function applyStudyReview({
     const newCardsToReview = Math.max(0, currentCardsToReview - 1);
     const shouldCreditGlobalProgress =
       lastResetAt === null || occurredAt.getTime() > lastResetAt.getTime();
-    const nextLastStudyDate =
-      currentLastStudyDate === null ||
-      occurredAt.getTime() > currentLastStudyDate.getTime()
-        ? occurredAt
-        : currentLastStudyDate;
+    const studyState = nextStudyState({
+      currentStreak,
+      remoteLastStudyDate: currentLastStudyDate,
+      occurredAt,
+      timeZoneOffsetMinutes,
+    });
 
     transaction.update(cardRef, { lastReviewed: occurredAt });
     const studyInfoUpdate = {
       reviewQueue: newReviewQueue,
-      lastStudyDate: nextLastStudyDate,
+      streak: studyState.streak,
+      lastStudyDate: studyState.lastStudyDate,
     };
     if (shouldCreditGlobalProgress) {
       studyInfoUpdate.progress = Math.min(1, currentProgress + .05);
