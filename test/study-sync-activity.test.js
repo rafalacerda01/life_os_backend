@@ -49,16 +49,71 @@ class MemoryCollection {
   doc(id) {
     return new MemoryReference(this.owner, `${this.path}/${id}`);
   }
+
+  where(field, operator, value) {
+    return new MemoryQuery(this.owner, this.path).where(field, operator, value);
+  }
+
+  orderBy(field, direction) {
+    return new MemoryQuery(this.owner, this.path).orderBy(field, direction);
+  }
+}
+
+class MemoryQuery {
+  constructor(owner, path, filter = null, order = null, limitCount = null) {
+    this.owner = owner;
+    this.path = path;
+    this.filter = filter;
+    this.order = order;
+    this.limitCount = limitCount;
+  }
+
+  where(field, operator, value) {
+    return new MemoryQuery(
+      this.owner,
+      this.path,
+      { field, operator, value },
+      this.order,
+      this.limitCount,
+    );
+  }
+
+  orderBy(field, direction) {
+    return new MemoryQuery(
+      this.owner,
+      this.path,
+      this.filter,
+      { field, direction },
+      this.limitCount,
+    );
+  }
+
+  limit(count) {
+    return new MemoryQuery(
+      this.owner,
+      this.path,
+      this.filter,
+      this.order,
+      count,
+    );
+  }
 }
 
 class MemorySnapshot {
-  constructor(value) {
+  constructor(value, ref = null) {
     this.value = value;
     this.exists = value !== undefined;
+    this.ref = ref;
   }
 
   data() {
     return this.value === undefined ? undefined : cloneValue(this.value);
+  }
+}
+
+class MemoryQuerySnapshot {
+  constructor(docs) {
+    this.docs = docs;
   }
 }
 
@@ -69,8 +124,42 @@ class MemoryTransaction {
     );
   }
 
-  async get(reference) {
-    return new MemorySnapshot(this.data.get(reference.path));
+  async get(target) {
+    if (target instanceof MemoryQuery) {
+      const prefix = `${target.path}/`;
+      let documents = [...this.data.entries()]
+        .filter(([path]) =>
+          path.startsWith(prefix) && !path.slice(prefix.length).includes('/'))
+        .map(([path, value]) => ({ path, value }));
+      if (target.filter !== null) {
+        const { field, operator, value } = target.filter;
+        documents = documents.filter((document) => {
+          const candidate = document.value[field];
+          if (operator === '<=') return candidate <= value;
+          if (operator === '>') return candidate > value;
+          throw new Error('UNSUPPORTED_QUERY');
+        });
+      }
+      if (target.order !== null) {
+        const { field, direction } = target.order;
+        documents.sort((left, right) => {
+          const comparison = left.value[field] - right.value[field];
+          return direction === 'desc' ? -comparison : comparison;
+        });
+      }
+      if (target.limitCount !== null) {
+        documents = documents.slice(0, target.limitCount);
+      }
+      return new MemoryQuerySnapshot(
+        documents.map(
+          (document) => new MemorySnapshot(
+            document.value,
+            new MemoryReference(null, document.path),
+          ),
+        ),
+      );
+    }
+    return new MemorySnapshot(this.data.get(target.path), target);
   }
 
   set(reference, value, options) {
@@ -88,6 +177,10 @@ class MemoryTransaction {
       ...cloneValue(current),
       ...cloneValue(value),
     });
+  }
+
+  delete(reference) {
+    this.data.delete(reference.path);
   }
 }
 
@@ -326,6 +419,26 @@ test('estado remoto inválido não é sobrescrito', async () => {
   );
 });
 
+test('range remota inválida falha fechado com código de activity', async () => {
+  const db = firestoreWithStudyInfo({ progress: .2 });
+  db.data.set('users/user-a/study_streak_ranges/invalid', {
+    startDayOrdinal: 20705,
+    endDayOrdinal: 20704,
+  });
+  const before = cloneValue(Object.fromEntries(db.data));
+
+  await assert.rejects(
+    apply(db),
+    (error) => error.code === 'STUDY_ACTIVITY_STATE_INVALID',
+  );
+
+  assert.deepEqual(Object.fromEntries(db.data), before);
+  assert.equal(
+    db.read(`users/user-a/study_activity_receipts/${mutationA}`),
+    undefined,
+  );
+});
+
 test('campos numéricos presentes como null falham fechado', async () => {
   const cases = [
     {
@@ -469,6 +582,7 @@ test('validação backend rejeita campos extras e valores inválidos', () => {
     { ...valid, subjectId: 'invalid/id' },
     { ...valid, progressDelta: 0 },
     { ...valid, occurredAt: 'invalid' },
+    { ...valid, occurredAt: '2026-09-09T12:00:00' },
     { ...valid, timeZoneOffsetMinutes: 841 },
   ];
   for (const body of invalidBodies) {

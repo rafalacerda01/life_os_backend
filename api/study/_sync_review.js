@@ -1,9 +1,13 @@
 import { FieldValue } from 'firebase-admin/firestore';
 
+import {
+  canonicalLocalDayOrdinal,
+  updateStudyStreakHistory,
+} from './_streak_history.js';
+
 const MAX_ID_LENGTH = 128;
 const MIN_TIME_ZONE_OFFSET_MINUTES = -840;
 const MAX_TIME_ZONE_OFFSET_MINUTES = 840;
-const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 const EXPLICIT_TIME_ZONE_PATTERN = /(?:Z|[+-]\d{2}:\d{2})$/i;
 
 function isPlainObject(value) {
@@ -113,6 +117,13 @@ function readNonNegativeInteger(data, field, { required = false } = {}) {
   return value;
 }
 
+function readOptionalDayOrdinal(data, field) {
+  if (!Object.hasOwn(data, field)) return null;
+  const value = data[field];
+  if (!Number.isInteger(value)) throw stateInvalid();
+  return value;
+}
+
 function readProgress(data) {
   if (!Object.hasOwn(data, 'progress')) return 0;
   const value = data.progress;
@@ -129,55 +140,6 @@ function readLastResetAt(snapshot) {
     throw stateInvalid();
   }
   return readDate(data.lastResetAt);
-}
-
-function localDayOrdinal(date, timeZoneOffsetMinutes) {
-  const localTime = new Date(date.getTime() + timeZoneOffsetMinutes * 60 * 1000);
-  return Math.floor(
-    Date.UTC(
-      localTime.getUTCFullYear(),
-      localTime.getUTCMonth(),
-      localTime.getUTCDate(),
-    ) / MILLISECONDS_PER_DAY,
-  );
-}
-
-function nextStudyState({
-  currentStreak,
-  remoteLastStudyDate,
-  occurredAt,
-  timeZoneOffsetMinutes,
-}) {
-  if (remoteLastStudyDate === null) {
-    return { streak: 1, lastStudyDate: occurredAt };
-  }
-
-  const eventDay = localDayOrdinal(occurredAt, timeZoneOffsetMinutes);
-  const remoteDay = localDayOrdinal(
-    remoteLastStudyDate,
-    timeZoneOffsetMinutes,
-  );
-  const dayDifference = eventDay - remoteDay;
-
-  if (dayDifference < 0) {
-    return {
-      streak: currentStreak,
-      lastStudyDate: remoteLastStudyDate,
-    };
-  }
-  if (dayDifference === 0) {
-    return {
-      streak: currentStreak,
-      lastStudyDate:
-        occurredAt.getTime() > remoteLastStudyDate.getTime()
-          ? occurredAt
-          : remoteLastStudyDate,
-    };
-  }
-  if (dayDifference === 1) {
-    return { streak: currentStreak + 1, lastStudyDate: occurredAt };
-  }
-  return { streak: 1, lastStudyDate: occurredAt };
 }
 
 export async function applyStudyReview({
@@ -197,6 +159,10 @@ export async function applyStudyReview({
   const progressEventRef = userRef
     .collection('study_progress_events')
     .doc(`review_${cardId}_${occurredAt.getTime()}`);
+  const eventDayOrdinal = canonicalLocalDayOrdinal(
+    occurredAt,
+    timeZoneOffsetMinutes,
+  );
 
   return db.runTransaction(async (transaction) => {
     const [
@@ -246,6 +212,16 @@ export async function applyStudyReview({
     }
 
     const currentLastReviewed = readOptionalDate(cardData, 'lastReviewed');
+    const currentLastReviewedDayOrdinal = readOptionalDayOrdinal(
+      cardData,
+      'lastReviewedDayOrdinal',
+    );
+    if (
+      currentLastReviewedDayOrdinal !== null &&
+      currentLastReviewed === null
+    ) {
+      throw stateInvalid();
+    }
     const currentCardsToReview = readNonNegativeInteger(
       subjectData,
       'cardsToReview',
@@ -265,38 +241,87 @@ export async function applyStudyReview({
     });
     const lastResetAt = readLastResetAt(progressStateSnapshot);
 
+    let shouldApplyCardEffects = true;
+    let alreadyApplied = false;
+    let skippedAsStale = false;
+    let shouldMigrateExactLegacyReplay = false;
     if (currentLastReviewed !== null) {
       const comparison = occurredAt.getTime() - currentLastReviewed.getTime();
-      if (comparison <= 0) {
-        return {
-          alreadyApplied: comparison === 0,
-          skippedAsStale: comparison < 0,
-        };
-      }
-      if (
-        localDayOrdinal(occurredAt, timeZoneOffsetMinutes) ===
-        localDayOrdinal(currentLastReviewed, timeZoneOffsetMinutes)
-      ) {
+      if (comparison === 0 && currentLastReviewedDayOrdinal !== null) {
         return { alreadyApplied: true, skippedAsStale: false };
       }
+      if (comparison <= 0) {
+        shouldApplyCardEffects = false;
+        alreadyApplied = comparison === 0;
+        skippedAsStale = comparison < 0;
+        shouldMigrateExactLegacyReplay =
+          comparison === 0 && currentLastReviewedDayOrdinal === null;
+      }
+      if (comparison > 0) {
+        // Legacy cards do not carry the historical offset. Use the new
+        // event's offset only until a newly applied review stores its ordinal.
+        const lastReviewedDayOrdinal =
+          currentLastReviewedDayOrdinal ??
+          canonicalLocalDayOrdinal(
+            currentLastReviewed,
+            timeZoneOffsetMinutes,
+          );
+        if (eventDayOrdinal === lastReviewedDayOrdinal) {
+          shouldApplyCardEffects = false;
+          alreadyApplied = true;
+        }
+      }
+    }
+
+    const streakHistory = await updateStudyStreakHistory({
+      transaction,
+      userRef,
+      occurredAt,
+      timeZoneOffsetMinutes,
+      currentStreak,
+      legacyLastStudyDate: currentLastStudyDate,
+      stateInvalid,
+    });
+    const lastStudyDate =
+      currentLastStudyDate !== null &&
+      currentLastStudyDate.getTime() > occurredAt.getTime()
+        ? currentLastStudyDate
+        : occurredAt;
+    const streakMetadataChanged =
+      streakHistory.historyChanged ||
+      streakHistory.streak !== currentStreak ||
+      currentLastStudyDate === null ||
+      lastStudyDate.getTime() !== currentLastStudyDate.getTime();
+
+    if (!shouldApplyCardEffects) {
+      if (shouldMigrateExactLegacyReplay) {
+        transaction.update(cardRef, {
+          lastReviewedDayOrdinal: eventDayOrdinal,
+        });
+      }
+      if (streakMetadataChanged) {
+        transaction.set(
+          studyInfoRef,
+          { streak: streakHistory.streak, lastStudyDate },
+          { merge: true },
+        );
+      }
+      return { alreadyApplied, skippedAsStale };
     }
 
     const newReviewQueue = Math.max(0, currentReviewQueue - 1);
     const newCardsToReview = Math.max(0, currentCardsToReview - 1);
     const shouldCreditGlobalProgress =
       lastResetAt === null || occurredAt.getTime() > lastResetAt.getTime();
-    const studyState = nextStudyState({
-      currentStreak,
-      remoteLastStudyDate: currentLastStudyDate,
-      occurredAt,
-      timeZoneOffsetMinutes,
-    });
 
-    transaction.update(cardRef, { lastReviewed: occurredAt });
+    transaction.update(cardRef, {
+      lastReviewed: occurredAt,
+      lastReviewedDayOrdinal: eventDayOrdinal,
+    });
     const studyInfoUpdate = {
       reviewQueue: newReviewQueue,
-      streak: studyState.streak,
-      lastStudyDate: studyState.lastStudyDate,
+      streak: streakHistory.streak,
+      lastStudyDate,
     };
     if (shouldCreditGlobalProgress) {
       studyInfoUpdate.progress = Math.min(1, currentProgress + .05);

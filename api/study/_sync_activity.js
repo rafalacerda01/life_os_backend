@@ -1,11 +1,13 @@
 import { FieldValue } from 'firebase-admin/firestore';
 
+import { updateStudyStreakHistory } from './_streak_history.js';
+
 const UUID_V4_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_SUBJECT_ID_LENGTH = 128;
 const MIN_TIME_ZONE_OFFSET_MINUTES = -840;
 const MAX_TIME_ZONE_OFFSET_MINUTES = 840;
-const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+const EXPLICIT_TIME_ZONE_PATTERN = /(?:Z|[+-]\d{2}:\d{2})$/i;
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -66,7 +68,11 @@ export function validateStudyActivityPayload(body) {
     return { valid: false, error: 'Delta de progresso inválido.' };
   }
 
-  if (typeof occurredAt !== 'string' || !Number.isFinite(Date.parse(occurredAt))) {
+  if (
+    typeof occurredAt !== 'string' ||
+    !EXPLICIT_TIME_ZONE_PATTERN.test(occurredAt) ||
+    !Number.isFinite(Date.parse(occurredAt))
+  ) {
     return { valid: false, error: 'Data da atividade de estudo inválida.' };
   }
 
@@ -164,58 +170,6 @@ function readProgressState(snapshot) {
   return readOptionalDate(data, 'lastResetAt');
 }
 
-function localDayOrdinal(date, timeZoneOffsetMinutes) {
-  const localTime = new Date(date.getTime() + timeZoneOffsetMinutes * 60 * 1000);
-  return Math.floor(
-    Date.UTC(
-      localTime.getUTCFullYear(),
-      localTime.getUTCMonth(),
-      localTime.getUTCDate(),
-    ) / MILLISECONDS_PER_DAY,
-  );
-}
-
-function nextStudyState({
-  currentStreak,
-  remoteLastStudyDate,
-  occurredAt,
-  timeZoneOffsetMinutes,
-}) {
-  if (remoteLastStudyDate === null) {
-    return { streak: 1, lastStudyDate: occurredAt, isOlder: false };
-  }
-
-  const eventDay = localDayOrdinal(occurredAt, timeZoneOffsetMinutes);
-  const remoteDay = localDayOrdinal(remoteLastStudyDate, timeZoneOffsetMinutes);
-  const dayDifference = eventDay - remoteDay;
-
-  if (dayDifference < 0) {
-    return {
-      streak: currentStreak,
-      lastStudyDate: remoteLastStudyDate,
-      isOlder: true,
-    };
-  }
-  if (dayDifference === 0) {
-    return {
-      streak: currentStreak,
-      lastStudyDate:
-        occurredAt.getTime() > remoteLastStudyDate.getTime()
-          ? occurredAt
-          : remoteLastStudyDate,
-      isOlder: false,
-    };
-  }
-  if (dayDifference === 1) {
-    return {
-      streak: currentStreak + 1,
-      lastStudyDate: occurredAt,
-      isOlder: false,
-    };
-  }
-  return { streak: 1, lastStudyDate: occurredAt, isOlder: false };
-}
-
 export async function applyStudyActivity({
   db,
   userId,
@@ -276,12 +230,20 @@ export async function applyStudyActivity({
     const lastResetAt = readProgressState(progressStateSnapshot);
     const shouldCreditGlobalProgress =
       lastResetAt === null || occurredAt.getTime() > lastResetAt.getTime();
-    const studyState = nextStudyState({
-      currentStreak,
-      remoteLastStudyDate,
+    const streakHistory = await updateStudyStreakHistory({
+      transaction,
+      userRef,
       occurredAt,
       timeZoneOffsetMinutes,
+      currentStreak,
+      legacyLastStudyDate: remoteLastStudyDate,
+      stateInvalid,
     });
+    const lastStudyDate =
+      remoteLastStudyDate !== null &&
+      remoteLastStudyDate.getTime() > occurredAt.getTime()
+        ? remoteLastStudyDate
+        : occurredAt;
     const newProgress = shouldCreditGlobalProgress
       ? Math.min(1, currentProgress + progressDelta)
       : currentProgress;
@@ -297,15 +259,17 @@ export async function applyStudyActivity({
       subjectStreakDays = readNonNegativeInteger(subjectData, 'streakDays', {
         required: true,
       });
-      if (!studyState.isOlder) subjectStreakDays = studyState.streak;
+      if (!streakHistory.isHistorical) {
+        subjectStreakDays = streakHistory.streak;
+      }
     }
 
     transaction.set(
       studyInfoRef,
       {
         progress: newProgress,
-        streak: studyState.streak,
-        lastStudyDate: studyState.lastStudyDate,
+        streak: streakHistory.streak,
+        lastStudyDate,
         updatedAt: serverTimestamp(),
       },
       { merge: true },
@@ -333,8 +297,8 @@ export async function applyStudyActivity({
     return {
       alreadyApplied: false,
       progress: newProgress,
-      streak: studyState.streak,
-      lastStudyDate: studyState.lastStudyDate,
+      streak: streakHistory.streak,
+      lastStudyDate,
       subjectProgress: newSubjectProgress,
     };
   });
