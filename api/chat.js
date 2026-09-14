@@ -3,6 +3,7 @@ import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 import { checkDistributedRateLimit } from './_distributed_rate_limit.js';
+import { hasValidGooglePlayPremium } from './billing/google/_entitlement.js';
 
 // ============================================================================
 // LIFE OS - AI CHAT ENDPOINT
@@ -106,8 +107,11 @@ async function hasAiConsent(userId) {
   return data?.accepted === true;
 }
 
-async function hasPremiumAccess(userId) {
-  const userSnapshot = await db
+export async function hasPremiumAccess(
+  userId,
+  { firestore = db, nowMillis = Date.now() } = {},
+) {
+  const userSnapshot = await firestore
     .collection('users')
     .doc(userId)
     .get();
@@ -118,7 +122,7 @@ async function hasPremiumAccess(userId) {
 
   const data = userSnapshot.data();
 
-  return data?.isPremium === true;
+  return hasValidGooglePlayPremium(data, nowMillis);
 }
 // ============================================================================
 // HELPERS

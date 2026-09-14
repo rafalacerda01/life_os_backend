@@ -11,6 +11,7 @@ const ALLOWED_SCOPES = new Set([
   'focus_finish',
   'focus_cancel',
   'circle_delete',
+  'billing_google_verify',
 ]);
 
 function rateLimitDocumentId(scope, uid) {
