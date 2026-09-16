@@ -1,4 +1,8 @@
 import { Timestamp } from 'firebase-admin/firestore';
+import {
+  establishBillingDeletionBarrier,
+  finishBillingDeletion,
+} from '../billing/google/_reconciliation.js';
 
 import {
   AccountHttpError,
@@ -404,6 +408,26 @@ async function ensureExternalCleanupMarker({ db, uid, userRef }) {
 
 export async function deleteAccount({ db, auth, uid }) {
   const userRef = db.collection('users').doc(uid);
+  // Keep Circle prechecks ahead of destructive billing-index cleanup.
+  const userSnapshot = await userRef.get();
+  const marker = await accountDeletionMarkerRef(userRef).get();
+  if (!userSnapshot.exists && !marker.exists) throw stateConflict();
+  const cleanupMarker = marker.exists ? validateExternalCleanupMarker(marker.data()) : null;
+  const userData = userSnapshot.data() ?? {};
+  const deletionState = validateDeletionState(userData);
+  const circleId = validateActiveCircleId(userData);
+  const markerProvesCleanup = cleanupMarker !== null &&
+    await markerStillProvesExternalCleanup({ db, uid, userRef, marker: cleanupMarker });
+  if (!markerProvesCleanup) {
+    if (deletionState !== null) {
+      if (circleId !== null && circleId !== deletionState.circleId) throw stateConflict();
+      if ((await db.collection('circles').doc(deletionState.circleId).get()).exists) throw stateConflict();
+    } else if (circleId !== null) {
+      const preflight = await resolveCircleMembership({ db, uid, circleId, commit: false });
+      if (preflight.kind !== 'ADMIN_SOLE_MEMBER') await listChallengeRefs(preflight.circleRef);
+    }
+  }
+  await establishBillingDeletionBarrier({ db, uid });
   const cleanup = await ensureExternalCleanupMarker({ db, uid, userRef });
 
   try {
@@ -413,6 +437,7 @@ export async function deleteAccount({ db, auth, uid }) {
   }
 
   await db.recursiveDelete(userRef);
+  await finishBillingDeletion({ db, uid });
 
   return {
     body: {

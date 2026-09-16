@@ -11,6 +11,7 @@ import {
   validateDeletePayload,
 } from '../api/account/_shared.js';
 import { deleteAccount } from '../api/account/delete.js';
+import { sha256 } from '../api/billing/google/_reconciliation.js';
 import { checkDistributedRateLimit } from '../api/_distributed_rate_limit.js';
 
 const UID = 'user-1';
@@ -196,6 +197,7 @@ class FakeFirestore {
     this.batchSizes = [];
     this.failBatchAt = null;
     this.setCalls = [];
+    this.operationLog = [];
   }
 
   collection(name) {
@@ -262,10 +264,15 @@ class FakeFirestore {
       }
     }
     this.store = nextStore;
+    this.operationLog.push(...writes.map((write) => ({
+      type: write.type,
+      path: write.ref.path,
+    })));
   }
 
   async recursiveDelete(ref) {
     this.recursiveDeletes.push(ref.path);
+    this.operationLog.push({ type: 'recursiveDelete', path: ref.path });
     const failuresLeft = this.failRecursiveDeleteOnce.get(ref.path) ?? 0;
     if (failuresLeft > 0) {
       this.failRecursiveDeleteOnce.set(ref.path, failuresLeft - 1);
@@ -1202,7 +1209,7 @@ test('ambiguous missing membership state fails closed', async () => {
 
 test('commit transaction rereads a raced memberCount', async () => {
   const db = seedNormalCircle(new FakeFirestore());
-  db.beforeTransactions.set(2, (firestore) => {
+  db.beforeTransactions.set(4, (firestore) => {
     firestore.seed(
       path('circles', CIRCLE_ID, 'members', 'new-user'),
       member('member'),
@@ -1338,7 +1345,8 @@ test('retry after transient Auth failure skips Circle cleanup and completes', as
   const result = await deleteAccount({ db, auth, uid: UID });
 
   assert.deepEqual(result.body, { deleted: true, circleDeleted: false });
-  assert.equal(db.transactionCount, transactionsAfterCleanup);
+  assert.ok(db.transactions.slice(transactionsAfterCleanup).every((transaction) =>
+    transaction.operations.every((operation) => !operation.path.startsWith('circles/'))));
   assert.equal(db.batchCommitCount, batchesAfterCleanup);
   assert.equal(db.data(path('circles', CIRCLE_ID)).memberCount, 1);
   assert.deepEqual(auth.deleteCalls, [UID, UID]);
@@ -1391,6 +1399,115 @@ test('recursive user cleanup failure occurs after Auth deletion', async () => {
   assert.ok(db.data(path('users', UID)));
   assert.ok(db.data(path('users', UID, 'tasks', 'task-1')));
   assert.ok(db.data(ACCOUNT_DELETION_MARKER_PATH));
+});
+
+test('billing deletion barrier removes token indexes and account index last', async () => {
+  const db = new FakeFirestore();
+  const accountHash = sha256(UID);
+  const accountPath = path('billing_google_accounts', accountHash);
+  const tokenPaths = ['token-a', 'token-b'].map((token) =>
+    path('billing_google_tokens', sha256(token)));
+  db.seed(path('users', UID), { activeCircleId: null });
+  db.seed(accountPath, { uid: UID, state: 'ACTIVE' });
+  for (const tokenPath of tokenPaths) db.seed(tokenPath, { accountHash });
+  const auth = new FakeAuth({});
+
+  await deleteAccount({ db, auth, uid: UID });
+
+  assert.deepEqual(auth.deleteCalls, [UID]);
+  assert.equal(db.data(path('users', UID)), undefined);
+  assert.equal(db.data(accountPath), undefined);
+  assert.ok(tokenPaths.every((tokenPath) => db.data(tokenPath) === undefined));
+  const operation = (type, target) => db.operationLog.findIndex(
+    (entry) => entry.type === type && entry.path === target,
+  );
+  assert.ok(operation('set', accountPath) < operation('delete', tokenPaths[0]));
+  assert.ok(operation('delete', tokenPaths[0]) < operation('recursiveDelete', path('users', UID)));
+  assert.ok(operation('recursiveDelete', path('users', UID)) < operation('delete', accountPath));
+});
+
+test('billing token indexes are deleted in bounded pages', async () => {
+  const db = new FakeFirestore();
+  const accountHash = sha256(UID);
+  db.seed(path('users', UID), { activeCircleId: null });
+  db.seed(path('billing_google_accounts', accountHash), { uid: UID, state: 'ACTIVE' });
+  for (let index = 0; index < 205; index += 1) {
+    db.seed(path('billing_google_tokens', sha256(`token-${index}`)), { accountHash });
+  }
+
+  await deleteAccount({ db, auth: new FakeAuth({}), uid: UID });
+
+  assert.equal([...db.store.keys()].filter((value) => value.startsWith('billing_google_')).length, 0);
+  const indexDeletes = db.operationLog.filter(
+    (entry) => entry.type === 'delete' && entry.path.startsWith('billing_google_tokens/'),
+  );
+  assert.equal(indexDeletes.length, 205);
+});
+
+test('billing index cleanup conflict aborts before Auth and user deletion', async () => {
+  const db = new FakeFirestore();
+  const accountHash = sha256(UID);
+  const indexPath = path('billing_google_tokens', sha256('token-a'));
+  db.seed(path('users', UID), { activeCircleId: null });
+  db.seed(path('billing_google_accounts', accountHash), { uid: UID, state: 'ACTIVE' });
+  db.seed(indexPath, { accountHash });
+  db.beforeTransactions.set(2, (firestore) => {
+    firestore.seed(indexPath, { accountHash: sha256('other-user') });
+  });
+  const auth = new FakeAuth({});
+
+  await assert.rejects(deleteAccount({ db, auth, uid: UID }));
+
+  assert.deepEqual(auth.deleteCalls, []);
+  assert.deepEqual(db.recursiveDeletes, []);
+  assert.ok(db.data(path('users', UID)));
+  assert.ok(db.data(indexPath));
+});
+
+test('foreign account index ownership conflict is never overwritten or deleted', async () => {
+  const db = new FakeFirestore();
+  const accountPath = path('billing_google_accounts', sha256(UID));
+  const foreign = { uid: 'other-user', state: 'ACTIVE' };
+  db.seed(path('users', UID), { activeCircleId: null });
+  db.seed(accountPath, foreign);
+  const auth = new FakeAuth({});
+
+  await assert.rejects(deleteAccount({ db, auth, uid: UID }));
+
+  assert.deepEqual(db.data(accountPath), foreign);
+  assert.deepEqual(auth.deleteCalls, []);
+  assert.deepEqual(db.recursiveDeletes, []);
+});
+
+test('billing cleanup transport failure retains DELETING barrier without deleting Auth', async () => {
+  const db = new FakeFirestore();
+  const accountPath = path('billing_google_accounts', sha256(UID));
+  const indexPath = path('billing_google_tokens', sha256('token-a'));
+  db.seed(path('users', UID), { activeCircleId: null });
+  db.seed(indexPath, { accountHash: sha256(UID) });
+  db.beforeTransactions.set(2, () => { throw new Error('private-billing-transport-error'); });
+  const auth = new FakeAuth({});
+
+  await assert.rejects(deleteAccount({ db, auth, uid: UID }));
+
+  assert.deepEqual(db.data(accountPath), { uid: UID, state: 'DELETING' });
+  assert.ok(db.data(indexPath));
+  assert.deepEqual(auth.deleteCalls, []);
+  assert.deepEqual(db.recursiveDeletes, []);
+});
+
+test('user-tree cleanup failure after Auth leaves billing barrier closed', async () => {
+  const db = new FakeFirestore();
+  db.seed(path('users', UID), { activeCircleId: null });
+  db.failRecursiveDeleteOnce.set(path('users', UID), 1);
+  const auth = new FakeAuth({});
+
+  await assert.rejects(deleteAccount({ db, auth, uid: UID }));
+
+  assert.equal(auth.deleted, true);
+  assert.deepEqual(db.data(path('billing_google_accounts', sha256(UID))), {
+    uid: UID, state: 'DELETING',
+  });
 });
 
 test('missing user evidence fails closed', async () => {

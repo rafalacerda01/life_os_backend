@@ -52,6 +52,20 @@ function parseExpiryTime(expiryTime) {
   return expiryMillis;
 }
 
+function parseObfuscatedAccountId(payload) {
+  const identifiers = payload.externalAccountIdentifiers;
+  if (identifiers === undefined) return null;
+  if (identifiers === null || typeof identifiers !== 'object' || Array.isArray(identifiers)) {
+    throw new GooglePlayPayloadError('BILLING_GOOGLE_RESPONSE_INVALID');
+  }
+  if (!Object.hasOwn(identifiers, 'obfuscatedExternalAccountId')) return null;
+  const value = identifiers.obfuscatedExternalAccountId;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new GooglePlayPayloadError('BILLING_GOOGLE_RESPONSE_INVALID');
+  }
+  return value;
+}
+
 export function parseGooglePlaySubscription(payload, nowMillis) {
   if (
     payload === null ||
@@ -91,8 +105,7 @@ export function parseGooglePlaySubscription(payload, nowMillis) {
   }
 
   const expiryMillis = parseExpiryTime(lineItem.expiryTime);
-  const obfuscatedAccountId =
-    payload.externalAccountIdentifiers?.obfuscatedExternalAccountId;
+  const obfuscatedAccountId = parseObfuscatedAccountId(payload);
 
   return {
     productId: lineItem.productId,
@@ -102,8 +115,7 @@ export function parseGooglePlaySubscription(payload, nowMillis) {
     acknowledgementState,
     expiryMillis,
     expiryDate: new Date(expiryMillis),
-    obfuscatedAccountId:
-      typeof obfuscatedAccountId === 'string' ? obfuscatedAccountId : null,
+    obfuscatedAccountId,
     isPremium:
       expiryMillis > nowMillis &&
       isEntitledSubscriptionState(subscriptionState),

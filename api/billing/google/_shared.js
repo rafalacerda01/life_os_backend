@@ -125,7 +125,7 @@ function assertBodyWithinLimit(req) {
   }
 }
 
-function getFirebaseServices() {
+export function getFirebaseServices() {
   if (!getApps().length) {
     const projectId = process.env.FIREBASE_PROJECT_ID;
     const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;

@@ -13,6 +13,7 @@ import {
 } from '../api/billing/google/_entitlement.js';
 import {
   GOOGLE_PLAY_REQUEST_TIMEOUT_MS,
+  GooglePlayRequestError,
   acknowledgeGooglePlaySubscription,
   getGooglePlaySubscription,
 } from '../api/billing/google/_google_play.js';
@@ -106,6 +107,9 @@ class FakeTransaction {
   }
 
   update(ref, data) {
+    if (this.db.failDocumentUpdate && Object.hasOwn(data, 'acknowledgementState')) {
+      throw new Error('private-firestore-update-error');
+    }
     this.writes.push({ type: 'update', path: ref.path, data });
   }
 
@@ -264,6 +268,14 @@ async function invoke(req = request(), options = {}) {
   return { db, calls, runtime, res };
 }
 
+function assertNoEntitlementWrites(db) {
+  assert.ok(db.committedWrites.every((write) =>
+    write.path === `users/${UID}/billing/google_play` &&
+    Object.keys(write.data).length === 1 &&
+    Number.isSafeInteger(write.data.reconciliationRevision)));
+  assert.deepEqual(db.data(`users/${UID}`), { displayName: 'Test' });
+}
+
 test('OPTIONS succeeds and advertises the App Check header', async () => {
   const { res } = await invoke({ method: 'OPTIONS', headers: {}, body: undefined });
   assert.equal(res.statusCode, 204);
@@ -408,22 +420,22 @@ test('Google API failure is sanitized without purchase token', async () => {
   assert.doesNotMatch(JSON.stringify(res.body), new RegExp(TOKEN));
 });
 
-test('wrong product is rejected without writes', async () => {
+test('wrong product is rejected without entitlement writes', async () => {
   const { res, db } = await invoke(request(), {
     payload: googlePayload({ productId: 'other_product' }),
   });
   assert.equal(res.statusCode, 400);
   assert.equal(res.body.code, 'BILLING_PRODUCT_INVALID');
-  assert.equal(db.committedWrites.length, 0);
+  assertNoEntitlementWrites(db);
 });
 
-test('unknown base plan is rejected without writes', async () => {
+test('unknown base plan is rejected without entitlement writes', async () => {
   const { res, db } = await invoke(request(), {
     payload: googlePayload({ basePlanId: 'weekly' }),
   });
   assert.equal(res.statusCode, 400);
   assert.equal(res.body.code, 'BILLING_BASE_PLAN_INVALID');
-  assert.equal(db.committedWrites.length, 0);
+  assertNoEntitlementWrites(db);
 });
 
 test('missing obfuscated account ID returns account mismatch', async () => {
@@ -434,8 +446,40 @@ test('missing obfuscated account ID returns account mismatch', async () => {
   });
   assert.equal(res.statusCode, 403);
   assert.equal(res.body.code, 'BILLING_ACCOUNT_MISMATCH');
-  assert.equal(db.committedWrites.length, 0);
+  assertNoEntitlementWrites(db);
 });
+
+test('Google parser preserves absent and valid external account identifiers', () => {
+  const absent = googlePayload();
+  delete absent.externalAccountIdentifiers;
+  assert.equal(parseGooglePlaySubscription(absent, NOW).obfuscatedAccountId, null);
+
+  const missingProperty = googlePayload();
+  missingProperty.externalAccountIdentifiers = {};
+  assert.equal(parseGooglePlaySubscription(missingProperty, NOW).obfuscatedAccountId, null);
+  assert.equal(
+    parseGooglePlaySubscription(googlePayload(), NOW).obfuscatedAccountId,
+    hash(UID),
+  );
+});
+
+for (const [name, accountId] of [
+  ['number', 123],
+  ['boolean', true],
+  ['object', { private: 'value' }],
+  ['array', ['value']],
+  ['null', null],
+  ['empty string', ''],
+]) {
+  test(`malformed ${name} external account ID fails closed`, async () => {
+    const invalid = googlePayload();
+    invalid.externalAccountIdentifiers.obfuscatedExternalAccountId = accountId;
+    const { res, db } = await invoke(request(), { payload: invalid });
+    assert.equal(res.statusCode, 502);
+    assert.equal(res.body.code, 'BILLING_GOOGLE_RESPONSE_INVALID');
+    assertNoEntitlementWrites(db);
+  });
+}
 
 test('another user obfuscated account ID returns account mismatch', async () => {
   const { res, db } = await invoke(request(), {
@@ -443,7 +487,7 @@ test('another user obfuscated account ID returns account mismatch', async () => 
   });
   assert.equal(res.statusCode, 403);
   assert.equal(res.body.code, 'BILLING_ACCOUNT_MISMATCH');
-  assert.equal(db.committedWrites.length, 0);
+  assertNoEntitlementWrites(db);
 });
 
 for (const state of [
@@ -503,7 +547,7 @@ for (const expiryTime of [undefined, null, 'invalid-date', '2026-10-13']) {
     const { res, db } = await invoke(request(), { payload });
     assert.equal(res.statusCode, 502);
     assert.equal(res.body.code, 'BILLING_GOOGLE_RESPONSE_INVALID');
-    assert.equal(db.committedWrites.length, 0);
+    assertNoEntitlementWrites(db);
   });
 }
 
@@ -526,7 +570,7 @@ test('successful verification writes root and private billing atomically', async
   const token = db.data(`users/${UID}/billing/google_play/tokens/${hash(TOKEN)}`);
 
   assert.equal(res.statusCode, 200);
-  assert.equal(db.transactions, 1);
+  assert.equal(db.transactions, 2);
   assert.equal(root.isPremium, true);
   assert.equal(root.premiumTier, 'monthly');
   assert.equal(root.premiumProvider, 'google_play');
@@ -560,7 +604,7 @@ test('retry of same token preserves firstSeenAt and writes once per transaction'
     runtime,
   });
   assert.deepEqual(db.data(tokenPath).firstSeenAt, firstSeenAt);
-  assert.equal(db.transactions, 2);
+  assert.equal(db.transactions, 4);
 });
 
 test('expired old token does not revoke a different current token', async () => {
@@ -621,7 +665,9 @@ test('pending acknowledgement runs only after entitlement persistence', async ()
   assert.deepEqual(calls.acknowledge, [
     { purchaseToken: TOKEN, persisted: true },
   ]);
-  assert.deepEqual(db.documentUpdateCalls, [
+  assert.deepEqual(db.committedWrites.filter((write) =>
+    write.type === 'update' && Object.hasOwn(write.data, 'acknowledgementState'))
+    .map(({ path, data }) => ({ path, data })), [
     {
       path: `users/${UID}/billing/google_play/tokens/${hash(TOKEN)}`,
       data: {
@@ -834,6 +880,54 @@ test('Google acknowledge uses official subscription endpoint and empty body', as
 
 test('Google Play operations default to a ten-second deadline', () => {
   assert.equal(GOOGLE_PLAY_REQUEST_TIMEOUT_MS, 10_000);
+});
+
+test('Google GET classifies retryable and terminal responses without private data', async () => {
+  const oldEmail = process.env.GOOGLE_PLAY_CLIENT_EMAIL;
+  const oldKey = process.env.GOOGLE_PLAY_PRIVATE_KEY;
+  process.env.GOOGLE_PLAY_CLIENT_EMAIL = 'billing@example.test';
+  process.env.GOOGLE_PLAY_PRIVATE_KEY = 'billing-private-key';
+  const cases = [
+    [410, 'subscriptionNoLongerAvailable', false, true],
+    [410, 'purchaseTokenNoLongerValid', false, true],
+    [410, 'unknownGoneReason', false, false],
+    [404, 'notFound', false, false],
+    [400, 'invalidValue', false, false],
+    [400, 'purchaseTokenMismatch', false, false],
+    [409, 'concurrentUpdate', true, false],
+    [409, 'conflict', false, false],
+    [429, 'rateLimitExceeded', true, false],
+    [401, 'authError', true, false],
+    [403, 'permissionDenied', true, false],
+    [503, 'backendError', true, false],
+  ];
+  try {
+    for (const [statusCode, reason, retryable, terminalTokenUnavailable] of cases) {
+      await assert.rejects(getGooglePlaySubscription(TOKEN, {
+        googleAuthFactory: () => ({ getClient: async () => ({
+          getRequestHeaders: async () => ({ authorization: 'Bearer private-oauth' }),
+        }) }),
+        fetchImpl: async () => ({
+          ok: false, status: statusCode,
+          json: async () => ({ error: { errors: [{ reason }], private: TOKEN } }),
+        }),
+      }), (error) => {
+        assert.ok(error instanceof GooglePlayRequestError);
+        assert.equal(error.statusCode, statusCode);
+        assert.equal(error.reason, reason);
+        assert.equal(error.retryable, retryable);
+        assert.equal(error.terminalTokenUnavailable, terminalTokenUnavailable);
+        assert.doesNotMatch(JSON.stringify(error), new RegExp(TOKEN));
+        assert.doesNotMatch(JSON.stringify(error), /private-oauth/);
+        return true;
+      });
+    }
+  } finally {
+    if (oldEmail === undefined) delete process.env.GOOGLE_PLAY_CLIENT_EMAIL;
+    else process.env.GOOGLE_PLAY_CLIENT_EMAIL = oldEmail;
+    if (oldKey === undefined) delete process.env.GOOGLE_PLAY_PRIVATE_KEY;
+    else process.env.GOOGLE_PLAY_PRIVATE_KEY = oldKey;
+  }
 });
 
 test('Google GET that never resolves is aborted by the deadline', async () => {

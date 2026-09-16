@@ -11,12 +11,49 @@ const ANDROID_PUBLISHER_BASE_URL =
   'https://androidpublisher.googleapis.com/androidpublisher/v3';
 export const GOOGLE_PLAY_REQUEST_TIMEOUT_MS = 10_000;
 
+const TERMINAL_TOKEN_REASONS = new Set([
+  'subscriptionNoLongerAvailable',
+  'purchaseTokenNoLongerValid',
+]);
+
 export class GooglePlayRequestError extends Error {
-  constructor(operation) {
+  constructor(operation, {
+    statusCode = null,
+    reason = null,
+    retryable = true,
+    terminalTokenUnavailable = false,
+  } = {}) {
     super(`GOOGLE_PLAY_${operation}_FAILED`);
     this.name = 'GooglePlayRequestError';
     this.operation = operation;
+    this.statusCode = statusCode;
+    this.reason = reason;
+    this.retryable = retryable;
+    this.terminalTokenUnavailable = terminalTokenUnavailable;
   }
+}
+
+async function googleResponseError(operation, response) {
+  const statusCode = Number.isInteger(response?.status) ? response.status : null;
+  let reason = null;
+  try {
+    const payload = await response.json();
+    const candidate = payload?.error?.errors?.[0]?.reason ?? payload?.error?.reason;
+    if (typeof candidate === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,127}$/.test(candidate)) {
+      reason = candidate;
+    }
+  } catch (_) {
+    // The response body is intentionally discarded. Status alone is not
+    // sufficient to prove that an old purchase token is terminal.
+  }
+  const terminalTokenUnavailable = operation === 'GET' && statusCode === 410 &&
+    TERMINAL_TOKEN_REASONS.has(reason);
+  const retryable = statusCode === null || statusCode >= 500 ||
+    statusCode === 401 || statusCode === 403 || statusCode === 429 ||
+    (statusCode === 409 && reason === 'concurrentUpdate');
+  return new GooglePlayRequestError(operation, {
+    statusCode, reason, retryable, terminalTokenUnavailable,
+  });
 }
 
 function getGoogleCredentials() {
@@ -99,7 +136,7 @@ export async function getGooglePlaySubscription(
         headers: { authorization },
         signal,
       });
-      if (!response.ok) throw new GooglePlayRequestError('GET');
+      if (!response.ok) throw await googleResponseError('GET', response);
       const payload = await response.json();
       if (
         payload === null ||
@@ -143,7 +180,7 @@ export async function acknowledgeGooglePlaySubscription(
         body: '{}',
         signal,
       });
-      if (!response.ok) throw new GooglePlayRequestError('ACKNOWLEDGE');
+      if (!response.ok) throw await googleResponseError('ACKNOWLEDGE', response);
     } catch (error) {
       if (error instanceof GooglePlayRequestError) throw error;
       throw new GooglePlayRequestError('ACKNOWLEDGE');
