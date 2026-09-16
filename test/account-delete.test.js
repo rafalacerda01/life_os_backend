@@ -378,6 +378,20 @@ function seedNormalCircle(db, options = {}) {
   return db;
 }
 
+function seedNormalCircleWithMemberships(db, memberLimit, membershipCount) {
+  seedNormalCircle(db, {
+    memberCount: membershipCount,
+    circleOverrides: { memberLimit },
+  });
+  for (let index = 2; index < membershipCount; index += 1) {
+    db.seed(
+      path('circles', CIRCLE_ID, 'members', 'member-' + index),
+      member('member'),
+    );
+  }
+  return db;
+}
+
 function seedSoleAdmin(db, options = {}) {
   db.seed(path('users', UID), {
     activeCircleId: CIRCLE_ID,
@@ -917,6 +931,28 @@ test('valid sole admin deletes Circle root safely and all descendants', async ()
   assert.deepEqual(auth.deleteCalls, [UID]);
 });
 
+test('sole admin with memberLimit 30 deletes Circle and account', async () => {
+  const db = seedSoleAdmin(new FakeFirestore(), {
+    circleOverrides: { memberLimit: 30 },
+  });
+  const auth = new FakeAuth({});
+  const circlePath = path('circles', CIRCLE_ID);
+  const userPath = path('users', UID);
+
+  assert.equal(db.data(circlePath).memberCount, 1);
+  assert.equal(db.data(circlePath).memberLimit, 30);
+  assert.equal(db.data(circlePath).schemaVersion, 2);
+  assert.equal(db.data(circlePath).adminId, UID);
+
+  const result = await deleteAccount({ db, auth, uid: UID });
+
+  assert.deepEqual(result.body, { deleted: true, circleDeleted: true });
+  assert.deepEqual(auth.deleteCalls, [UID]);
+  assert.equal(db.data(circlePath), undefined);
+  assert.equal(db.data(userPath), undefined);
+  assert.deepEqual(db.recursiveDeletes, [circlePath, userPath]);
+});
+
 test('inconsistent sole admin fails before destructive work', async () => {
   const db = seedSoleAdmin(new FakeFirestore(), { includeMember: false });
   const auth = new FakeAuth({});
@@ -1019,6 +1055,121 @@ test('normal member cleanup removes Focus and Activity events but keeps another 
   assert.ok(
     db.transactions.every((transaction) => transaction.writes.length <= 2),
   );
+});
+
+test('memberLimit 30 allows a normal member to delete the account', async () => {
+  const db = seedNormalCircleWithMemberships(new FakeFirestore(), 30, 2);
+  const auth = new FakeAuth({});
+
+  const result = await deleteAccount({ db, auth, uid: UID });
+
+  assert.deepEqual(result.body, { deleted: true, circleDeleted: false });
+  assert.equal(db.data(path('circles', CIRCLE_ID)).memberCount, 1);
+  assert.equal(db.data(path('circles', CIRCLE_ID, 'members', UID)), undefined);
+  assert.deepEqual(auth.deleteCalls, [UID]);
+  assert.deepEqual(db.recursiveDeletes, [path('users', UID)]);
+});
+
+test('Circle with 30 memberships is accepted', async () => {
+  const db = seedNormalCircleWithMemberships(new FakeFirestore(), 30, 30);
+  const auth = new FakeAuth({});
+
+  await deleteAccount({ db, auth, uid: UID });
+
+  assert.equal(db.data(path('circles', CIRCLE_ID)).memberCount, 29);
+  assert.equal(db.data(path('circles', CIRCLE_ID, 'members', UID)), undefined);
+  assert.ok(db.data(path('circles', CIRCLE_ID, 'members', 'member-29')));
+  assert.deepEqual(auth.deleteCalls, [UID]);
+});
+
+test('legacy memberLimit 10 remains accepted', async () => {
+  const db = seedNormalCircleWithMemberships(new FakeFirestore(), 10, 10);
+  const auth = new FakeAuth({});
+
+  await deleteAccount({ db, auth, uid: UID });
+
+  assert.equal(db.data(path('circles', CIRCLE_ID)).memberCount, 9);
+  assert.equal(db.data(path('circles', CIRCLE_ID, 'members', UID)), undefined);
+  assert.deepEqual(auth.deleteCalls, [UID]);
+});
+
+test('free memberLimit 3 remains accepted', async () => {
+  const db = seedNormalCircleWithMemberships(new FakeFirestore(), 3, 3);
+  const auth = new FakeAuth({});
+
+  await deleteAccount({ db, auth, uid: UID });
+
+  assert.equal(db.data(path('circles', CIRCLE_ID)).memberCount, 2);
+  assert.equal(db.data(path('circles', CIRCLE_ID, 'members', UID)), undefined);
+  assert.deepEqual(auth.deleteCalls, [UID]);
+});
+
+for (const invalidMemberLimit of [11, 31]) {
+  test(`memberLimit ${invalidMemberLimit} fails closed`, async () => {
+    const db = seedNormalCircleWithMemberships(
+      new FakeFirestore(),
+      invalidMemberLimit,
+      2,
+    );
+    const privatePath = path('users', UID, 'tasks', 'private-task');
+    const memberPath = path('circles', CIRCLE_ID, 'members', UID);
+    db.seed(privatePath, { title: 'Private task' });
+    const originalCircle = db.data(path('circles', CIRCLE_ID));
+    const originalMembership = db.data(memberPath);
+    const auth = new FakeAuth({});
+
+    await assert.rejects(
+      deleteAccount({ db, auth, uid: UID }),
+      (error) => error.code === 'ACCOUNT_STATE_CONFLICT',
+    );
+
+    assert.deepEqual(auth.deleteCalls, []);
+    assert.deepEqual(db.recursiveDeletes, []);
+    assert.deepEqual(db.data(path('users', UID)), {
+      activeCircleId: CIRCLE_ID,
+    });
+    assert.deepEqual(db.data(privatePath), { title: 'Private task' });
+    assert.deepEqual(db.data(memberPath), originalMembership);
+    assert.deepEqual(db.data(path('circles', CIRCLE_ID)), originalCircle);
+    assert.equal(
+      db.data(path('circles', CIRCLE_ID)).memberLimit,
+      invalidMemberLimit,
+    );
+    assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH), undefined);
+  });
+}
+
+test('more than 30 memberships fails closed', async () => {
+  const db = seedNormalCircleWithMemberships(new FakeFirestore(), 30, 30);
+  const privatePath = path('users', UID, 'tasks', 'private-task');
+  const memberPath = path('circles', CIRCLE_ID, 'members', UID);
+  db.seed(
+    path('circles', CIRCLE_ID, 'members', 'overflow-member'),
+    member('member'),
+  );
+  db.seed(privatePath, { title: 'Private task' });
+  const originalCircle = db.data(path('circles', CIRCLE_ID));
+  const originalMembership = db.data(memberPath);
+  const auth = new FakeAuth({});
+
+  await assert.rejects(
+    deleteAccount({ db, auth, uid: UID }),
+    (error) => error.code === 'ACCOUNT_STATE_CONFLICT',
+  );
+
+  assert.deepEqual(auth.deleteCalls, []);
+  assert.deepEqual(db.recursiveDeletes, []);
+  assert.deepEqual(db.data(path('users', UID)), {
+    activeCircleId: CIRCLE_ID,
+  });
+  assert.deepEqual(db.data(privatePath), { title: 'Private task' });
+  assert.deepEqual(db.data(memberPath), originalMembership);
+  assert.deepEqual(db.data(path('circles', CIRCLE_ID)), originalCircle);
+  assert.equal(db.data(path('circles', CIRCLE_ID)).memberCount, 30);
+  assert.ok(
+    db.data(path('circles', CIRCLE_ID, 'members', 'overflow-member')),
+  );
+  assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH), undefined);
 });
 
 test('retry state is idempotent and a provable stale counter is corrected', async () => {

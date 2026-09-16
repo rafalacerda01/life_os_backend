@@ -12,7 +12,7 @@ import {
 } from './_shared.js';
 
 const CIRCLE_SCHEMA_VERSION = 2;
-const MAX_CIRCLE_MEMBERS = 10;
+const MAX_CIRCLE_MEMBERS = 30;
 const DELETION_STATE_FIELD = '_serverAccountDeletion';
 const DELETION_STATE_VERSION = 1;
 const SOLE_ADMIN_MODE = 'SOLE_ADMIN_CIRCLE';
@@ -67,7 +67,9 @@ function validateCircleCore(circle, uid) {
   }
 
   if (
-    (circle.memberLimit !== 3 && circle.memberLimit !== 10) ||
+    (circle.memberLimit !== 3 &&
+      circle.memberLimit !== 10 &&
+      circle.memberLimit !== 30) ||
     circle.memberCount > circle.memberLimit
   ) {
     throw stateConflict();
