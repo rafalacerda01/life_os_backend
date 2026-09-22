@@ -110,6 +110,50 @@ test('UID autenticado nunca é enviado ao Gemini', async () => {
   assert.doesNotMatch(options.body, new RegExp(secretUid));
 });
 
+test('orientações gerais do Life OS chegam ao Gemini sem contexto pessoal', async (t) => {
+  const messages = [
+    'Me ajuda a organizar amanhã?',
+    'O que devo priorizar hoje?',
+    'Como posso melhorar meu desempenho?',
+    'Tenho prova amanhã, como me preparar?',
+    'Quais matérias devo revisar?',
+    'Como manter constância?',
+  ];
+
+  for (const [index, message] of messages.entries()) {
+    await t.test(message, async () => {
+      const secretUid = `general-guidance-secret-uid-${index}`;
+      let fetchCalls = 0;
+      let options;
+      const response = await invokeChat({
+        message,
+        uid: secretUid,
+        context: {
+          humor: 'privado',
+          hidratacao_ml: 500,
+          medicamentos_ativos: 2,
+          fase_ciclo: 'luteal',
+          financas: {
+            saldo_atual: 100,
+            total_entradas: 500,
+            total_saidas: 400,
+          },
+        },
+        fetch: async (_, receivedOptions) => {
+          fetchCalls += 1;
+          options = receivedOptions;
+          return successResponse();
+        },
+      });
+
+      assert.equal(response.statusCode, 200);
+      assert.equal(fetchCalls, 1);
+      assert.deepEqual(extractModelPayload(options).context, {});
+      assert.doesNotMatch(options.body, new RegExp(secretUid));
+    });
+  }
+});
+
 test('pergunta financeira envia somente agregados financeiros', async () => {
   let options;
   await invokeChat({

@@ -4,6 +4,14 @@ import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 import { checkDistributedRateLimit } from './_distributed_rate_limit.js';
 import { hasValidGooglePlayPremium } from './billing/google/_entitlement.js';
+import {
+  AI_CONSENT_VERSION_V2,
+  CHAT_V2_GENERATION_CONFIG,
+  ChatV2ValidationError,
+  buildChatV2SystemInstruction,
+  parseChatV2Insight,
+  validateChatV2Request,
+} from '../src/ai/chat_v2.js';
 
 // ============================================================================
 // LIFE OS - AI CHAT ENDPOINT
@@ -90,8 +98,11 @@ function applyCors(req, res) {
     'Content-Type, Authorization, X-Firebase-AppCheck',
   );
 }
-async function hasAiConsent(userId) {
-  const consentSnapshot = await db
+async function hasAiConsent(
+  userId,
+  { requiredVersion, firestore = db } = {},
+) {
+  const consentSnapshot = await firestore
     .collection('users')
     .doc(userId)
     .collection('privacy')
@@ -104,7 +115,9 @@ async function hasAiConsent(userId) {
 
   const data = consentSnapshot.data();
 
-  return data?.accepted === true;
+  if (data?.accepted !== true) return false;
+  return requiredVersion === undefined ||
+    data.consentVersion === requiredVersion;
 }
 
 export async function hasPremiumAccess(
@@ -224,7 +237,28 @@ function detectRelevantDomains(message) {
     'comer', 'alimentacao', 'lanche', 'fome', 'apetite', 'chocolate',
     'doce', 'cafe', 'refeicao', 'bolo',
   ]);
-  const isGeneralCooking = hasFoodTerm && containsAnyTerm(normalized, [
+  const hasFoodContext = [
+    'hydration',
+    'mood_wellbeing',
+    'cycle',
+    'productivity',
+    'study',
+    'habits',
+  ].some((domain) => domains.has(domain)) ||
+    containsAnyTerm(normalized, ['fome', 'apetite']);
+
+  if (hasFoodTerm && hasFoodContext) domains.add('food_wellbeing');
+
+  return domains;
+}
+
+function isGeneralCookingOutOfScope(message, domains) {
+  const normalized = normalizeMessage(message);
+  const hasFoodTerm = containsAnyTerm(normalized, [
+    'comer', 'alimentacao', 'lanche', 'fome', 'apetite', 'chocolate',
+    'doce', 'cafe', 'refeicao', 'bolo', 'lasanha',
+  ]);
+  const hasCookingIntent = containsAnyTerm(normalized, [
     'receita', 'como fazer', 'como faco', 'ingredientes', 'modo de preparo',
     'passo a passo', 'assar', 'cozinhar',
   ]);
@@ -238,10 +272,7 @@ function detectRelevantDomains(message) {
   ].some((domain) => domains.has(domain)) ||
     containsAnyTerm(normalized, ['fome', 'apetite']);
 
-  if (isGeneralCooking && !hasFoodContext) return new Set();
-  if (hasFoodTerm && hasFoodContext) domains.add('food_wellbeing');
-
-  return domains;
+  return hasFoodTerm && hasCookingIntent && !hasFoodContext;
 }
 
 function minimizeContextForModel(context, domains) {
@@ -494,6 +525,12 @@ export async function chatHandler(req, res, runtime = {}) {
   }
 
   const userId = decodedToken.uid;
+  const rawBody = req.body;
+  const isV2Request = isPlainObject(rawBody) &&
+    Object.hasOwn(rawBody, 'version');
+  const requiredConsentVersion = isV2Request && rawBody.version === 2
+    ? AI_CONSENT_VERSION_V2
+    : undefined;
 
 // --------------------------------------------------------------------------
 // CONSENTIMENTO
@@ -502,7 +539,9 @@ export async function chatHandler(req, res, runtime = {}) {
 let consentGranted;
 
 try {
-  consentGranted = await (runtime.hasAiConsent ?? hasAiConsent)(userId);
+  consentGranted = await (runtime.hasAiConsent ?? hasAiConsent)(userId, {
+    requiredVersion: requiredConsentVersion,
+  });
 } catch (_) {
   console.error('[chat] Falha ao verificar consentimento da IA.');
 
@@ -579,80 +618,88 @@ if (!rateLimitAllowed) {
   // BODY
   // --------------------------------------------------------------------------
 
-  const rawBody = req.body;
-
   if (!isPlainObject(rawBody)) {
     return res.status(400).json({
       error: 'Payload inválido.',
     });
   }
 
-  const { message, context } = rawBody;
+  let normalizedMessage;
+  let modelContext;
+  let v2Request = null;
 
-  // --------------------------------------------------------------------------
-  // MESSAGE
-  // --------------------------------------------------------------------------
-
-  if (
-    typeof message !== 'string' ||
-    message.trim().length === 0
-  ) {
-    return res.status(400).json({
-      error: 'Mensagem obrigatória e deve ser um texto.',
-    });
-  }
-
-  const normalizedMessage = message.trim();
-
-  if (normalizedMessage.length > MAX_MESSAGE_LENGTH) {
-    return res.status(400).json({
-      error:
-        'A mensagem excede o limite permitido de 2000 caracteres.',
-    });
-  }
-
-  const relevantDomains = detectRelevantDomains(normalizedMessage);
-  if (relevantDomains.size === 0) {
-    return res.status(200).json({
-      reply: OUT_OF_SCOPE_REPLY,
-    });
-  }
-
-  // --------------------------------------------------------------------------
-  // CONTEXT
-  // --------------------------------------------------------------------------
-
-  let safeContext = null;
-
-  if (context !== undefined) {
-    if (!isPlainObject(context)) {
+  if (isV2Request) {
+    try {
+      const safeV2Context = sanitizeUntrustedContext(rawBody.context);
+      if (JSON.stringify(safeV2Context).length > MAX_CONTEXT_JSON_LENGTH) {
+        throw new ChatV2ValidationError();
+      }
+      v2Request = validateChatV2Request({
+        ...rawBody,
+        context: safeV2Context,
+      });
+      modelContext = v2Request.context;
+    } catch (error) {
+      const code = error instanceof ChatV2ValidationError
+        ? error.code
+        : 'AI_REQUEST_INVALID';
       return res.status(400).json({
-        error: 'O contexto deve ser um objeto.',
+        code,
+        error: 'Solicitação V2 inválida.',
+      });
+    }
+  } else {
+    const { message, context } = rawBody;
+    if (
+      typeof message !== 'string' ||
+      message.trim().length === 0
+    ) {
+      return res.status(400).json({
+        error: 'Mensagem obrigatória e deve ser um texto.',
       });
     }
 
-    try {
-      safeContext = sanitizeUntrustedContext(context);
-    } catch (_) {
+    normalizedMessage = message.trim();
+    if (normalizedMessage.length > MAX_MESSAGE_LENGTH) {
       return res.status(400).json({
         error:
-          'Contexto inválido ou excedendo os limites permitidos.',
+          'A mensagem excede o limite permitido de 2000 caracteres.',
       });
     }
 
-    const serializedContext = JSON.stringify(safeContext);
-
-    if (serializedContext.length > MAX_CONTEXT_JSON_LENGTH) {
-      return res.status(400).json({
-        error: 'O contexto fornecido é muito extenso.',
+    const relevantDomains = detectRelevantDomains(normalizedMessage);
+    if (isGeneralCookingOutOfScope(normalizedMessage, relevantDomains)) {
+      return res.status(200).json({
+        reply: OUT_OF_SCOPE_REPLY,
       });
     }
+
+    let safeContext = null;
+    if (context !== undefined) {
+      if (!isPlainObject(context)) {
+        return res.status(400).json({
+          error: 'O contexto deve ser um objeto.',
+        });
+      }
+
+      try {
+        safeContext = sanitizeUntrustedContext(context);
+      } catch (_) {
+        return res.status(400).json({
+          error:
+            'Contexto inválido ou excedendo os limites permitidos.',
+        });
+      }
+
+      if (JSON.stringify(safeContext).length > MAX_CONTEXT_JSON_LENGTH) {
+        return res.status(400).json({
+          error: 'O contexto fornecido é muito extenso.',
+        });
+      }
+    }
+
+    modelContext = minimizeContextForModel(safeContext, relevantDomains);
   }
-
-  const modelContext = minimizeContextForModel(
-    safeContext,
-    relevantDomains,
-  );
 
   // --------------------------------------------------------------------------
   // GEMINI KEY
@@ -675,7 +722,9 @@ if (!rateLimitAllowed) {
     // Agora fica separado da entrada do usuário.
     // ------------------------------------------------------------------------
 
-    const systemInstruction = `
+    const systemInstruction = v2Request
+      ? buildChatV2SystemInstruction(v2Request.intent)
+      : `
 IDENTIDADE:
 Você é o Core, a IA exclusiva do Life OS.
 
@@ -734,18 +783,25 @@ REGRAS DE ESCOPO E SEGURANÇA:
    Não atue como assistente culinário generalista e não forneça
    receitas completas como finalidade principal.
 
-9. Nunca invente dados do usuário.
+9. Nunca invente dados pessoais do usuário.
 
-10. Use somente os dados presentes no contexto. Se uma informação
-    não estiver disponível, informe que o dado não está disponível.
+10. Afirmações sobre a situação específica do usuário só podem usar
+    dados presentes no contexto. Se uma informação pessoal não estiver
+    disponível, informe que o dado não está disponível.
 
-11. Responda em português brasileiro quando o usuário escrever
+11. Orientações gerais dentro do escopo do Life OS podem usar
+    conhecimento geral, mesmo quando o contexto estiver vazio.
+
+12. Se a solicitação estiver fora do escopo do Life OS, não responda ao
+    conteúdo e retorne exatamente: "${OUT_OF_SCOPE_REPLY}"
+
+13. Responda em português brasileiro quando o usuário escrever
     em português.
 
-12. Mantenha tom profissional, acolhedor e compatível com a
+14. Mantenha tom profissional, acolhedor e compatível com a
     identidade cyberpunk do Life OS.
 
-13. Emojis podem ser utilizados quando apropriado:
+15. Emojis podem ser utilizados quando apropriado:
     ⚡ 🚀 🦾 🎯
 `;
 
@@ -756,10 +812,11 @@ REGRAS DE ESCOPO E SEGURANÇA:
     // Somente o contexto minimizado chega ao modelo.
     // ------------------------------------------------------------------------
 
-    const untrustedUserPayload = JSON.stringify({
-      context: modelContext,
-      message: normalizedMessage,
-    });
+    const untrustedUserPayload = JSON.stringify(
+      v2Request
+        ? { intent: v2Request.intent, context: modelContext }
+        : { context: modelContext, message: normalizedMessage },
+    );
 
     // ------------------------------------------------------------------------
     // GEMINI REQUEST
@@ -813,6 +870,9 @@ REGRAS DE ESCOPO E SEGURANÇA:
                 ],
               },
             ],
+            ...(v2Request
+              ? { generationConfig: CHAT_V2_GENERATION_CONFIG }
+              : {}),
           }),
           signal: controller.signal,
         },
@@ -839,6 +899,20 @@ REGRAS DE ESCOPO E SEGURANÇA:
       typeof reply === 'string' &&
       reply.length > 0
     ) {
+      if (v2Request) {
+        try {
+          return res.status(200).json({
+            version: 2,
+            intent: v2Request.intent,
+            insight: parseChatV2Insight(reply),
+          });
+        } catch (_) {
+          console.error('[chat] Resposta V2 inválida da API do Google.');
+          return res.status(502).json({
+            error: 'Não foi possível processar sua solicitação no momento.',
+          });
+        }
+      }
       return res.status(200).json({
         reply,
       });
