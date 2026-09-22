@@ -1,5 +1,8 @@
 /*
 !api/
 !api/**
+!src/
+!src/ai/
+!src/ai/chat_v2.js
 !package.json
 !package-lock.json
