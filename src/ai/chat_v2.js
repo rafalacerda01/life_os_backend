@@ -32,6 +32,8 @@ const OFFICIAL_FINANCE_CATEGORIES = new Set([
 const MOOD_VALUES = new Set([
   'muito mal',
   'mal',
+  'radiante',
+  'focado',
   'neutro',
   'bem',
   'muito bem',
@@ -43,6 +45,7 @@ const MOOD_VALUES = new Set([
   'calma',
   'cansado',
   'cansada',
+  'estressado',
 ]);
 
 const MOOD_SUMMARY_VALUES = new Set([
