@@ -55,7 +55,7 @@ const MAX_CONTEXT_DEPTH = 6;
 const MAX_CONTEXT_KEYS = 80;
 const MAX_CONTEXT_ARRAY_ITEMS = 100;
 const MAX_CONTEXT_STRING_LENGTH = 2_000;
-const GEMINI_REQUEST_TIMEOUT_MS = 12_000;
+const GEMINI_REQUEST_TIMEOUT_MS = 20_000;
 
 // ============================================================================
 // CORS

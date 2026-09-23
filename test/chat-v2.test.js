@@ -196,6 +196,25 @@ test('daily_overview aceita somente agregados e retorna insight V2', async () =>
     context: { ...context, health: { hydration_ml: 1700, mood: 'bem' } },
   });
   assert.equal(request.body.generationConfig.responseMimeType, 'application/json');
+  const { generationConfig } = request.body;
+  assert.equal(generationConfig.responseSchema.additionalProperties, false);
+  assert.deepEqual(
+    Object.keys(generationConfig.responseSchema.properties).sort(),
+    ['headline', 'recommendation', 'summary'],
+  );
+  assert.deepEqual(
+    generationConfig.responseSchema.required,
+    ['headline', 'summary', 'recommendation'],
+  );
+  assert.equal(generationConfig.maxOutputTokens, 512);
+  assert.equal(generationConfig.temperature, 0.3);
+  for (const [field, limit] of [
+    ['headline', 120],
+    ['summary', 800],
+    ['recommendation', 500],
+  ]) {
+    assert.match(generationConfig.responseSchema.properties[field].description, new RegExp(String(limit)));
+  }
   assert.equal(Object.hasOwn(request.payload, 'uid'), false);
   assert.doesNotMatch(result.fetchOptions.body, new RegExp(secretUid));
 });
@@ -497,12 +516,16 @@ test('timeout V2 permanece sanitizado', async () => {
 test('resposta Gemini V2 inválida retorna 502 sanitizado', async (t) => {
   const cases = [
     ['JSON malformado', '{invalid'],
+    ['campo ausente', JSON.stringify({ headline: 'Título', summary: 'Resumo' })],
     ['schema inválido', JSON.stringify({
       headline: 'Título',
       summary: '',
       recommendation: 'Ação',
     })],
     ['campo extra', JSON.stringify({ ...VALID_INSIGHT, extra: 'não permitido' })],
+    ['headline acima de 120', JSON.stringify({ ...VALID_INSIGHT, headline: 'x'.repeat(121) })],
+    ['summary acima de 800', JSON.stringify({ ...VALID_INSIGHT, summary: 'x'.repeat(801) })],
+    ['recommendation acima de 500', JSON.stringify({ ...VALID_INSIGHT, recommendation: 'x'.repeat(501) })],
   ];
 
   for (const [name, text] of cases) {
