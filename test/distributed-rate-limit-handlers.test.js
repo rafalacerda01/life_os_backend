@@ -93,7 +93,8 @@ test('Chat aplica limite distribuído 15/60s ao UID verificado', async () => {
   const response = await invoke(
     chatHandler,
     authenticatedPost({
-      message: 'Como melhorar meu foco nos estudos?',
+      version: 2,
+      intent: 'daily_overview',
       context: {},
     }),
     chatRuntime({
@@ -129,7 +130,8 @@ test('Chat falha fechado e sanitiza erro do rate limit', async () => {
     const response = await invoke(
       chatHandler,
       authenticatedPost({
-        message: 'Como melhorar meu foco nos estudos?',
+        version: 2,
+        intent: 'daily_overview',
         context: {},
       }),
       chatRuntime({

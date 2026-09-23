@@ -10,6 +10,11 @@ if (!getApps().length) {
 const { chatHandler } = await import('../api/chat.js');
 
 const APP_CHECK_TOKEN = 'app-check-token-secret';
+const VALID_INSIGHT = {
+  headline: 'Seu dia',
+  summary: 'Resumo seguro',
+  recommendation: 'Continue.',
+};
 
 function responseStub() {
   return {
@@ -44,7 +49,7 @@ function post(headers = {}) {
   return {
     method: 'POST',
     headers,
-    body: { message: 'Como melhorar meu foco nos estudos?', context: {} },
+    body: { version: 2, intent: 'daily_overview', context: {} },
   };
 }
 
@@ -294,7 +299,7 @@ test('Chat usa exatamente o endpoint Gemini configurado', async () => {
             candidates: [
               {
                 content: {
-                  parts: [{ text: 'Resposta de teste' }],
+                  parts: [{ text: JSON.stringify(VALID_INSIGHT) }],
                 },
               },
             ],
@@ -309,6 +314,11 @@ test('Chat usa exatamente o endpoint Gemini configurado', async () => {
     'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent',
   );
   assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body, {
+    version: 2,
+    intent: 'daily_overview',
+    insight: VALID_INSIGHT,
+  });
 });
 
 test('timeout do Gemini aborta o fetch e retorna 504 controlado', async () => {
@@ -440,7 +450,7 @@ test('sucesso do Gemini limpa o timer e não aborta depois', async () => {
             candidates: [
               {
                 content: {
-                  parts: [{ text: 'Resposta sem timeout' }],
+                  parts: [{ text: JSON.stringify(VALID_INSIGHT) }],
                 },
               },
             ],
@@ -453,7 +463,11 @@ test('sucesso do Gemini limpa o timer e não aborta depois', async () => {
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(response.body, { reply: 'Resposta sem timeout' });
+  assert.deepEqual(response.body, {
+    version: 2,
+    intent: 'daily_overview',
+    insight: VALID_INSIGHT,
+  });
   assert.equal(receivedSignal.aborted, false);
 });
 

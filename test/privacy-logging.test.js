@@ -78,7 +78,7 @@ function chatPost() {
       'x-firebase-appcheck': 'valid-app-check',
       authorization: 'Bearer firebase-id-token-secret',
     },
-    body: { message: 'Como melhorar meu foco nos estudos?', context: {} },
+    body: { version: 2, intent: 'daily_overview', context: {} },
   };
 }
 

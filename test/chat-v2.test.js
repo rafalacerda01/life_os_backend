@@ -115,6 +115,62 @@ async function invokeV2({
   return { res, fetchCalls, fetchOptions };
 }
 
+test('payload legado é rejeitado antes de consentimento, Premium, rate limit e Gemini', async (t) => {
+  for (const body of [
+    { message: 'Olá', context: {} },
+    { arbitrary: 'private-payload' },
+  ]) {
+    await t.test(JSON.stringify(body), async () => {
+      const res = responseStub();
+      let appCheckCalls = 0;
+      let authCalls = 0;
+      let hasAiConsentCalls = 0;
+      let premiumCalls = 0;
+      let rateLimitCalls = 0;
+      let fetchCalls = 0;
+
+      await chatHandler(
+        {
+          method: 'POST',
+          headers: {
+            'x-firebase-appcheck': 'valid-app-check',
+            authorization: 'Bearer valid-id-token',
+          },
+          body,
+        },
+        res,
+        {
+          verifyAppCheckToken: async () => {
+            appCheckCalls += 1;
+            return { appId: 'test-app' };
+          },
+          verifyIdToken: async (_, checkRevoked) => {
+            authCalls += 1;
+            assert.equal(checkRevoked, true);
+            return { uid: 'v2-user' };
+          },
+          hasAiConsent: async () => { hasAiConsentCalls += 1; return true; },
+          hasPremiumAccess: async () => { premiumCalls += 1; return true; },
+          checkRateLimit: async () => { rateLimitCalls += 1; return true; },
+          fetch: async () => { fetchCalls += 1; return geminiResponse(); },
+        },
+      );
+
+      assert.equal(res.statusCode, 400);
+      assert.deepEqual(res.body, {
+        code: 'AI_REQUEST_INVALID',
+        error: 'Solicitação V2 inválida.',
+      });
+      assert.equal(appCheckCalls, 1);
+      assert.equal(authCalls, 1);
+      assert.equal(hasAiConsentCalls, 0);
+      assert.equal(premiumCalls, 0);
+      assert.equal(rateLimitCalls, 0);
+      assert.equal(fetchCalls, 0);
+    });
+  }
+});
+
 test('daily_overview aceita somente agregados e retorna insight V2', async () => {
   const secretUid = 'daily-secret-uid';
   const context = {
