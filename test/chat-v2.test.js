@@ -197,7 +197,6 @@ test('daily_overview aceita somente agregados e retorna insight V2', async () =>
   });
   assert.equal(request.body.generationConfig.responseMimeType, 'application/json');
   const { generationConfig } = request.body;
-  assert.equal(generationConfig.responseSchema.additionalProperties, false);
   assert.deepEqual(
     Object.keys(generationConfig.responseSchema.properties).sort(),
     ['headline', 'recommendation', 'summary'],

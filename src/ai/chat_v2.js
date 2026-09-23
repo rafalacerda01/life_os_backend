@@ -361,7 +361,6 @@ export const CHAT_V2_GENERATION_CONFIG = Object.freeze({
   responseMimeType: 'application/json',
   responseSchema: {
     type: 'OBJECT',
-    additionalProperties: false,
     properties: {
       headline: {
         type: 'STRING',
