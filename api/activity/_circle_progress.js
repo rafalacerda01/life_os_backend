@@ -200,7 +200,8 @@ export async function readActivityCircleProgressPlan({
     circleRef.collection('challenges'),
   );
   const eligibleChallenges = challengesSnapshot.docs.filter((snapshot) =>
-    isEligibleChallenge(snapshot.data(), challengeType, event.occurredAt),
+    isSafeDocumentId(snapshot.id) &&
+      isEligibleChallenge(snapshot.data(), challengeType, event.occurredAt),
   );
 
   if (eligibleChallenges.length > MAX_CIRCLE_PROGRESS_CHALLENGES) {

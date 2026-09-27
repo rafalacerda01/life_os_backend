@@ -62,6 +62,10 @@ class FakeDocumentSnapshot {
   data() {
     return this._data;
   }
+
+  get id() {
+    return this.ref.path.split('/').at(-1);
+  }
 }
 
 class FakeTransaction {
@@ -297,6 +301,22 @@ function progressPath(challengeId) {
 
 function processedPath(challengeId, kind = 'task', occurredAt = EVENT_AT) {
   return `circles/${CIRCLE_ID}/challenges/${challengeId}/processed_events/${activityId(kind, occurredAt)}`;
+}
+
+for (const kind of ['task', 'habit']) {
+  for (const invalidId of ['x'.repeat(129), ' leading', 'trailing ']) {
+    test(`invalid Challenge ID ${JSON.stringify(invalidId)} is skipped without blocking ${kind}`, async () => {
+      const type = `${kind.toUpperCase()}_COMPLETIONS`;
+      const fixture = createFixture({kind, challenges: [
+        [invalidId, challenge(type)], ['v'.repeat(128), challenge(type)],
+      ]});
+      await complete(fixture);
+      assert.equal(fixture.db.data(progressPath(invalidId)), undefined);
+      assert.equal(fixture.db.data(processedPath(invalidId, kind)), undefined);
+      assert.equal(fixture.db.data(progressPath('v'.repeat(128))).value, 1);
+      assert.ok(fixture.db.data(processedPath('v'.repeat(128), kind)));
+    });
+  }
 }
 
 function circleWrites(db, transactionIndex = 0) {

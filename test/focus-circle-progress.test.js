@@ -49,6 +49,10 @@ class FakeDocumentSnapshot {
   data() {
     return this._data;
   }
+
+  get id() {
+    return this.ref.path.split('/').at(-1);
+  }
 }
 
 class FakeTransaction {
@@ -265,6 +269,22 @@ function progressPath(challengeId) {
 
 function eventPath(challengeId, sessionId = SESSION_ID) {
   return `circles/${CIRCLE_ID}/challenges/${challengeId}/processed_events/${sessionId}`;
+}
+
+for (const invalidId of ['x'.repeat(129), ' leading', 'trailing ']) {
+  test(`invalid Challenge ID ${JSON.stringify(invalidId)} is skipped without blocking valid Focus`, async () => {
+    const session = completedSession();
+    const db = new FakeFirestore();
+    seedCircle(db, session, {challenges: [
+      [invalidId, challenge(session, 'FOCUS_MINUTES')],
+      ['v'.repeat(128), challenge(session, 'FOCUS_MINUTES')],
+    ]});
+    await processCircle(db, session);
+    assert.equal(db.data(progressPath(invalidId)), undefined);
+    assert.equal(db.data(eventPath(invalidId)), undefined);
+    assert.equal(db.data(progressPath('v'.repeat(128))).value, 1);
+    assert.ok(db.data(eventPath('v'.repeat(128))));
+  });
 }
 
 for (const memberLimit of [10, 30]) {

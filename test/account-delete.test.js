@@ -926,7 +926,7 @@ test('account without Circle, including activeCircleId null, is deleted recursiv
 });
 
 test('invalid or whitespace-normalized activeCircleId fails closed', async () => {
-  const invalidValues = [123, '', 'bad/id', 'x'.repeat(129), ' circle-1 '];
+  const invalidValues = [123, '', 'bad/id', 'x'.repeat(1501), ' circle-1 '];
   for (const activeCircleId of invalidValues) {
     const db = new FakeFirestore();
     db.seed(path('users', UID), { activeCircleId });
@@ -1594,6 +1594,48 @@ function seedHistory(db, circleId = 'old-circle', challengeId = 'old-challenge')
   return root;
 }
 
+test('legacy oversized Circle and Challenge history is cleaned without touching another UID', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {});
+  const root = seedHistory(db, 'c'.repeat(129), 'h'.repeat(129));
+  const original = {schemaVersion: 2, createdBy: UID, title: 'Shared challenge'};
+  db.seed(root, original);
+  const foreign = progressData(7, 'other-user');
+  db.seed(`${root}/progress/other-user`, foreign);
+  const auth = new FakeAuth({});
+  const result = await deleteAccount({db, auth, uid: UID});
+  assert.equal(result.body.deleted, true);
+  assert.equal(db.data(`${root}/progress/${UID}`), undefined);
+  assert.equal(db.data(`${root}/processed_events/focus-old`), undefined);
+  assert.equal(db.data(`circles/${'c'.repeat(129)}/ranking/${UID}`), undefined);
+  assert.deepEqual(db.data(`${root}/progress/other-user`), foreign);
+  assert.deepEqual(db.data(root), {...original, createdBy: ''});
+  assert.deepEqual(auth.deleteCalls, [UID]);
+});
+
+for (const soleAdmin of [false, true]) {
+  test(`legacy oversized active Circle supports account cleanup (sole admin: ${soleAdmin})`, async () => {
+    const db = new FakeFirestore();
+    const id = 'c'.repeat(129);
+    db.seed(`users/${UID}`, {activeCircleId: id});
+    db.seed(`circles/${id}`, baseCircle({adminId: soleAdmin ? UID : ADMIN_UID,
+      memberCount: soleAdmin ? 1 : 2}));
+    db.seed(`circles/${id}/members/${UID}`, member(soleAdmin ? 'admin' : 'member'));
+    if (!soleAdmin) db.seed(`circles/${id}/members/${ADMIN_UID}`, member('admin'));
+    const auth = new FakeAuth({});
+    const result = await deleteAccount({db, auth, uid: UID});
+    assert.equal(result.body.deleted, true);
+    assert.equal(db.data(`users/${UID}`), undefined);
+    assert.equal(db.data(`circles/${id}/members/${UID}`), undefined);
+    if (soleAdmin) assert.equal(db.data(`circles/${id}`), undefined);
+    else {
+      assert.equal(db.data(`circles/${id}`).memberCount, 1);
+      assert.ok(db.data(`circles/${id}/members/${ADMIN_UID}`));
+    }
+    assert.deepEqual(auth.deleteCalls, [UID]);
+  });
+}
+
 test('global history in Circle A and current membership B are both cleaned', async () => {
   const db = seedNormalCircle(new FakeFirestore());
   const old = seedHistory(db);
@@ -1845,6 +1887,22 @@ test('pending Circle marker belonging to a different live root cannot authorize 
   assert.deepEqual(db.data('circles/old'), root);
   assert.deepEqual(db.recursiveDeletes, []);
   assert.deepEqual(auth.deleteCalls, []);
+});
+
+test('legacy oversized pending Circle marker finalizes without retaining UID references', async () => {
+  const db = new FakeFirestore();
+  const id = 'c'.repeat(129);
+  db.seed(`users/${UID}`, {});
+  db.seed(`circles/${id}`, baseCircle({adminId: UID, memberCount: 1, deletionState: 'SERVER_DELETING'}));
+  db.seed(`circles/${id}/members/${UID}`, member('admin'));
+  db.seed(`circle_deletions/${id}`, {version: 1, state: 'SERVER_DELETING',
+    circleId: id, initiatedBy: UID, memberUids: [UID], createdAt: timestamp(100)});
+  const auth = new FakeAuth({});
+  await deleteAccount({db, auth, uid: UID});
+  assert.equal(db.data(`circles/${id}`), undefined);
+  assert.equal(db.data(`circle_deletions/${id}`), undefined);
+  assert.equal(db.data(`users/${UID}`), undefined);
+  assert.deepEqual(auth.deleteCalls, [UID]);
 });
 
 test('backfilled legacy progress with optional timestamps is cleaned without changing writers', async () => {

@@ -196,7 +196,7 @@ export async function readCircleProgressPlan({
     circleRef.collection('challenges'),
   );
   const eligibleChallenges = challengesSnapshot.docs.filter((snapshot) =>
-    isEligibleChallenge(snapshot.data(), session),
+    isSafeDocumentId(snapshot.id) && isEligibleChallenge(snapshot.data(), session),
   );
 
   if (eligibleChallenges.length > MAX_CIRCLE_PROGRESS_CHALLENGES) {

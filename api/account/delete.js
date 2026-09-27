@@ -88,7 +88,8 @@ function validateDeletionState(userData) {
     !isPlainObject(state) ||
     state.version !== DELETION_STATE_VERSION ||
     state.mode !== SOLE_ADMIN_MODE ||
-    normalizeSafeDocumentId(state.circleId) !== state.circleId ||
+    !circleCleanup.storedPathSegment(state.circleId) ||
+    state.circleId.trim() !== state.circleId ||
     !isTimestamp(state.startedAt)
   ) {
     throw stateConflict();
@@ -110,7 +111,8 @@ function validateExternalCleanupMarker(marker) {
     typeof marker.circleDeleted !== 'boolean' ||
     !(
       marker.activeCircleId === null ||
-      normalizeSafeDocumentId(marker.activeCircleId) === marker.activeCircleId
+      (circleCleanup.storedPathSegment(marker.activeCircleId) &&
+        marker.activeCircleId.trim() === marker.activeCircleId)
     ) ||
     !isTimestamp(marker.completedAt)
   ) {
@@ -128,7 +130,8 @@ function validateExternalCleanupMarker(marker) {
 function validateActiveCircleId(userData) {
   const activeCircleId = userData?.activeCircleId;
   if (activeCircleId === undefined || activeCircleId === null) return null;
-  if (normalizeSafeDocumentId(activeCircleId) !== activeCircleId) {
+  if (!circleCleanup.storedPathSegment(activeCircleId) ||
+      activeCircleId.trim() !== activeCircleId) {
     throw stateConflict('O activeCircleId da conta esta inconsistente.');
   }
   return activeCircleId;

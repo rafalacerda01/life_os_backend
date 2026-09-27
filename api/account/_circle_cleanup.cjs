@@ -25,6 +25,12 @@ function safeId(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 128 &&
     value.trim() === value && !value.includes("/") && value !== "." && value !== "..";
 }
+// Stored Firestore paths may predate the stricter public ID contract.
+function storedPathSegment(value) {
+  return typeof value === "string" && value.length > 0 &&
+    Buffer.byteLength(value, "utf8") <= 1500 && !value.includes("/") &&
+    value !== "." && value !== ".." && !/^__.*__$/.test(value);
+}
 function time(value) {
   try {
     return object(value) && typeof value.toMillis === "function" &&
@@ -76,7 +82,7 @@ function pathParts(snapshot, group) {
   const expected = ["members", "ranking", "challenges"].includes(group) ? 4 : 6;
   if (parts.length !== expected || parts[0] !== "circles" ||
       parts.at(-2) !== group || (expected === 6 && parts[2] !== "challenges") ||
-      !parts.every(safeId)) conflict();
+      !parts.every(storedPathSegment)) conflict();
   return parts;
 }
 function validateHistory(snapshot, group, uid) {
@@ -172,7 +178,7 @@ async function cleanupOwned(db, uid, guard, allowShared) {
       if (!allowShared && data.memberCount > 1) conflict("CIRCLE_ADMIN_ACTION_REQUIRED");
       for (const member of list.docs) {
         const id = pathParts(member, "members").at(-1);
-        if (member.data()?.role !== (id === uid ? "admin" : "member")) conflict();
+        if (!safeId(id) || member.data()?.role !== (id === uid ? "admin" : "member")) conflict();
       }
       if (!list.docs.some((doc) => doc.ref.path.split("/").at(-1) === uid)) conflict();
       if (marker.exists) {
@@ -204,7 +210,9 @@ async function clearLink(db, uid, circleId) {
 function validatePendingMarker(snapshot) {
   const value = snapshot.data();
   const circleId = snapshot.ref.path.split("/").at(-1);
-  if (snapshot.ref.path.split('/').length !== 2 || !safeId(circleId)) conflict();
+  if (snapshot.ref.path.split('/').length !== 2 ||
+      snapshot.ref.path.split('/')[0] !== "circle_deletions" ||
+      !storedPathSegment(circleId)) conflict();
   if (!exact(value, ["version", "state", "circleId", "initiatedBy", "memberUids", "createdAt"]) ||
       value.version !== 1 || value.state !== "SERVER_DELETING" || value.circleId !== circleId ||
       !safeId(value.initiatedBy) || !Array.isArray(value.memberUids) ||
@@ -325,6 +333,6 @@ async function verifyReferences(db, uid) {
     if (doc.data()?.initiatedBy === uid || doc.data()?.memberUids?.includes(uid)) conflict();
   });
 }
-module.exports = {PAGE_SIZE, guardRef, validateGuard, beginGuard, requireGuard,
+module.exports = {PAGE_SIZE, storedPathSegment, guardRef, validateGuard, beginGuard, requireGuard,
   completeGuard, preflightOwned, cleanupOwned, cleanupPendingMarkers, cleanupMemberships,
   cleanupHistory, assertEmpty, verifyReferences};
