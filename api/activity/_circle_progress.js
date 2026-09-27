@@ -124,8 +124,9 @@ function isExpectedActivityEventId(event, activityEventId) {
   return false;
 }
 
-function validProgressUpdate(progress, occurredAt) {
+function validProgressUpdate(progress, occurredAt, uid) {
   if (!isPlainObject(progress)) return null;
+  if (Object.hasOwn(progress, 'uid') && progress.uid !== uid) return null;
   if (!Number.isSafeInteger(progress.value) || progress.value < 0) return null;
   if (progress.updatedAt !== undefined && !isTimestamp(progress.updatedAt)) {
     return null;
@@ -228,6 +229,7 @@ export async function readActivityCircleProgressPlan({
       progressUpdate = validProgressUpdate(
         progressSnapshot.data(),
         event.occurredAt,
+        uid,
       );
       if (progressUpdate === null) continue;
     }
@@ -270,6 +272,7 @@ export function applyActivityCircleProgressPlan({
     });
 
     const progressData = {
+      uid,
       value: entry.nextValue,
       updatedAt: processedAt,
       lastEventAt: entry.nextLastEventAt,

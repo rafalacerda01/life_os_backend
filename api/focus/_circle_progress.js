@@ -122,8 +122,9 @@ function isEligibleChallenge(challenge, session) {
   );
 }
 
-function validProgressUpdate(progress, contribution, completedAt) {
+function validProgressUpdate(progress, contribution, completedAt, uid) {
   if (!isPlainObject(progress)) return null;
+  if (Object.hasOwn(progress, 'uid') && progress.uid !== uid) return null;
   if (!Number.isSafeInteger(progress.value) || progress.value < 0) return null;
   if (progress.updatedAt !== undefined && !isTimestamp(progress.updatedAt)) {
     return null;
@@ -226,6 +227,7 @@ export async function readCircleProgressPlan({
         progressSnapshot.data(),
         contribution,
         session.completedAt,
+        uid,
       );
       if (progressUpdate === null) continue;
     }
@@ -267,6 +269,7 @@ export function applyCircleProgressPlan({
     });
 
     const progressData = {
+      uid,
       value: entry.nextValue,
       updatedAt: processedAt,
       lastEventAt: entry.nextLastEventAt,

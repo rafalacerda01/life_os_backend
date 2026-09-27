@@ -541,6 +541,7 @@ test('missing progress is created with value one', async () => {
   });
   await complete(fixture);
   assert.deepEqual(fixture.db.data(progressPath('task')), {
+    uid: UID,
     value: 1,
     updatedAt: EVENT_AT,
     lastEventAt: EVENT_AT,
@@ -559,7 +560,62 @@ test('valid existing progress increments exactly one', async () => {
   });
   await complete(fixture);
   assert.equal(fixture.db.data(progressPath('task')).value, 9);
+  assert.equal(fixture.db.data(progressPath('task')).uid, UID);
 });
+
+for (const kind of ['task', 'habit']) {
+  test(`matching progress ownership preserves ${kind} contribution and replay`, async () => {
+    const fixture = createFixture({
+      kind,
+      challenges: [[kind, challenge(`${kind.toUpperCase()}_COMPLETIONS`)]],
+    });
+    const previousAt = Timestamp.fromMillis(EVENT_AT.toMillis() - 1);
+    fixture.db.seed(progressPath(kind), {
+      uid: UID,
+      value: 8,
+      updatedAt: previousAt,
+      lastEventAt: previousAt,
+    });
+
+    await complete(fixture);
+    await complete(fixture);
+
+    assert.deepEqual(fixture.db.data(progressPath(kind)), {
+      uid: UID,
+      value: 9,
+      updatedAt: EVENT_AT,
+      lastEventAt: EVENT_AT,
+    });
+    assert.equal(fixture.db.data(processedPath(kind, kind)).uid, UID);
+    assert.equal(circleWrites(fixture.db, 1).length, 0);
+  });
+
+  for (const owner of ['other-user', null, undefined]) {
+    test(`inconsistent progress ownership (${String(owner)}) skips ${kind} event`, async () => {
+      const fixture = createFixture({
+        kind,
+        challenges: [
+          ['bad', challenge(`${kind.toUpperCase()}_COMPLETIONS`)],
+          ['good', challenge(`${kind.toUpperCase()}_COMPLETIONS`)],
+        ],
+      });
+      const original = {
+        uid: owner,
+        value: 8,
+        updatedAt: EVENT_AT,
+        lastEventAt: EVENT_AT,
+      };
+      fixture.db.seed(progressPath('bad'), original);
+
+      await complete(fixture);
+
+      assert.deepEqual(fixture.db.data(progressPath('bad')), original);
+      assert.equal(fixture.db.data(processedPath('bad', kind)), undefined);
+      assert.equal(fixture.db.data(progressPath('good')).uid, UID);
+      assert.equal(fixture.db.data(progressPath('good')).value, 1);
+    });
+  }
+}
 
 test('malformed progress is untouched while another Challenge continues', async () => {
   const fixture = createFixture({

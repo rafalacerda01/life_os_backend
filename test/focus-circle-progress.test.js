@@ -639,6 +639,7 @@ test('missing progress is created with server-owned event metadata', async () =>
   const progress = db.data(progressPath('focus'));
   const event = db.data(eventPath('focus'));
   assert.deepEqual(progress, {
+    uid: UID,
     value: 3,
     updatedAt: session.completedAt,
     lastEventAt: session.completedAt,
@@ -665,7 +666,61 @@ test('valid existing progress increments exactly once', async () => {
   await processCircle(db, session);
 
   assert.equal(db.data(progressPath('focus')).value, 10);
+  assert.equal(db.data(progressPath('focus')).uid, UID);
 });
+
+test('matching progress ownership preserves contribution and timestamps', async () => {
+  const session = completedSession({ durationSeconds: 180 });
+  const db = new FakeFirestore();
+  seedCircle(db, session, {
+    challenges: [['focus', challenge(session, 'FOCUS_MINUTES')]],
+  });
+  db.seed(progressPath('focus'), {
+    uid: UID,
+    value: 7,
+    updatedAt: session.startedAt,
+    lastEventAt: session.startedAt,
+  });
+
+  await processCircle(db, session);
+  await processCircle(db, session);
+
+  assert.deepEqual(db.data(progressPath('focus')), {
+    uid: UID,
+    value: 10,
+    updatedAt: session.completedAt,
+    lastEventAt: session.completedAt,
+  });
+  assert.equal(db.data(eventPath('focus')).uid, UID);
+  assert.equal(db.transactions[1].writes.length, 0);
+});
+
+for (const owner of ['other-user', null, undefined]) {
+  test(`inconsistent progress ownership (${String(owner)}) skips Focus event`, async () => {
+    const session = completedSession();
+    const db = new FakeFirestore();
+    seedCircle(db, session, {
+      challenges: [
+        ['bad', challenge(session, 'FOCUS_MINUTES')],
+        ['good', challenge(session, 'FOCUS_MINUTES')],
+      ],
+    });
+    const original = {
+      uid: owner,
+      value: 7,
+      updatedAt: session.startedAt,
+      lastEventAt: session.startedAt,
+    };
+    db.seed(progressPath('bad'), original);
+
+    await processCircle(db, session);
+
+    assert.deepEqual(db.data(progressPath('bad')), original);
+    assert.equal(db.data(eventPath('bad')), undefined);
+    assert.equal(db.data(progressPath('good')).uid, UID);
+    assert.equal(db.data(progressPath('good')).value, 1);
+  });
+}
 
 test('existing newer lastEventAt never regresses', async () => {
   const session = completedSession();
