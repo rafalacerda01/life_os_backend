@@ -305,6 +305,47 @@ function circleWrites(db, transactionIndex = 0) {
   );
 }
 
+for (const memberLimit of [10, 30]) {
+  for (const kind of ['task', 'habit']) {
+    test(`Circle limit ${memberLimit} credits ${kind} completion`, async () => {
+      const challengeType = `${kind.toUpperCase()}_COMPLETIONS`;
+      const fixture = createFixture({
+        kind,
+        circleOverrides: { memberLimit, memberCount: memberLimit },
+        challenges: [[kind, challenge(challengeType)]],
+      });
+
+      await complete(fixture);
+
+      assert.ok(fixture.db.data(activityPath(kind)));
+      assert.equal(fixture.db.data(progressPath(kind)).value, 1);
+      assert.equal(
+        fixture.db.data(processedPath(kind, kind)).challengeType,
+        challengeType,
+      );
+    });
+  }
+}
+
+for (const memberLimit of [4, 29, 31]) {
+  for (const kind of ['task', 'habit']) {
+    test(`Circle limit ${memberLimit} preserves ${kind} event without competition`, async () => {
+      const fixture = createFixture({
+        kind,
+        circleOverrides: { memberLimit },
+        challenges: [[kind, challenge(`${kind.toUpperCase()}_COMPLETIONS`)]],
+      });
+
+      await complete(fixture);
+
+      assert.ok(fixture.db.data(activityPath(kind)));
+      assert.equal(fixture.db.data(progressPath(kind)), undefined);
+      assert.equal(fixture.db.data(processedPath(kind, kind)), undefined);
+      assert.equal(circleWrites(fixture.db).length, 0);
+    });
+  }
+}
+
 function seedStoredEvent(fixture, occurredAt = EVENT_AT) {
   const type =
     fixture.kind === 'task'

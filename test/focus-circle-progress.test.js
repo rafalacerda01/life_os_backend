@@ -267,6 +267,56 @@ function eventPath(challengeId, sessionId = SESSION_ID) {
   return `circles/${CIRCLE_ID}/challenges/${challengeId}/processed_events/${sessionId}`;
 }
 
+for (const memberLimit of [10, 30]) {
+  for (const [targetType, challengeType] of [
+    ['TASK', 'FOCUS_MINUTES'],
+    ['SUBJECT', 'STUDY_MINUTES'],
+  ]) {
+    test(`Circle limit ${memberLimit} credits ${challengeType}`, async () => {
+      const session = completedSession({ targetType, durationSeconds: 180 });
+      const db = new FakeFirestore();
+      seedCircle(db, session, {
+        circleData: validCircleData(session, {
+          memberLimit,
+          memberCount: memberLimit,
+          adminId: 'other-admin',
+        }),
+        memberData: validMemberData(session, { role: 'member' }),
+        challenges: [['challenge', challenge(session, challengeType)]],
+      });
+
+      await processCircle(db, session);
+
+      assert.equal(db.data(progressPath('challenge')).value, 3);
+      assert.equal(db.data(eventPath('challenge')).challengeType, challengeType);
+      assert.equal(db.data(eventPath('challenge')).contributionValue, 3);
+    });
+  }
+}
+
+for (const memberLimit of [4, 29, 31]) {
+  test(`Circle limit ${memberLimit} fails closed for Focus progress`, async () => {
+    const session = completedSession({ targetType: 'SUBJECT' });
+    const db = new FakeFirestore();
+    seedCircle(db, session, {
+      circleData: validCircleData(session, { memberLimit }),
+      challenges: [
+        ['focus', challenge(session, 'FOCUS_MINUTES')],
+        ['study', challenge(session, 'STUDY_MINUTES')],
+      ],
+    });
+
+    const plan = await processCircle(db, session);
+
+    assert.equal(plan.entries.length, 0);
+    assert.equal(db.transactions[0].writes.length, 0);
+    for (const challengeId of ['focus', 'study']) {
+      assert.equal(db.data(progressPath(challengeId)), undefined);
+      assert.equal(db.data(eventPath(challengeId)), undefined);
+    }
+  });
+}
+
 function runningFinishFixture({
   durationSeconds = 60,
   targetType = 'TASK',

@@ -60,7 +60,9 @@ function isValidCircle(circle) {
     isSafeDocumentId(circle.adminId) &&
     Number.isInteger(circle.memberCount) &&
     circle.memberCount >= 1 &&
-    (circle.memberLimit === 3 || circle.memberLimit === 10) &&
+    (circle.memberLimit === 3 ||
+      circle.memberLimit === 10 ||
+      circle.memberLimit === 30) &&
     circle.memberCount <= circle.memberLimit &&
     isTimestamp(circle.createdAt) &&
     isTimestamp(circle.updatedAt)
