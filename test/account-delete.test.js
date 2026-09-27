@@ -68,6 +68,10 @@ class FakeQuery {
     return new FakeQuery(this.collectionRef, this.filters, value);
   }
 
+  orderBy() { return this; }
+
+  startAfter(snapshot) { this.cursor = snapshot.ref.path; return this; }
+
   get() {
     return Promise.resolve(this.collectionRef.db.querySnapshot(this));
   }
@@ -95,11 +99,14 @@ class FakeCollectionReference {
   get() {
     return Promise.resolve(this.db.querySnapshot(this));
   }
+
+  orderBy() { return new FakeQuery(this); }
 }
 
 class FakeDocumentSnapshot {
   constructor(ref, data) {
     this.ref = ref;
+    this.id = ref.path.split('/').at(-1);
     this.exists = data !== undefined;
     this._data = data;
   }
@@ -181,6 +188,15 @@ class FakeTransaction extends FakeWriter {
   }
 
   commit() {
+    if (this.writes.some((write) => /\/(processed_events|progress|ranking)\//.test(write.ref.path))) {
+      this.db.historyCommits = (this.db.historyCommits ?? 0) + 1;
+      if (this.db.historyCommits === this.db.failHistoryAt) throw new Error('history transport failure');
+    }
+    if (this.db.failHistoryOnce && this.writes.some((write) =>
+      /\/(processed_events|progress|ranking)\//.test(write.ref.path))) {
+      this.db.failHistoryOnce = false;
+      throw new Error('batch cleanup failed');
+    }
     this.db.applyWrites(this.writes);
   }
 }
@@ -202,6 +218,12 @@ class FakeFirestore {
 
   collection(name) {
     return new FakeCollectionReference(this, name);
+  }
+
+  collectionGroup(name) {
+    const ref = new FakeCollectionReference(this, name);
+    ref.group = name;
+    return ref;
   }
 
   batch() {
@@ -228,9 +250,14 @@ class FakeFirestore {
     let docs = [];
 
     for (const [documentPath, data] of [...this.store.entries()].sort()) {
-      if (!documentPath.startsWith(prefix)) continue;
-      const suffix = documentPath.slice(prefix.length);
-      if (!suffix || suffix.includes('/')) continue;
+      if (collectionRef.group) {
+        if (documentPath.split('/').at(-2) !== collectionRef.group) continue;
+      } else {
+        if (!documentPath.startsWith(prefix)) continue;
+        const suffix = documentPath.slice(prefix.length);
+        if (!suffix || suffix.includes('/')) continue;
+      }
+      if (ref.cursor && documentPath <= ref.cursor) continue;
       const snapshot = new FakeDocumentSnapshot(
         new FakeDocumentReference(this, documentPath),
         data,
@@ -364,6 +391,23 @@ function member(role) {
     photoUrlSnapshot: null,
     joinedAt: timestamp(),
   };
+}
+
+function progressData(value = 1, uid = UID) {
+  return { uid, value, updatedAt: timestamp(100), lastEventAt: timestamp(100) };
+}
+
+function focusEvent(id, uid = UID) {
+  return { uid, source: 'VERIFIED_FOCUS', sessionId: id,
+    challengeType: 'FOCUS_MINUTES', contributionValue: 1,
+    sessionStartedAt: timestamp(0), sessionCompletedAt: timestamp(100),
+    processedAt: timestamp(100), schemaVersion: 1 };
+}
+
+function activityEvent(id, uid = UID) {
+  return { uid, source: 'VERIFIED_ACTIVITY', activityEventId: id,
+    activityType: 'TASK_COMPLETION', challengeType: 'TASK_COMPLETIONS', resourceId: 'task',
+    contributionValue: 1, eventOccurredAt: timestamp(100), processedAt: timestamp(100), schemaVersion: 1 };
 }
 
 function seedNormalCircle(db, options = {}) {
@@ -1030,17 +1074,9 @@ test('normal member cleanup removes Focus and Activity events but keeps another 
   const db = seedNormalCircle(new FakeFirestore());
   const challengePath = path('circles', CIRCLE_ID, 'challenges', 'c1');
   db.seed(challengePath, { corrupted: true });
-  db.seed(path(challengePath, 'progress', UID), { value: 3 });
-  db.seed(path(challengePath, 'processed_events', 'focus'), {
-    uid: UID,
-    source: 'VERIFIED_FOCUS',
-    sessionId: 'session-1',
-  });
-  db.seed(path(challengePath, 'processed_events', 'activity'), {
-    uid: UID,
-    source: 'VERIFIED_ACTIVITY',
-    activityEventId: 'event-1',
-  });
+  db.seed(path(challengePath, 'progress', UID), progressData(3));
+  db.seed(path(challengePath, 'processed_events', 'focus'), focusEvent('focus'));
+  db.seed(path(challengePath, 'processed_events', 'activity'), activityEvent('activity'));
   db.seed(path(challengePath, 'processed_events', 'foreign'), {
     uid: 'other-user',
     source: 'VERIFIED_FOCUS',
@@ -1209,7 +1245,7 @@ test('ambiguous missing membership state fails closed', async () => {
 
 test('commit transaction rereads a raced memberCount', async () => {
   const db = seedNormalCircle(new FakeFirestore());
-  db.beforeTransactions.set(4, (firestore) => {
+  db.beforeTransactions.set(3, (firestore) => {
     firestore.seed(
       path('circles', CIRCLE_ID, 'members', 'new-user'),
       member('member'),
@@ -1242,7 +1278,7 @@ test('exact challenge safety boundary is accepted', async () => {
   assert.deepEqual(auth.deleteCalls, [UID]);
 });
 
-test('large processed event history is paged outside transactions', async () => {
+test('large processed event history uses bounded ownership-checked transactions', async () => {
   const db = seedNormalCircle(new FakeFirestore());
   const challengePath = path('circles', CIRCLE_ID, 'challenges', 'c1');
   db.seed(challengePath, { invalid: true });
@@ -1254,30 +1290,29 @@ test('large processed event history is paged outside transactions', async () => 
         'processed_events',
         'e-' + String(index).padStart(4, '0'),
       ),
-      { uid: UID, source: 'VERIFIED_FOCUS', sessionId: 's-' + index },
+      focusEvent('e-' + String(index).padStart(4, '0')),
     );
   }
   const auth = new FakeAuth({});
 
   await deleteAccount({ db, auth, uid: UID });
 
-  assert.ok(db.batchSizes.filter((size) => size > 1).length >= 3);
+  const pages = db.transactions.filter((transaction) =>
+    transaction.writes.some((write) => write.ref.path.includes('/processed_events/')));
+  assert.equal(pages.length, 3);
   assert.ok(
-    db.batchSizes.every((size) => size <= PROCESSED_EVENT_DELETE_PAGE_SIZE),
+    pages.every((transaction) => transaction.writes.length <= PROCESSED_EVENT_DELETE_PAGE_SIZE),
   );
   assert.ok(
-    db.transactions.every((transaction) =>
-      transaction.writes.every(
-        (write) => !write.ref.path.includes('processed_events'),
-      ),
-    ),
+    pages.every((transaction) => transaction.writes.every((write) => write.type === 'delete')),
   );
 });
 
 test('Circle cleanup failure never deletes Firebase Auth', async () => {
   const circleDb = seedNormalCircle(new FakeFirestore());
   circleDb.seed(path('circles', CIRCLE_ID, 'challenges', 'c1'), { any: true });
-  circleDb.failBatchAt = 1;
+  circleDb.seed(path('circles', CIRCLE_ID, 'challenges', 'c1', 'progress', UID), progressData());
+  circleDb.failHistoryOnce = true;
   const circleAuth = new FakeAuth({});
   await assert.rejects(
     deleteAccount({ db: circleDb, auth: circleAuth, uid: UID }),
@@ -1313,10 +1348,8 @@ test('transient Auth failure preserves user tree and external cleanup marker', a
   );
   assert.ok(db.data(path('users', UID)));
   assert.ok(db.data(path('users', UID, 'tasks', 'task-1')));
-  assert.deepEqual(
-    db.data(ACCOUNT_DELETION_MARKER_PATH),
-    db.setCalls.at(-1).data,
-  );
+  assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH).version, 2);
+  assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH).scope, 'GLOBAL_CIRCLE_UID');
   assert.equal(
     db.data(ACCOUNT_DELETION_MARKER_PATH).state,
     'EXTERNAL_CLEANUP_COMPLETE',
@@ -1346,7 +1379,7 @@ test('retry after transient Auth failure skips Circle cleanup and completes', as
 
   assert.deepEqual(result.body, { deleted: true, circleDeleted: false });
   assert.ok(db.transactions.slice(transactionsAfterCleanup).every((transaction) =>
-    transaction.operations.every((operation) => !operation.path.startsWith('circles/'))));
+    transaction.writes.every((write) => !write.ref.path.startsWith('circles/'))));
   assert.equal(db.batchCommitCount, batchesAfterCleanup);
   assert.equal(db.data(path('circles', CIRCLE_ID)).memberCount, 1);
   assert.deepEqual(auth.deleteCalls, [UID, UID]);
@@ -1451,7 +1484,7 @@ test('billing index cleanup conflict aborts before Auth and user deletion', asyn
   db.seed(path('users', UID), { activeCircleId: null });
   db.seed(path('billing_google_accounts', accountHash), { uid: UID, state: 'ACTIVE' });
   db.seed(indexPath, { accountHash });
-  db.beforeTransactions.set(2, (firestore) => {
+  db.beforeTransactions.set(3, (firestore) => {
     firestore.seed(indexPath, { accountHash: sha256('other-user') });
   });
   const auth = new FakeAuth({});
@@ -1485,7 +1518,7 @@ test('billing cleanup transport failure retains DELETING barrier without deletin
   const indexPath = path('billing_google_tokens', sha256('token-a'));
   db.seed(path('users', UID), { activeCircleId: null });
   db.seed(indexPath, { accountHash: sha256(UID) });
-  db.beforeTransactions.set(2, () => { throw new Error('private-billing-transport-error'); });
+  db.beforeTransactions.set(3, () => { throw new Error('private-billing-transport-error'); });
   const auth = new FakeAuth({});
 
   await assert.rejects(deleteAccount({ db, auth, uid: UID }));
@@ -1548,4 +1581,300 @@ test('unexpected failures return no token, email, UID, or stack', async () => {
   } finally {
     console.error = originalConsoleError;
   }
+});
+const GUARD_PATH = `account_deletion_guards/${UID}`;
+function rankingData(owner = UID) {
+  return {uid: owner, name: 'Private name', totalXp: 10, photoUrl: null, updatedAt: timestamp(100)};
+}
+function seedHistory(db, circleId = 'old-circle', challengeId = 'old-challenge') {
+  const root = `circles/${circleId}/challenges/${challengeId}`;
+  db.seed(`${root}/progress/${UID}`, progressData());
+  db.seed(`${root}/processed_events/focus-old`, focusEvent('focus-old'));
+  db.seed(`circles/${circleId}/ranking/${UID}`, rankingData());
+  return root;
+}
+
+test('global history in Circle A and current membership B are both cleaned', async () => {
+  const db = seedNormalCircle(new FakeFirestore());
+  const old = seedHistory(db);
+  db.seed(old, {schemaVersion: 2, title: 'Shared challenge', createdBy: UID});
+  const foreign = progressData(7, 'other-user');
+  db.seed(`${old}/progress/other-user`, foreign);
+  const auth = new FakeAuth({});
+  auth.deleteUser = async (owner) => {
+    assert.equal(db.data(`${old}/progress/${UID}`), undefined);
+    assert.equal(db.data(`${old}/processed_events/focus-old`), undefined);
+    assert.equal(db.data(`circles/old-circle/ranking/${UID}`), undefined);
+    assert.equal(db.data(`circles/${CIRCLE_ID}/members/${UID}`), undefined);
+    assert.equal(db.data(old).createdBy, '');
+    const marker = db.data(ACCOUNT_DELETION_MARKER_PATH);
+    assert.equal(marker.version, 2);
+    assert.equal(marker.scope, 'GLOBAL_CIRCLE_UID');
+    assert.equal(marker.deletionId, db.data(GUARD_PATH).deletionId);
+    auth.deleteCalls.push(owner);
+  };
+  await deleteAccount({db, auth, uid: UID});
+  assert.deepEqual(db.data(`${old}/progress/other-user`), foreign);
+  const guardSet = db.operationLog.findIndex((entry) => entry.path === GUARD_PATH && entry.type === 'set');
+  const historyDelete = db.operationLog.findIndex((entry) => entry.path === `${old}/progress/${UID}`);
+  assert.ok(guardSet >= 0 && guardSet < historyDelete);
+  assert.equal(db.data(GUARD_PATH).state, 'COMPLETE');
+});
+
+for (const data of [{}, {activeCircleId: null}]) {
+  test(`leaving Circle A before deletion still discovers history (${Object.keys(data).length})`, async () => {
+    const db = new FakeFirestore();
+    db.seed(`users/${UID}`, data);
+    const old = seedHistory(db);
+    const result = await deleteAccount({db, auth: new FakeAuth({}), uid: UID});
+    assert.equal(result.body.deleted, true);
+    assert.equal(db.data(`${old}/progress/${UID}`), undefined);
+    assert.equal(db.data(`${old}/processed_events/focus-old`), undefined);
+    assert.equal(db.data(`circles/old-circle/ranking/${UID}`), undefined);
+  });
+}
+
+test('more than 240 challenges including absent parents are cleaned globally', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {});
+  for (let index = 0; index < 321; index++) {
+    db.seed(`circles/history/challenges/c-${index}/progress/${UID}`, progressData());
+  }
+  await deleteAccount({db, auth: new FakeAuth({}), uid: UID});
+  assert.equal([...db.store.keys()].some((key) => key.includes('/progress/')), false);
+});
+
+test('global progress events and ranking all converge across multiple bounded pages', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {});
+  for (let index = 0; index < 417; index++) seedHistory(db, `old-${index}`);
+  await deleteAccount({db, auth: new FakeAuth({}), uid: UID});
+  for (const group of ['progress', 'processed_events', 'ranking']) {
+    const pages = db.transactions.filter((tx) => tx.writes.some((write) => write.ref.path.includes(`/${group}/`)));
+    assert.equal(pages.length, 3);
+    assert.ok(pages.every((tx) => tx.writes.length <= 200));
+  }
+  assert.deepEqual([...db.store.keys()], [GUARD_PATH]);
+});
+
+for (const [name, documentPath, document] of [
+  ['progress doc ownership mismatch', 'circles/old/challenges/c/progress/other-user', progressData()],
+  ['progress field ownership mismatch', `circles/old/challenges/c/progress/${UID}`, progressData(1, 'other-user')],
+  ['malformed progress path', `users/elsewhere/progress/${UID}`, progressData()],
+  ['malformed event path', 'users/elsewhere/processed_events/focus-old', focusEvent('focus-old')],
+  ['malformed ranking path', `users/elsewhere/ranking/${UID}`, rankingData()],
+  ['ranking ownership mismatch', 'circles/old/ranking/other-user', rankingData()],
+  ['invalid progress schema', `circles/old/challenges/c/progress/${UID}`, {...progressData(), value: '1'}],
+  ['invalid event schema', 'circles/old/challenges/c/processed_events/focus-old', {uid: UID}],
+  ['invalid ranking schema', `circles/old/ranking/${UID}`, {...rankingData(), totalXp: -1}],
+]) {
+  test(`${name} fails closed without deleting the inconsistent document or Auth`, async () => {
+    const db = new FakeFirestore();
+    db.seed(`users/${UID}`, {});
+    db.seed(documentPath, document);
+    const auth = new FakeAuth({});
+    await assert.rejects(deleteAccount({db, auth, uid: UID}), (error) => error.code === 'ACCOUNT_STATE_CONFLICT');
+    assert.deepEqual(db.data(documentPath), document);
+    assert.deepEqual(auth.deleteCalls, []);
+    assert.ok(db.data(`users/${UID}`));
+    assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH), undefined);
+  });
+}
+
+test('retry after a partially committed global page keeps the same barrier identity', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {});
+  for (let index = 0; index < 417; index++) {
+    const id = `focus-${String(index).padStart(4, '0')}`;
+    db.seed(`circles/old/challenges/c/processed_events/${id}`, focusEvent(id));
+  }
+  db.failHistoryAt = 2;
+  const auth = new FakeAuth({});
+  await assert.rejects(deleteAccount({db, auth, uid: UID}), /history transport failure/);
+  assert.equal([...db.store.keys()].filter((key) => key.includes('/processed_events/')).length, 217);
+  assert.deepEqual(auth.deleteCalls, []);
+  assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH), undefined);
+  const id = db.data(GUARD_PATH).deletionId;
+  await deleteAccount({db, auth, uid: UID});
+  assert.equal(db.data(GUARD_PATH).deletionId, id);
+  assert.equal(db.data(GUARD_PATH).state, 'COMPLETE');
+  assert.equal([...db.store.keys()].some((key) => key.includes('/processed_events/')), false);
+});
+
+test('legacy marker v1 is not proof of global cleanup and is upgraded only after discovery', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {activeCircleId: null});
+  db.seed(ACCOUNT_DELETION_MARKER_PATH, externalCleanupMarker());
+  const old = seedHistory(db);
+  const auth = new FakeAuth({}, {deleteUserError: 'auth/internal-error'});
+  await assert.rejects(deleteAccount({db, auth, uid: UID}));
+  assert.equal(db.data(`${old}/progress/${UID}`), undefined);
+  assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH).version, 2);
+  assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH).deletionId, db.data(GUARD_PATH).deletionId);
+});
+
+test('shared admin preflight does not create an account barrier or mutate Billing', async () => {
+  const db = seedSoleAdmin(new FakeFirestore(), {circleOverrides: {memberCount: 2}});
+  db.seed(`circles/${CIRCLE_ID}/members/other`, member('member'));
+  const auth = new FakeAuth({});
+  await assert.rejects(deleteAccount({db, auth, uid: UID}), (error) => error.code === 'CIRCLE_ADMIN_ACTION_REQUIRED');
+  assert.equal(db.data(GUARD_PATH), undefined);
+  assert.equal(db.operationLog.length, 0);
+  assert.deepEqual(auth.deleteCalls, []);
+});
+
+test('historical membership without activeCircleId is removed without touching the administrator', async () => {
+  const db = seedNormalCircle(new FakeFirestore(), {userData: {activeCircleId: null}});
+  await deleteAccount({db, auth: new FakeAuth({}), uid: UID});
+  assert.equal(db.data(`circles/${CIRCLE_ID}/members/${UID}`), undefined);
+  assert.equal(db.data(`circles/${CIRCLE_ID}`).memberCount, 1);
+  assert.ok(db.data(`circles/${CIRCLE_ID}/members/${ADMIN_UID}`));
+});
+
+test('historical sole-admin Circle without activeCircleId is safely removed', async () => {
+  const db = seedSoleAdmin(new FakeFirestore(), {userData: {activeCircleId: null}});
+  const result = await deleteAccount({db, auth: new FakeAuth({}), uid: UID});
+  assert.equal(result.body.circleDeleted, true);
+  assert.equal(db.data(`circles/${CIRCLE_ID}`), undefined);
+  assert.equal(db.data(`circle_deletions/${CIRCLE_ID}`), undefined);
+  assert.equal(db.data(`circle_cleanup_guards/${CIRCLE_ID}`).state, 'SERVER_DELETING');
+});
+
+test('current and legacy challenge attribution is anonymized without deleting shared content', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {});
+  for (const version of [undefined, 2]) {
+    const key = `circles/shared/challenges/author-${String(version)}`;
+    const original = {createdBy: UID, title: 'Shared challenge', targetValue: 100};
+    if (version) original.schemaVersion = version;
+    db.seed(key, original);
+    db.seed(`${key}/progress/other-user`, {value: 4});
+    await deleteAccount({db, auth: new FakeAuth({}), uid: UID});
+    assert.deepEqual(db.data(key), {...original, createdBy: ''});
+    assert.deepEqual(db.data(`${key}/progress/other-user`), {value: 4});
+    db.seed(`users/${UID}`, {});
+  }
+});
+
+test('pending Circle deletion marker UID references are finalized behind a non-UID closure guard', async () => {
+  const db = seedNormalCircle(new FakeFirestore(), {userData: {activeCircleId: null},
+    circleOverrides: {deletionState: 'SERVER_DELETING'}});
+  db.seed(`users/${ADMIN_UID}`, {activeCircleId: CIRCLE_ID});
+  db.seed(`circle_deletions/${CIRCLE_ID}`, {version: 1, state: 'SERVER_DELETING',
+    circleId: CIRCLE_ID, initiatedBy: ADMIN_UID, memberUids: [ADMIN_UID, UID], createdAt: timestamp(100)});
+  await deleteAccount({db, auth: new FakeAuth({}), uid: UID});
+  assert.equal(db.data(`circle_deletions/${CIRCLE_ID}`), undefined);
+  assert.equal(db.data(`circles/${CIRCLE_ID}`), undefined);
+  assert.deepEqual(db.data(`users/${ADMIN_UID}`), {activeCircleId: null});
+  const closure = `circle_cleanup_guards/${CIRCLE_ID}`;
+  assert.equal(db.data(closure).state, 'SERVER_DELETING');
+  assert.equal(JSON.stringify(db.data(closure)).includes(UID), false);
+  assert.ok(db.operationLog.findIndex((entry) => entry.path === closure) <
+    db.operationLog.findIndex((entry) => entry.type === 'recursiveDelete' && entry.path === `circles/${CIRCLE_ID}`));
+});
+
+test('v2 proof cannot be reused with a different barrier identity', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {});
+  const auth = new FakeAuth({}, {deleteUserError: 'auth/internal-error'});
+  await assert.rejects(deleteAccount({db, auth, uid: UID}));
+  const marker = db.data(ACCOUNT_DELETION_MARKER_PATH);
+  db.seed(ACCOUNT_DELETION_MARKER_PATH, {...marker, deletionId: '11111111-1111-4111-8111-111111111111'});
+  await assert.rejects(deleteAccount({db, auth, uid: UID}), (error) => error.code === 'ACCOUNT_STATE_CONFLICT');
+  assert.deepEqual(auth.deleteCalls, [UID]);
+});
+
+test('barrier identity changed during global cleanup cannot publish completion or delete Auth', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {});
+  const old = seedHistory(db);
+  const originalRunTransaction = db.runTransaction.bind(db);
+  let replaced = false;
+  db.runTransaction = async (callback) => {
+    if (!replaced && db.data(GUARD_PATH) && db.data(`${old}/progress/${UID}`) === undefined) {
+      db.seed(GUARD_PATH, {...db.data(GUARD_PATH),
+        deletionId: '22222222-2222-4222-8222-222222222222'});
+      replaced = true;
+    }
+    return originalRunTransaction(callback);
+  };
+  const auth = new FakeAuth({});
+  await assert.rejects(deleteAccount({db, auth, uid: UID}), error => error.code === 'ACCOUNT_STATE_CONFLICT');
+  assert.equal(replaced, true);
+  assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH), undefined);
+  assert.deepEqual(auth.deleteCalls, []);
+  assert.ok(db.data(`users/${UID}`));
+});
+
+test('final UID verification rejects history injected after repeat-until-empty', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {});
+  const originalQuery = db.querySnapshot.bind(db);
+  let injected = false;
+  const latePath = 'circles/late/challenges/late/processed_events/focus-late';
+  db.querySnapshot = ref => {
+    const result = originalQuery(ref);
+    const collection = ref.collectionRef;
+    if (!injected && collection?.group === 'processed_events' && ref.limitValue === 1) {
+      db.seed(latePath, focusEvent('focus-late'));
+      injected = true;
+      return originalQuery(ref);
+    }
+    return result;
+  };
+  const auth = new FakeAuth({});
+  await assert.rejects(deleteAccount({db, auth, uid: UID}), error => error.code === 'ACCOUNT_STATE_CONFLICT');
+  assert.equal(injected, true);
+  assert.ok(db.data(latePath));
+  assert.ok(db.data(`users/${UID}`));
+  assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH), undefined);
+  assert.deepEqual(auth.deleteCalls, []);
+  await deleteAccount({db, auth, uid: UID});
+  assert.equal(db.data(latePath), undefined);
+});
+
+test('pending Circle marker belonging to a different live root cannot authorize recursive deletion', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {});
+  const root = {schemaVersion: 2, adminId: 'another-admin', memberLimit: 3, memberCount: 1};
+  db.seed('circles/old', root);
+  db.seed('circle_deletions/old', {version: 1, state: 'SERVER_DELETING',
+    circleId: 'old', initiatedBy: UID, memberUids: [UID], createdAt: timestamp(100)});
+  const auth = new FakeAuth({});
+  await assert.rejects(deleteAccount({db, auth, uid: UID}), error => error.code === 'ACCOUNT_STATE_CONFLICT');
+  assert.deepEqual(db.data('circles/old'), root);
+  assert.deepEqual(db.recursiveDeletes, []);
+  assert.deepEqual(auth.deleteCalls, []);
+});
+
+test('backfilled legacy progress with optional timestamps is cleaned without changing writers', async () => {
+  const db = new FakeFirestore();
+  db.seed(`users/${UID}`, {});
+  const key = `circles/old/challenges/legacy/progress/${UID}`;
+  db.seed(key, {uid: UID, value: 7});
+  await deleteAccount({db, auth: new FakeAuth({}), uid: UID});
+  assert.equal(db.data(key), undefined);
+});
+
+test('historical sole-admin partial recursive deletion retains context until retry converges', async () => {
+  const db = seedSoleAdmin(new FakeFirestore(), {userData: {activeCircleId: null}});
+  const recursiveDelete = db.recursiveDelete.bind(db);
+  let failed = false;
+  db.recursiveDelete = async ref => {
+    if (ref.path === `circles/${CIRCLE_ID}` && !failed) {
+      db.store.delete(ref.path);
+      failed = true;
+      throw new Error('partial recursive failure');
+    }
+    return recursiveDelete(ref);
+  };
+  const auth = new FakeAuth({});
+  await assert.rejects(deleteAccount({db, auth, uid: UID}), /partial recursive failure/);
+  assert.equal(db.data(`circle_deletions/${CIRCLE_ID}`).initiatedBy, UID);
+  assert.deepEqual(auth.deleteCalls, []);
+  const result = await deleteAccount({db, auth, uid: UID});
+  assert.equal(result.body.circleDeleted, true);
+  assert.equal(db.data(`circle_deletions/${CIRCLE_ID}`), undefined);
+  assert.equal(db.data(`circles/${CIRCLE_ID}/members/${UID}`), undefined);
+  assert.deepEqual(auth.deleteCalls, [UID]);
 });

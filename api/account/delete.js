@@ -1,4 +1,5 @@
 import { Timestamp } from 'firebase-admin/firestore';
+import circleCleanup from './_circle_cleanup.cjs';
 import {
   establishBillingDeletionBarrier,
   finishBillingDeletion,
@@ -9,10 +10,7 @@ import {
   createAccountHandler,
   hasExactKeys,
   isPlainObject,
-  MAX_CIRCLE_CHALLENGES_TO_SCAN,
-  MAX_PROCESSED_EVENTS_PER_CHALLENGE,
   normalizeSafeDocumentId,
-  PROCESSED_EVENT_DELETE_PAGE_SIZE,
 } from './_shared.js';
 
 const CIRCLE_SCHEMA_VERSION = 2;
@@ -20,7 +18,7 @@ const MAX_CIRCLE_MEMBERS = 30;
 const DELETION_STATE_FIELD = '_serverAccountDeletion';
 const DELETION_STATE_VERSION = 1;
 const SOLE_ADMIN_MODE = 'SOLE_ADMIN_CIRCLE';
-const EXTERNAL_CLEANUP_MARKER_VERSION = 1;
+const EXTERNAL_CLEANUP_MARKER_VERSION = 2;
 const EXTERNAL_CLEANUP_COMPLETE = 'EXTERNAL_CLEANUP_COMPLETE';
 const ACCOUNT_DELETION_MARKER_ID = 'account_deletion';
 
@@ -100,15 +98,14 @@ function validateDeletionState(userData) {
 }
 
 function validateExternalCleanupMarker(marker) {
+  const keys = ['version', 'state', 'circleDeleted', 'activeCircleId', 'completedAt'];
+  if (marker?.version === 2) keys.push('scope', 'deletionId');
   if (
-    !hasExactKeys(marker, [
-      'version',
-      'state',
-      'circleDeleted',
-      'activeCircleId',
-      'completedAt',
-    ]) ||
-    marker.version !== EXTERNAL_CLEANUP_MARKER_VERSION ||
+    !hasExactKeys(marker, keys) ||
+    ![1, EXTERNAL_CLEANUP_MARKER_VERSION].includes(marker.version) ||
+    (marker.version === 2 && (marker.scope !== 'GLOBAL_CIRCLE_UID' ||
+      typeof marker.deletionId !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(marker.deletionId))) ||
     marker.state !== EXTERNAL_CLEANUP_COMPLETE ||
     typeof marker.circleDeleted !== 'boolean' ||
     !(
@@ -121,6 +118,8 @@ function validateExternalCleanupMarker(marker) {
   }
 
   return {
+    version: marker.version,
+    deletionId: marker.deletionId,
     circleDeleted: marker.circleDeleted,
     activeCircleId: marker.activeCircleId,
   };
@@ -188,13 +187,13 @@ function decideCurrentMemberState({ circle, membersSnapshot, memberSnapshot, uid
   throw stateConflict();
 }
 
-async function resolveCircleMembership({ db, uid, circleId, commit }) {
+async function resolveCircleMembership({ db, uid, circleId, commit, transaction: existingTransaction }) {
   const userRef = db.collection('users').doc(uid);
   const circleRef = db.collection('circles').doc(circleId);
   const membersRef = circleRef.collection('members');
   const memberRef = membersRef.doc(uid);
 
-  return db.runTransaction(async (transaction) => {
+  const resolve = async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
     if (!userSnapshot.exists) throw stateConflict();
 
@@ -220,6 +219,16 @@ async function resolveCircleMembership({ db, uid, circleId, commit }) {
     if (!commit) return { circleRef, kind: memberState.kind };
 
     if (memberState.kind === 'ADMIN_SOLE_MEMBER') {
+      const closureRef = db.collection('circle_cleanup_guards').doc(circleId);
+      const closure = await transaction.get(closureRef);
+      if (closure.exists) {
+        const data = closure.data();
+        if (!hasExactKeys(data, ['version', 'state', 'createdAt']) ||
+            data.version !== 1 || data.state !== 'SERVER_DELETING' ||
+            !isTimestamp(data.createdAt)) throw stateConflict();
+      } else {
+        transaction.set(closureRef, {version: 1, state: 'SERVER_DELETING', createdAt: Timestamp.now()});
+      }
       transaction.update(userRef, {
         [DELETION_STATE_FIELD]: {
           version: DELETION_STATE_VERSION,
@@ -248,65 +257,27 @@ async function resolveCircleMembership({ db, uid, circleId, commit }) {
     }
 
     return { circleRef, kind: memberState.kind };
-  });
-}
-
-async function listChallengeRefs(circleRef) {
-  // Deliberately scoped to root documents in the active Circle. A global
-  // collectionGroup sweep could cross unrelated Circles and require broader
-  // index/ownership guarantees. Orphan subcollections below a missing
-  // challenge root are therefore not discoverable by this bounded query.
-  const snapshot = await circleRef
-    .collection('challenges')
-    .limit(MAX_CIRCLE_CHALLENGES_TO_SCAN + 1)
-    .get();
-  if (countDocs(snapshot) > MAX_CIRCLE_CHALLENGES_TO_SCAN) {
-    throw stateConflict('O Circle excede o limite seguro de processamento.');
-  }
-  return snapshot.docs.map((challengeSnapshot) => challengeSnapshot.ref);
-}
-
-async function commitDeletes(db, refs) {
-  if (refs.length === 0) return;
-  const batch = db.batch();
-  for (const ref of refs) batch.delete(ref);
-  await batch.commit();
-}
-
-async function cleanupChallengeData({ db, uid, challengeRef }) {
-  await commitDeletes(db, [challengeRef.collection('progress').doc(uid)]);
-
-  const processedEvents = challengeRef.collection('processed_events');
-  let deletedEvents = 0;
-  while (true) {
-    const snapshot = await processedEvents
-      .where('uid', '==', uid)
-      .limit(PROCESSED_EVENT_DELETE_PAGE_SIZE)
-      .get();
-    if (countDocs(snapshot) === 0) return;
-
-    if (deletedEvents + countDocs(snapshot) > MAX_PROCESSED_EVENTS_PER_CHALLENGE) {
-      throw stateConflict('O volume de processed_events excede o limite seguro.');
-    }
-
-    await commitDeletes(
-      db,
-      snapshot.docs.map((eventSnapshot) => eventSnapshot.ref),
-    );
-    deletedEvents += countDocs(snapshot);
-  }
-}
-
-async function cleanupMemberCircleData({ db, uid, challengeRefs }) {
-  for (const challengeRef of challengeRefs) {
-    await cleanupChallengeData({ db, uid, challengeRef });
-  }
+  };
+  return existingTransaction ? resolve(existingTransaction) : db.runTransaction(resolve);
 }
 
 async function finishSoleAdminRetry({ db, circleId }) {
   const circleRef = db.collection('circles').doc(circleId);
-  const circleSnapshot = await circleRef.get();
-  if (circleSnapshot.exists) throw stateConflict();
+  const closureRef = db.collection('circle_cleanup_guards').doc(circleId);
+  await db.runTransaction(async (transaction) => {
+    const root = await transaction.get(circleRef);
+    const closure = await transaction.get(closureRef);
+    if (root.exists) throw stateConflict();
+    if (closure.exists) {
+      const data = closure.data();
+      if (!hasExactKeys(data, ['version', 'state', 'createdAt']) ||
+          data.version !== 1 || data.state !== 'SERVER_DELETING' ||
+          !isTimestamp(data.createdAt)) throw stateConflict();
+    } else {
+      // Legacy retries also need a durable reservation before recursiveDelete.
+      transaction.set(closureRef, {version: 1, state: 'SERVER_DELETING', createdAt: Timestamp.now()});
+    }
+  });
   await db.recursiveDelete(circleRef);
   return { circleDeleted: true, activeCircleId: circleId };
 }
@@ -334,18 +305,6 @@ async function cleanupExternalAccountData({ db, uid }) {
     return { circleDeleted: false, activeCircleId: null };
   }
 
-  const preflight = await resolveCircleMembership({
-    db,
-    uid,
-    circleId,
-    commit: false,
-  });
-
-  let challengeRefs = [];
-  if (preflight.kind !== 'ADMIN_SOLE_MEMBER') {
-    challengeRefs = await listChallengeRefs(preflight.circleRef);
-  }
-
   const committed = await resolveCircleMembership({
     db,
     uid,
@@ -357,7 +316,6 @@ async function cleanupExternalAccountData({ db, uid }) {
     return finishSoleAdminRetry({ db, circleId });
   }
 
-  await cleanupMemberCircleData({ db, uid, challengeRefs });
   return { circleDeleted: false, activeCircleId: circleId };
 }
 
@@ -383,68 +341,89 @@ async function markerStillProvesExternalCleanup({ db, uid, userRef, marker }) {
   return !memberSnapshot.exists;
 }
 
-async function ensureExternalCleanupMarker({ db, uid, userRef }) {
+async function ensureExternalCleanupMarker({ db, uid, userRef, guard }) {
   const markerRef = accountDeletionMarkerRef(userRef);
   const markerSnapshot = await markerRef.get();
+  let cleanup;
   if (markerSnapshot.exists) {
     const marker = validateExternalCleanupMarker(markerSnapshot.data());
+    if (marker.version === 2 && marker.deletionId !== guard.deletionId) throw stateConflict();
     if (await markerStillProvesExternalCleanup({ db, uid, userRef, marker })) {
-      return marker;
+      cleanup = marker;
     }
   }
 
-  const cleanup = await cleanupExternalAccountData({ db, uid });
-  // runtime/* is denied to clients by the current Firestore Rules. Only the
-  // Admin SDK writes this evidence, and recursiveDelete removes it at the end.
-  await markerRef.set({
-    version: EXTERNAL_CLEANUP_MARKER_VERSION,
-    state: EXTERNAL_CLEANUP_COMPLETE,
-    circleDeleted: cleanup.circleDeleted,
-    activeCircleId: cleanup.activeCircleId,
-    completedAt: Timestamp.now(),
+  const pendingCircleDeleted = await circleCleanup.cleanupPendingMarkers(db, uid, guard);
+  if (!cleanup) cleanup = await cleanupExternalAccountData({ db, uid });
+  const ownedDeleted = await circleCleanup.cleanupOwned(db, uid, guard, false);
+  cleanup.circleDeleted ||= pendingCircleDeleted || ownedDeleted;
+  await circleCleanup.cleanupMemberships(db, uid, guard);
+  await circleCleanup.cleanupHistory(db, uid, guard);
+  await circleCleanup.verifyReferences(db, uid);
+  await db.runTransaction(async (transaction) => {
+    await circleCleanup.requireGuard(transaction, db, uid, guard);
+    await circleCleanup.assertEmpty(transaction, db, uid);
+    const user = await transaction.get(userRef);
+    const activeCircleId = validateActiveCircleId(user.data());
+    if (activeCircleId !== null && activeCircleId !== cleanup.activeCircleId) throw stateConflict();
+    if (activeCircleId !== null) {
+      const circleRef = db.collection('circles').doc(activeCircleId);
+      const root = await transaction.get(circleRef);
+      const member = await transaction.get(circleRef.collection('members').doc(uid));
+      if (member.exists || (cleanup.circleDeleted && root.exists)) throw stateConflict();
+    }
+    transaction.set(markerRef, {
+      version: EXTERNAL_CLEANUP_MARKER_VERSION,
+      state: EXTERNAL_CLEANUP_COMPLETE,
+      scope: 'GLOBAL_CIRCLE_UID',
+      deletionId: guard.deletionId,
+      circleDeleted: cleanup.circleDeleted,
+      activeCircleId,
+      completedAt: Timestamp.now(),
+    });
   });
   return cleanup;
 }
 
 export async function deleteAccount({ db, auth, uid }) {
   const userRef = db.collection('users').doc(uid);
-  // Keep Circle prechecks ahead of destructive billing-index cleanup.
-  const userSnapshot = await userRef.get();
-  const marker = await accountDeletionMarkerRef(userRef).get();
-  if (!userSnapshot.exists && !marker.exists) throw stateConflict();
-  const cleanupMarker = marker.exists ? validateExternalCleanupMarker(marker.data()) : null;
-  const userData = userSnapshot.data() ?? {};
-  const deletionState = validateDeletionState(userData);
-  const circleId = validateActiveCircleId(userData);
-  const markerProvesCleanup = cleanupMarker !== null &&
-    await markerStillProvesExternalCleanup({ db, uid, userRef, marker: cleanupMarker });
-  if (!markerProvesCleanup) {
-    if (deletionState !== null) {
-      if (circleId !== null && circleId !== deletionState.circleId) throw stateConflict();
-      if ((await db.collection('circles').doc(deletionState.circleId).get()).exists) throw stateConflict();
-    } else if (circleId !== null) {
-      const preflight = await resolveCircleMembership({ db, uid, circleId, commit: false });
-      if (preflight.kind !== 'ADMIN_SOLE_MEMBER') await listChallengeRefs(preflight.circleRef);
-    }
-  }
-  await establishBillingDeletionBarrier({ db, uid });
-  const cleanup = await ensureExternalCleanupMarker({ db, uid, userRef });
-
   try {
-    await auth.deleteUser(uid);
+    const guard = await circleCleanup.beginGuard(db, uid, async (transaction) => {
+      const user = await transaction.get(userRef);
+      const marker = await transaction.get(accountDeletionMarkerRef(userRef));
+      if (!user.exists && !marker.exists) throw stateConflict();
+      if (marker.exists && validateExternalCleanupMarker(marker.data()).version === 2) throw stateConflict();
+      const data = user.data() ?? {};
+      const deletionState = validateDeletionState(data);
+      const circleId = validateActiveCircleId(data);
+      await circleCleanup.preflightOwned(transaction, db, uid);
+      if (deletionState !== null) {
+        if (circleId !== null && circleId !== deletionState.circleId) throw stateConflict();
+        if ((await transaction.get(db.collection('circles').doc(deletionState.circleId))).exists) throw stateConflict();
+      } else if (circleId !== null) {
+        await resolveCircleMembership({ db, uid, circleId, commit: false, transaction });
+      }
+    });
+    await establishBillingDeletionBarrier({ db, uid });
+    const cleanup = await ensureExternalCleanupMarker({ db, uid, userRef, guard });
+    try {
+      await auth.deleteUser(uid);
+    } catch (error) {
+      if (error?.code !== 'auth/user-not-found') throw error;
+    }
+    await db.recursiveDelete(userRef);
+    await finishBillingDeletion({ db, uid });
+    await circleCleanup.completeGuard(db, uid, guard);
+    return { body: { deleted: true, circleDeleted: cleanup.circleDeleted } };
   } catch (error) {
-    if (error?.code !== 'auth/user-not-found') throw error;
+    if (!(error instanceof AccountHttpError) && error?.code === 'ACCOUNT_STATE_CONFLICT') {
+      throw stateConflict();
+    }
+    if (!(error instanceof AccountHttpError) && error?.code === 'CIRCLE_ADMIN_ACTION_REQUIRED') {
+      throw adminActionRequired();
+    }
+    throw error;
   }
-
-  await db.recursiveDelete(userRef);
-  await finishBillingDeletion({ db, uid });
-
-  return {
-    body: {
-      deleted: true,
-      circleDeleted: cleanup.circleDeleted,
-    },
-  };
 }
 
 export default createAccountHandler(
