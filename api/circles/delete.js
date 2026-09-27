@@ -10,7 +10,7 @@ import {
 export const CIRCLE_DELETION_COLLECTION = 'circle_deletions';
 export const CIRCLE_DELETION_STATE = 'SERVER_DELETING';
 export const CIRCLE_DELETION_MARKER_VERSION = 1;
-export const MAX_CIRCLE_MEMBERS = 10;
+export const MAX_CIRCLE_MEMBERS = 30;
 
 function stateConflict(message = 'O estado do Circle esta inconsistente.') {
   return new CircleHttpError(409, 'CIRCLE_STATE_CONFLICT', message);
@@ -74,7 +74,7 @@ function validateCircle(circle, uid, memberCount) {
     !Number.isInteger(circle.memberCount) ||
     circle.memberCount < 1 ||
     circle.memberCount > MAX_CIRCLE_MEMBERS ||
-    (circle.memberLimit !== 3 && circle.memberLimit !== 10) ||
+    (circle.memberLimit !== 3 && circle.memberLimit !== 10 && circle.memberLimit !== 30) ||
     circle.memberCount > circle.memberLimit ||
     circle.memberCount !== memberCount
   ) {

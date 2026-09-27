@@ -207,6 +207,19 @@ function markerPath() {
   return `${CIRCLE_DELETION_COLLECTION}/${CIRCLE_ID}`;
 }
 
+function seedPremiumCircle(db, memberCount) {
+  seedCircle(db);
+  db.seed(`circles/${CIRCLE_ID}`, circle({ memberLimit: 30, memberCount }));
+  const memberUids = [ADMIN_UID];
+  for (let index = 1; index < memberCount; index += 1) {
+    const uid = `premium-member-${index}`;
+    db.seed(`circles/${CIRCLE_ID}/members/${uid}`, { role: 'member' });
+    db.seed(`users/${uid}`, { activeCircleId: CIRCLE_ID });
+    memberUids.push(uid);
+  }
+  return memberUids;
+}
+
 async function execute(db, uid = ADMIN_UID) {
   return deleteCircle({
     body: { circleId: CIRCLE_ID },
@@ -301,6 +314,113 @@ test('admin deletes Circle with multiple members', async () => {
   assert.equal(db.data(`circles/${CIRCLE_ID}`), undefined);
   assert.equal(db.data(`users/${ADMIN_UID}`).activeCircleId, null);
   assert.equal(db.data(`users/${MEMBER_UID}`).activeCircleId, null);
+});
+
+for (const memberCount of [1, 11, 30]) {
+  test(`admin deletes Premium limit 30 Circle with ${memberCount} members`, async () => {
+    const db = new FakeFirestore();
+    const memberUids = seedPremiumCircle(db, memberCount);
+
+    const result = await execute(db);
+
+    assert.deepEqual(result.body, { deleted: true });
+    assert.equal(db.data(`circles/${CIRCLE_ID}`), undefined);
+    assert.equal(db.data(markerPath()), undefined);
+    assert.deepEqual(db.recursiveDeletes, [`circles/${CIRCLE_ID}`]);
+    for (const uid of memberUids) {
+      assert.equal(db.data(`circles/${CIRCLE_ID}/members/${uid}`), undefined);
+      assert.equal(db.data(`users/${uid}`).activeCircleId, null);
+    }
+  });
+}
+
+test('legacy Premium memberLimit 10 remains deletable', async () => {
+  const db = seedCircle(new FakeFirestore());
+  db.seed(`circles/${CIRCLE_ID}`, circle({ memberLimit: 10 }));
+
+  assert.deepEqual((await execute(db)).body, { deleted: true });
+  assert.equal(db.data(`circles/${CIRCLE_ID}`), undefined);
+  assert.equal(db.data(`users/${ADMIN_UID}`).activeCircleId, null);
+});
+
+for (const memberLimit of [4, 29, 31]) {
+  test(`invalid memberLimit ${memberLimit} fails closed without writes`, async () => {
+    const db = seedCircle(new FakeFirestore());
+    db.seed(`circles/${CIRCLE_ID}`, circle({ memberLimit }));
+    const before = new Map(db.store);
+
+    await assert.rejects(execute(db), (error) => {
+      assert.equal(error.statusCode, 409);
+      assert.equal(error.code, 'CIRCLE_STATE_CONFLICT');
+      return true;
+    });
+
+    assert.deepEqual(db.store, before);
+    assert.deepEqual(db.recursiveDeletes, []);
+    assert.equal(db.data(markerPath()), undefined);
+  });
+}
+
+test('31 memberships exceed structural maximum even with declared count 30', async () => {
+  const db = new FakeFirestore();
+  seedPremiumCircle(db, 31);
+  db.seed(`circles/${CIRCLE_ID}`, circle({ memberLimit: 30, memberCount: 30 }));
+  const before = new Map(db.store);
+
+  await assert.rejects(execute(db), (error) => {
+    assert.equal(error.statusCode, 409);
+    assert.equal(error.code, 'CIRCLE_STATE_CONFLICT');
+    return true;
+  });
+
+  assert.deepEqual(db.store, before);
+  assert.deepEqual(db.recursiveDeletes, []);
+  assert.equal(db.data(markerPath()), undefined);
+});
+
+test('Premium Circle retry accepts deletion marker with 30 members', async () => {
+  const db = new FakeFirestore();
+  const memberUids = seedPremiumCircle(db, 30);
+  db.failRecursiveDeleteOnce = true;
+
+  await assert.rejects(execute(db), /recursive delete failed/);
+  assert.equal(db.data(`circles/${CIRCLE_ID}`).deletionState, CIRCLE_DELETION_STATE);
+  assert.deepEqual(db.data(markerPath()).memberUids, [...memberUids].sort());
+  for (const uid of memberUids) {
+    assert.equal(db.data(`users/${uid}`).activeCircleId, null);
+  }
+
+  assert.deepEqual((await execute(db)).body, { deleted: true });
+  assert.equal(db.data(`circles/${CIRCLE_ID}`), undefined);
+  assert.equal(db.data(markerPath()), undefined);
+  assert.deepEqual(db.recursiveDeletes, [`circles/${CIRCLE_ID}`, `circles/${CIRCLE_ID}`]);
+});
+
+test('deletion marker with 31 member UIDs fails closed without writes', async () => {
+  const db = new FakeFirestore();
+  const memberUids = seedPremiumCircle(db, 31);
+  db.seed(`circles/${CIRCLE_ID}`, {
+    ...db.data(`circles/${CIRCLE_ID}`),
+    deletionState: CIRCLE_DELETION_STATE,
+  });
+  db.seed(markerPath(), {
+    version: 1,
+    state: CIRCLE_DELETION_STATE,
+    circleId: CIRCLE_ID,
+    initiatedBy: ADMIN_UID,
+    memberUids,
+    createdAt: NOW,
+  });
+  const before = new Map(db.store);
+
+  await assert.rejects(execute(db), (error) => {
+    assert.equal(error.statusCode, 409);
+    assert.equal(error.code, 'CIRCLE_STATE_CONFLICT');
+    return true;
+  });
+
+  assert.deepEqual(db.store, before);
+  assert.deepEqual(db.recursiveDeletes, []);
 });
 
 test('activeCircleId is cleared for every matching member', async () => {
