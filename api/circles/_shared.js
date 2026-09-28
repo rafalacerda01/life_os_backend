@@ -88,7 +88,9 @@ function applyCors(req, res) {
   );
 }
 
-function assertJsonRequest(req) {
+function assertJsonRequest(req, operation = 'delete') {
+  const invalidCode = operation === 'leave' ? 'INVALID_CIRCLE_LEAVE_PAYLOAD' : 'INVALID_CIRCLE_DELETE_PAYLOAD';
+  const limitMessage = operation === 'leave' ? 'Payload de saida excede o limite permitido.' : 'Payload de exclusao excede o limite permitido.';
   const contentType = req.headers?.['content-type'];
   if (
     typeof contentType !== 'string' ||
@@ -110,15 +112,15 @@ function assertJsonRequest(req) {
     ) {
       throw new CircleHttpError(
         400,
-        'INVALID_CIRCLE_DELETE_PAYLOAD',
+        invalidCode,
         'Content-Length invalido.',
       );
     }
     if (Number(rawLength) > MAX_CIRCLE_DELETE_BODY_BYTES) {
       throw new CircleHttpError(
         413,
-        'INVALID_CIRCLE_DELETE_PAYLOAD',
-        'Payload de exclusao excede o limite permitido.',
+        invalidCode,
+        limitMessage,
       );
     }
   }
@@ -135,8 +137,8 @@ function assertJsonRequest(req) {
   ) {
     throw new CircleHttpError(
       413,
-      'INVALID_CIRCLE_DELETE_PAYLOAD',
-      'Payload de exclusao excede o limite permitido.',
+      invalidCode,
+      limitMessage,
     );
   }
 }
@@ -175,23 +177,23 @@ function getFirebaseServices() {
   return { auth: getAuth(), appCheck: getAppCheck(), db };
 }
 
-function sendError(res, error) {
+function sendError(res, error, operation = 'delete') {
   if (error instanceof CircleHttpError) {
     return res.status(error.statusCode).json({
       error: error.message,
       code: error.code,
     });
   }
-  console.error('[circles] Falha sanitizada na exclusao server-side.');
+  console.error(operation === 'leave' ? '[circles] Falha sanitizada na saida server-side.' : '[circles] Falha sanitizada na exclusao server-side.');
   return res.status(500).json({
-    error: 'Nao foi possivel excluir o Circle.',
-    code: 'CIRCLE_DELETE_FAILED',
+    error: operation === 'leave' ? 'Nao foi possivel sair do Circle.' : 'Nao foi possivel excluir o Circle.',
+    code: operation === 'leave' ? 'CIRCLE_LEAVE_FAILED' : 'CIRCLE_DELETE_FAILED',
   });
 }
 
 export function createCircleDeleteHandler(
   execute,
-  { getServices = getFirebaseServices, nowProvider = () => Date.now() } = {},
+  { getServices = getFirebaseServices, nowProvider = () => Date.now(), operation = 'delete' } = {},
 ) {
   return async function circleDeleteHandler(req, res, runtime = {}) {
     applyCors(req, res);
@@ -204,8 +206,8 @@ export function createCircleDeleteHandler(
     }
 
     try {
-      assertJsonRequest(req);
-      const body = validateCircleDeletePayload(req.body);
+      assertJsonRequest(req, operation);
+      const body = operation === 'leave' ? validateCircleLeavePayload(req.body) : validateCircleDeletePayload(req.body);
       const rawAppCheckToken = req.headers?.['x-firebase-appcheck'];
       if (
         typeof rawAppCheckToken !== 'string' ||
@@ -258,7 +260,7 @@ export function createCircleDeleteHandler(
       try {
         rateLimitAllowed = await checkRateLimit({
           db: services.db,
-          scope: 'circle_delete',
+          scope: operation === 'leave' ? 'circle_leave' : 'circle_delete',
           uid,
           limit: MAX_REQUESTS_PER_WINDOW,
           windowMs: RATE_LIMIT_WINDOW_MS,
@@ -288,7 +290,18 @@ export function createCircleDeleteHandler(
       });
       return res.status(result.statusCode ?? 200).json(result.body);
     } catch (error) {
-      return sendError(res, error);
+      return sendError(res, error, operation);
     }
   };
+}
+
+export function validateCircleLeavePayload(body) {
+  if (!hasExactKeys(body, ['circleId']) || normalizeCircleId(body.circleId) === null) {
+    throw new CircleHttpError(400, 'INVALID_CIRCLE_LEAVE_PAYLOAD', 'Payload de saida do Circle invalido.');
+  }
+  return { circleId: body.circleId };
+}
+
+export function createCircleLeaveHandler(execute, dependencies = {}) {
+  return createCircleDeleteHandler(execute, { ...dependencies, operation: 'leave' });
 }
