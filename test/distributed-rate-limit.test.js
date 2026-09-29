@@ -11,6 +11,7 @@ const GATEWAY_SCOPES = [
   'focus_finish',
   'focus_cancel',
   'circle_delete',
+  'circle_leave',
 ];
 
 class FakeFirestore {
@@ -139,7 +140,7 @@ test('scopes desconhecidos continuam rejeitados antes de acessar Firestore', asy
   for (const scope of [
     'account', 'account_update', 'unknown', 'account_delete/unsafe',
     'activity', 'taskComplete', 'activity_unknown', 'focus', 'focus_unknown',
-    'circle', 'circles_delete', 'circle_delete/unsafe',
+    'circle', 'circles_delete', 'circle_delete/unsafe', 'circle_leave/unsafe',
   ]) {
     const db = new FakeFirestore();
     await assert.rejects(check(db, { scope }), {
@@ -161,6 +162,28 @@ for (const scope of ['chat', 'sync', 'account_delete', ...GATEWAY_SCOPES]) {
     assert.equal(JSON.stringify([...db.documents]).includes(uid), false);
   });
 }
+
+test('circle_leave and circle_delete have independent hashed counters', async () => {
+  const db = new FakeFirestore();
+  const uid = 'private-circle-user';
+  const hash = createHash('sha256').update(uid, 'utf8').digest('hex');
+  const leave = { scope: 'circle_leave', uid, limit: 1 };
+  const deletion = { scope: 'circle_delete', uid, limit: 1 };
+
+  assert.equal(await check(db, leave), true);
+  assert.equal(await check(db, leave), false);
+  assert.equal(await check(db, deletion), true);
+  assert.equal(await check(db, deletion), false);
+  assert.deepEqual([...db.documents.keys()], [
+    `circle_leave_${hash}`,
+    `circle_delete_${hash}`,
+  ]);
+  assert.deepEqual([...db.documents.values()], [
+    { windowStartMs: 1_000, count: 1 },
+    { windowStartMs: 1_000, count: 1 },
+  ]);
+  assert.equal(JSON.stringify([...db.documents]).includes(uid), false);
+});
 
 test('novos scopes esgotados nao consomem quota das demais operacoes', async () => {
   const db = new FakeFirestore();
