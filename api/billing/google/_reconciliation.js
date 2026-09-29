@@ -167,7 +167,7 @@ function storedLineage(data) {
   return { predecessor, successor };
 }
 
-async function readLineage(transaction, r, tokenHash, evidence, accountHash) {
+async function readLineage(transaction, r, tokenHash, evidence, accountHash, expectedCurrent) {
   const nodes = new Map();
   async function read(hash) {
     if (!nodes.has(hash)) {
@@ -208,6 +208,11 @@ async function readLineage(transaction, r, tokenHash, evidence, accountHash) {
     if (node.successor !== null && node.successor !== child) {
       throw reconciliationError('BILLING_LINEAGE_CONFLICT');
     }
+    if (node.predecessor !== null && seen.has(node.predecessor)) {
+      throw reconciliationError('BILLING_LINEAGE_CONFLICT');
+    }
+    // Once current is proven, older history is not needed for this reconciliation.
+    if (previous === expectedCurrent || expectedCurrent === tokenHash) break;
     child = previous;
     previous = node.predecessor;
   }
@@ -253,7 +258,7 @@ export async function commitReconciliation({
     const ownership = await ownershipHashes((ref) => transaction.get(ref), db, tokenHash, payload);
     if (ownership.accountHash !== accountHash) throw reconciliationError();
     if (ownership.predecessor && !ownership.predecessorIndexed) throw dependencyPending();
-    const lineage = await readLineage(transaction, r, tokenHash, ownership.predecessor, accountHash);
+    const lineage = await readLineage(transaction, r, tokenHash, ownership.predecessor, accountHash, expectedCurrent);
     let promote = expectedCurrent === tokenHash || expectedCurrent === null;
     let freshPrevious = null;
     if (lineage.received.successor !== null) promote = false;

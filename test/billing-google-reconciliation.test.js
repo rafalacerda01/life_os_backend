@@ -3,7 +3,7 @@ import test from 'node:test';
 import { Timestamp } from 'firebase-admin/firestore';
 
 import {
-  commitReconciliation, reconcileGooglePlayPurchase, reserveReconciliation,
+  MAX_LINEAGE_LINKS, commitReconciliation, reconcileGooglePlayPurchase, reserveReconciliation,
   resolveOwnership, sha256,
 } from '../api/billing/google/_reconciliation.js';
 import { GooglePlayRequestError } from '../api/billing/google/_google_play.js';
@@ -502,19 +502,106 @@ test('self cycle fails closed', async () => {
   await assertNoCommercialChange(f, () => f.reconcile(B));
 });
 
-test('lineage allows four links and refuses a fifth', async () => {
+test('twelve sequential replacements and current renewal preserve lineage and entitlement', async (t) => {
   const f = fixture();
+  const reads = t.mock.method(f.db, 'snapshot');
   await f.verify();
+  const tokens = [A];
   let previous = A;
-  for (let index = 1; index <= 4; index += 1) {
+  for (let index = 1; index <= 12; index += 1) {
     const token = `lineage-token-${index}`;
-    f.responses.set(token, payload({ linked: previous }));
-    await f.reconcile(token);
+    const google = payload({ linked: previous });
+    google.lineItems[0].expiryTime = `2027-01-${String(index).padStart(2, '0')}T12:00:00Z`;
+    f.responses.set(token, google);
+    reads.mock.resetCalls();
+    const result = await f.reconcile(token);
+    assert.equal(result.isPremium, true);
+    assert.equal(f.db.data(BILLING).currentTokenHash, sha256(token));
+    assert.equal(f.db.data(tokenPath(token)).predecessorTokenHash, sha256(previous));
+    assert.equal(f.db.data(tokenPath(previous)).supersededByTokenHash, sha256(token));
+    assert.equal(f.db.data(USER).isPremium, true);
+    assert.equal(f.db.data(USER).premiumTier, 'monthly');
+    assert.equal(f.db.data(USER).premiumSubscriptionState, google.subscriptionState);
+    assert.equal(f.db.data(USER).premiumExpiresAt.toMillis(), Date.parse(google.lineItems[0].expiryTime));
+    assert.deepEqual(new Set(reads.mock.calls
+      .map(call => call.arguments[0].path).filter(path => path.startsWith(`${BILLING}/tokens/`))),
+    new Set([tokenPath(token), tokenPath(previous)]));
+    tokens.push(token);
     previous = token;
   }
-  f.responses.set('fifth-link', payload({ linked: previous }));
-  await assertNoCommercialChange(f, () => f.reconcile('fifth-link'));
+
+  const current = tokens.at(-1);
+  const predecessor = tokens.at(-2);
+  f.responses.set(current, payload({ state: 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD' }));
+  reads.mock.resetCalls();
+  assert.equal((await f.reconcile(current)).isPremium, true);
+  assert.equal(f.db.data(BILLING).currentTokenHash, sha256(current));
+  assert.equal(f.db.data(USER).premiumSubscriptionState, 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD');
+  assert.equal(f.db.data(USER).premiumExpiresAt.toMillis(), Date.parse(payload().lineItems[0].expiryTime));
+  assert.deepEqual(new Set(reads.mock.calls
+    .map(call => call.arguments[0].path).filter(path => path.startsWith(`${BILLING}/tokens/`))),
+  new Set([tokenPath(current), tokenPath(predecessor)]));
+  for (let index = 1; index < tokens.length; index += 1) {
+    assert.equal(f.db.data(tokenPath(tokens[index])).predecessorTokenHash, sha256(tokens[index - 1]));
+    assert.equal(f.db.data(tokenPath(tokens[index - 1])).supersededByTokenHash, sha256(tokens[index]));
+  }
+  await assertNoCommercialChange(f, () => f.reconcile(A), { code: 'BILLING_LINEAGE_CONFLICT' });
+  assert.equal(f.db.data(BILLING).currentTokenHash, sha256(current));
 });
+
+for (const links of [MAX_LINEAGE_LINKS - 1, MAX_LINEAGE_LINKS]) {
+  test(`out-of-order search ${links + 1} links from current respects defensive limit`, async () => {
+    const f = fixture();
+    await f.verify();
+    let previous = A;
+    for (let index = 1; index <= links; index += 1) {
+      const token = `out-of-order-${index}`;
+      f.db.seed(tokenPath(token), {
+        purchaseToken: token, predecessorTokenHash: sha256(previous), predecessorKind: 'linked',
+      });
+      f.db.seed(indexPath(token), { accountHash: sha256(UID) });
+      f.db.seed(tokenPath(previous), { ...f.db.data(tokenPath(previous)), supersededByTokenHash: sha256(token) });
+      previous = token;
+    }
+    f.responses.set(B, payload({ linked: previous }));
+    if (links + 1 > MAX_LINEAGE_LINKS) {
+      await assertNoCommercialChange(f, () => f.reconcile(B), { code: 'BILLING_LINEAGE_CONFLICT' });
+      assert.equal(f.db.data(BILLING).currentTokenHash, sha256(A));
+    } else {
+      assert.equal((await f.reconcile(B)).isPremium, true);
+      assert.equal(f.db.data(BILLING).currentTokenHash, sha256(B));
+      assert.equal(f.db.data(tokenPath(B)).predecessorTokenHash, sha256(previous));
+      assert.equal(f.db.data(tokenPath(previous)).supersededByTokenHash, sha256(B));
+    }
+  });
+}
+
+for (const cycle of [A, B]) {
+  test(`current anchor ${cycle === A ? 'self cycle' : 'cycle back to received token'} fails closed`, async () => {
+    const f = fixture();
+    await f.verify();
+    f.db.seed(tokenPath(A), {
+      ...f.db.data(tokenPath(A)), predecessorTokenHash: sha256(cycle), predecessorKind: 'linked',
+    });
+    f.responses.set(B, payload({ linked: A }));
+    await assertNoCommercialChange(f, () => f.reconcile(B), { code: 'BILLING_LINEAGE_CONFLICT' });
+  });
+}
+
+for (const corruption of ['missing token', 'incompatible successor']) {
+  test(`current renewal still validates direct predecessor: ${corruption}`, async () => {
+    const f = fixture();
+    await f.verify();
+    f.responses.set(B, payload({ linked: A }));
+    await f.reconcile(B);
+    f.responses.set(B, payload());
+    if (corruption === 'missing token') f.db.store.delete(tokenPath(A));
+    else f.db.seed(tokenPath(A), { ...f.db.data(tokenPath(A)), supersededByTokenHash: sha256(C) });
+    await assertNoCommercialChange(f, () => f.reconcile(B), {
+      code: corruption === 'missing token' ? 'BILLING_DEPENDENCY_PENDING' : 'BILLING_LINEAGE_CONFLICT',
+    });
+  });
+}
 
 test('RTDN revision N cannot commit after revision N+1', async () => {
   const f = fixture();
