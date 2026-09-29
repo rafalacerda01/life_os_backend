@@ -12,6 +12,7 @@ import {
   syncTaskUpdate,
 } from './activity/_sync_updates.js';
 import { checkDistributedRateLimit } from './_distributed_rate_limit.js';
+import { hasValidGooglePlayPremium } from './billing/google/_entitlement.js';
 import {
   applyStudyActivity,
   validateStudyActivityPayload,
@@ -824,7 +825,7 @@ async function createTransactionWithQuota({
         userSnapshot.data() ?? {};
 
       const isPremium =
-        userData.isPremium === true;
+        hasValidGooglePlayPremium(userData);
 
       const transactionsCount =
         userData.transactionsCount;
@@ -1560,7 +1561,7 @@ async function createMedicationWithQuota({
       userSnapshot.data() ?? {};
 
     const isPremium =
-      userData.isPremium === true;
+      hasValidGooglePlayPremium(userData);
 
     const medicationsCount =
       userData.medicationsCount;
@@ -1763,7 +1764,7 @@ async function createSubjectWithQuota({
       userSnapshot.data() ?? {};
 
     const isPremium =
-      userData.isPremium === true;
+      hasValidGooglePlayPremium(userData);
 
     const subjectsCount =
       userData.subjectsCount;
@@ -2026,7 +2027,7 @@ async function createGoalWithQuota({
       userSnapshot.data() ?? {};
 
     const isPremium =
-      userData.isPremium === true;
+      hasValidGooglePlayPremium(userData);
 
     const goalsCount =
       userData.goalsCount;
@@ -2210,7 +2211,7 @@ async function createTaskWithQuota({
     const userData = userSnapshot.data() ?? {};
 
     const isPremium =
-      userData.isPremium === true;
+      hasValidGooglePlayPremium(userData);
 
     const tasksCount =
       userData.tasksCount;
@@ -2376,7 +2377,7 @@ async function createHabitWithQuota({
     const userData = userSnapshot.data() ?? {};
 
     const isPremium =
-      userData.isPremium === true;
+      hasValidGooglePlayPremium(userData);
 
     const habitsCount =
       userData.habitsCount;
