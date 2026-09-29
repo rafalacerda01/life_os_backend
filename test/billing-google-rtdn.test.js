@@ -289,6 +289,34 @@ for (const [state, isPremium] of [
   });
 }
 
+test('RTDN applies deferred renewal effective annual entitlement instead of dropping it', async () => {
+  const f = fixture();
+  f.db.seed(USER, { displayName: 'Test', isPremium: true, premiumTier: 'monthly' });
+  const payload = google();
+  payload.lineItems.push({
+    productId: 'life_os_premium',
+    offerDetails: { basePlanId: 'monthly' },
+    expiryTime: '2026-09-14T12:00:00Z',
+  });
+  f.runtime.getGooglePlaySubscription = async (token) => {
+    f.calls.google.push(token);
+    return payload;
+  };
+
+  assert.equal((await invoke(f)).statusCode, 204);
+  assert.deepEqual(f.calls.google, [TOKEN]);
+  const root = f.db.data(USER);
+  const billing = f.db.data(BILLING);
+  assert.equal(root.isPremium, true);
+  assert.equal(root.premiumTier, 'annual');
+  assert.equal(root.premiumProductId, 'life_os_premium');
+  assert.equal(root.premiumBasePlanId, 'annual');
+  assert.equal(root.premiumExpiresAt.toMillis(), Date.parse('2026-10-15T12:00:00Z'));
+  assert.equal(billing.basePlanId, 'annual');
+  assert.equal(billing.expiresAt.toMillis(), root.premiumExpiresAt.toMillis());
+  assert.ok(f.db.writes.some((write) => write.path === USER));
+});
+
 test('canceled with past expiry remains Free', async () => {
   const f = fixture();
   f.runtime.getGooglePlaySubscription = async () => google('SUBSCRIPTION_STATE_CANCELED', true);

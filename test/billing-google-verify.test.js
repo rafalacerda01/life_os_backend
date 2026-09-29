@@ -1119,7 +1119,7 @@ test('strict payload helper accepts exactly one nonempty token', () => {
   assert.equal(validateBillingPayload({ purchaseToken: TOKEN }), TOKEN);
 });
 
-test('Google parser rejects ambiguous multiple line items', () => {
+test('Google parser rejects two recognized line items with future expiry', () => {
   assert.throws(
     () => parseGooglePlaySubscription(googlePayload({
       lineItems: [
@@ -1128,6 +1128,159 @@ test('Google parser rejects ambiguous multiple line items', () => {
       ],
     }), NOW),
     /BILLING_GOOGLE_RESPONSE_INVALID/,
+  );
+});
+
+for (const basePlanId of ['monthly', 'annual']) {
+  test(`Google parser preserves single ${basePlanId} entitlement`, () => {
+    const result = parseGooglePlaySubscription(googlePayload({ basePlanId }), NOW);
+    assert.equal(result.productId, GOOGLE_PLAY_PRODUCT_ID);
+    assert.equal(result.basePlanId, basePlanId);
+    assert.equal(result.tier, basePlanId);
+    assert.equal(result.expiryMillis, Date.parse(FUTURE));
+    assert.deepEqual(result.expiryDate, new Date(FUTURE));
+    assert.equal(result.isPremium, true);
+  });
+}
+
+const deferredAnnualItem = {
+  productId: GOOGLE_PLAY_PRODUCT_ID,
+  offerDetails: { basePlanId: 'annual' },
+};
+
+for (const [name, lineItems, tier, expiryTime, state, isPremium] of [
+  ['before deferred replacement', [
+    googlePayload().lineItems[0], deferredAnnualItem,
+  ], 'monthly', FUTURE, 'SUBSCRIPTION_STATE_ACTIVE', true],
+  ['after deferred renewal', [
+    googlePayload({ expiryTime: PAST }).lineItems[0],
+    googlePayload({ basePlanId: 'annual' }).lineItems[0],
+  ], 'annual', FUTURE, 'SUBSCRIPTION_STATE_ACTIVE', true],
+  ['all items expired', [
+    googlePayload({ expiryTime: '2026-09-10T12:00:00.000Z' }).lineItems[0],
+    googlePayload({ basePlanId: 'annual', expiryTime: PAST }).lineItems[0],
+  ], 'annual', PAST, 'SUBSCRIPTION_STATE_EXPIRED', false],
+]) {
+  for (const reversed of [false, true]) {
+    test(`Google parser selects effective item ${name}, reversed=${reversed}`, () => {
+      const expected = parseGooglePlaySubscription(googlePayload({
+        basePlanId: tier, expiryTime, state,
+      }), NOW);
+      const result = parseGooglePlaySubscription(googlePayload({
+        lineItems: reversed ? [...lineItems].reverse() : lineItems, state,
+      }), NOW);
+      assert.deepEqual(result, expected);
+      assert.equal(result.isPremium, isPremium);
+    });
+  }
+}
+
+for (const [name, lineItems, tier] of [
+  ['before replacement', [googlePayload().lineItems[0], deferredAnnualItem], 'monthly'],
+  ['after renewal', [
+    googlePayload({ basePlanId: 'annual' }).lineItems[0],
+    googlePayload({ expiryTime: PAST }).lineItems[0],
+  ], 'annual'],
+]) {
+  test(`/verify persists effective deferred entitlement ${name}`, async () => {
+    const { res, db } = await invoke(request(), { payload: googlePayload({ lineItems }) });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.isPremium, true);
+    assert.equal(res.body.tier, tier);
+    const root = db.data(`users/${UID}`);
+    const billing = db.data(`users/${UID}/billing/google_play`);
+    assert.equal(root.isPremium, true);
+    assert.equal(root.premiumProductId, GOOGLE_PLAY_PRODUCT_ID);
+    assert.equal(root.premiumTier, tier);
+    assert.equal(root.premiumBasePlanId, tier);
+    assert.equal(root.premiumExpiresAt.toMillis(), Date.parse(FUTURE));
+    assert.equal(billing.productId, GOOGLE_PLAY_PRODUCT_ID);
+    assert.equal(billing.basePlanId, tier);
+    assert.equal(billing.expiresAt.toMillis(), Date.parse(FUTURE));
+  });
+}
+
+for (const [name, lineItems] of [
+  ['empty array', []],
+  ['single item without expiry', [deferredAnnualItem]],
+  ['multiple items without expiry', [
+    { ...deferredAnnualItem, offerDetails: { basePlanId: 'monthly' } },
+    deferredAnnualItem,
+  ]],
+]) {
+  test(`Google parser rejects ${name}`, () => {
+    assert.throws(
+      () => parseGooglePlaySubscription(googlePayload({ lineItems }), NOW),
+      { code: 'BILLING_GOOGLE_RESPONSE_INVALID' },
+    );
+  });
+}
+
+for (const [name, expiryTime] of [
+  ['null', null], ['explicit undefined', undefined], ['invalid string', 'invalid'],
+]) {
+  test(`Google parser rejects present ${name} expiry even alongside a valid item`, () => {
+    const invalidItem = { ...deferredAnnualItem, expiryTime };
+    for (const lineItems of [
+      [googlePayload().lineItems[0], invalidItem],
+      [invalidItem, googlePayload().lineItems[0]],
+    ]) {
+      assert.throws(
+        () => parseGooglePlaySubscription(googlePayload({ lineItems }), NOW),
+        { code: 'BILLING_EXPIRY_INVALID' },
+      );
+    }
+  });
+}
+
+for (const [name, expiry] of [
+  ['deferred', {}], ['expired', { expiryTime: PAST }], ['future', { expiryTime: FUTURE }],
+]) {
+  for (const [field, overrides, code] of [
+    ['product', { productId: 'other_product' }, 'BILLING_PRODUCT_INVALID'],
+    ['base plan', { offerDetails: { basePlanId: 'weekly' } }, 'BILLING_BASE_PLAN_INVALID'],
+  ]) {
+    test(`Google parser rejects unknown ${field} in ${name} item in either order`, () => {
+      const invalidItem = { ...deferredAnnualItem, ...expiry, ...overrides };
+      for (const lineItems of [
+        [googlePayload().lineItems[0], invalidItem],
+        [invalidItem, googlePayload().lineItems[0]],
+      ]) {
+        assert.throws(
+          () => parseGooglePlaySubscription(googlePayload({ lineItems }), NOW),
+          { code },
+        );
+      }
+    });
+  }
+}
+
+test('Google parser rejects future duplicates even for the same commercial plan', () => {
+  const item = googlePayload().lineItems[0];
+  assert.throws(
+    () => parseGooglePlaySubscription(googlePayload({ lineItems: [item, item] }), NOW),
+    { code: 'BILLING_GOOGLE_RESPONSE_INVALID' },
+  );
+});
+
+test('Google parser rejects latest expired tie between distinct commercial plans', () => {
+  const lineItems = [
+    googlePayload({ expiryTime: PAST }).lineItems[0],
+    googlePayload({ basePlanId: 'annual', expiryTime: PAST }).lineItems[0],
+  ];
+  for (const items of [lineItems, [...lineItems].reverse()]) {
+    assert.throws(
+      () => parseGooglePlaySubscription(googlePayload({ lineItems: items }), NOW),
+      { code: 'BILLING_GOOGLE_RESPONSE_INVALID' },
+    );
+  }
+});
+
+test('Google parser allows identical expired items without changing entitlement', () => {
+  const item = googlePayload({ expiryTime: PAST }).lineItems[0];
+  assert.deepEqual(
+    parseGooglePlaySubscription(googlePayload({ lineItems: [item, item] }), NOW),
+    parseGooglePlaySubscription(googlePayload({ expiryTime: PAST }), NOW),
   );
 });
 

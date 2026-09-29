@@ -77,25 +77,48 @@ export function parseGooglePlaySubscription(payload, nowMillis) {
   }
 
   const { lineItems, subscriptionState, acknowledgementState } = payload;
-  if (!Array.isArray(lineItems) || lineItems.length !== 1) {
+  if (!Array.isArray(lineItems) || lineItems.length === 0) {
     throw new GooglePlayPayloadError('BILLING_GOOGLE_RESPONSE_INVALID');
   }
 
-  const lineItem = lineItems[0];
-  if (
-    lineItem === null ||
-    typeof lineItem !== 'object' ||
-    Array.isArray(lineItem) ||
-    lineItem.productId !== GOOGLE_PLAY_PRODUCT_ID
-  ) {
-    throw new GooglePlayPayloadError('BILLING_PRODUCT_INVALID');
+  let effectiveItem = null;
+  let futureItems = 0;
+  let ambiguousLatestExpiry = false;
+  for (const lineItem of lineItems) {
+    if (
+      lineItem === null ||
+      typeof lineItem !== 'object' ||
+      Array.isArray(lineItem) ||
+      lineItem.productId !== GOOGLE_PLAY_PRODUCT_ID
+    ) {
+      throw new GooglePlayPayloadError('BILLING_PRODUCT_INVALID');
+    }
+
+    const basePlanId = lineItem.offerDetails?.basePlanId;
+    const tier = tierForBasePlan(basePlanId);
+    if (tier === null) {
+      throw new GooglePlayPayloadError('BILLING_BASE_PLAN_INVALID');
+    }
+
+    // A deferred replacement without expiry has not started yet.
+    if (!Object.hasOwn(lineItem, 'expiryTime')) continue;
+    const expiryMillis = parseExpiryTime(lineItem.expiryTime);
+    if (expiryMillis > nowMillis) futureItems += 1;
+    if (effectiveItem === null || expiryMillis > effectiveItem.expiryMillis) {
+      effectiveItem = { productId: lineItem.productId, basePlanId, tier, expiryMillis };
+      ambiguousLatestExpiry = false;
+    } else if (
+      expiryMillis === effectiveItem.expiryMillis &&
+      basePlanId !== effectiveItem.basePlanId
+    ) {
+      ambiguousLatestExpiry = true;
+    }
   }
 
-  const basePlanId = lineItem.offerDetails?.basePlanId;
-  const tier = tierForBasePlan(basePlanId);
-  if (tier === null) {
-    throw new GooglePlayPayloadError('BILLING_BASE_PLAN_INVALID');
+  if (effectiveItem === null || futureItems > 1 || ambiguousLatestExpiry) {
+    throw new GooglePlayPayloadError('BILLING_GOOGLE_RESPONSE_INVALID');
   }
+  const { productId, basePlanId, tier, expiryMillis } = effectiveItem;
 
   if (typeof subscriptionState !== 'string' || subscriptionState.length === 0) {
     throw new GooglePlayPayloadError('BILLING_GOOGLE_RESPONSE_INVALID');
@@ -104,11 +127,10 @@ export function parseGooglePlaySubscription(payload, nowMillis) {
     throw new GooglePlayPayloadError('BILLING_GOOGLE_RESPONSE_INVALID');
   }
 
-  const expiryMillis = parseExpiryTime(lineItem.expiryTime);
   const obfuscatedAccountId = parseObfuscatedAccountId(payload);
 
   return {
-    productId: lineItem.productId,
+    productId,
     basePlanId,
     tier,
     subscriptionState,
