@@ -254,11 +254,9 @@ export async function applyStudyActivity({
       const subjectData = subjectSnapshot.data() ?? {};
       newSubjectProgress = Math.min(
         1,
-        readProgress(subjectData, { required: true }) + progressDelta,
+        readProgress(subjectData) + progressDelta,
       );
-      subjectStreakDays = readNonNegativeInteger(subjectData, 'streakDays', {
-        required: true,
-      });
+      subjectStreakDays = readNonNegativeInteger(subjectData, 'streakDays');
       if (!streakHistory.isHistorical) {
         subjectStreakDays = streakHistory.streak;
       }

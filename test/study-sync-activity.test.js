@@ -522,40 +522,115 @@ test('lastStudyDate presente e inválido falha fechado', async () => {
   }
 });
 
-test('subject sem progress falha fechado sem escrita ou receipt', async () => {
-  const studyInfo = { progress: .2 };
+test('legacy subject materializes missing progress and streakDays exactly once', async () => {
+  const subject = {
+    title: 'Matematica',
+    hasExam: false,
+    examDate: null,
+    createdAt: new Date('2025-01-01T00:00:00.000Z'),
+  };
+  const db = firestoreWithStudyInfo({ progress: .2 }, subject);
+
+  const result = await apply(db, { subjectId: 'subject-1' });
+
+  assert.equal(result.alreadyApplied, false);
+  assert.equal(db.read('users/user-a/study_info/main').progress, .45);
+  assert.deepEqual(db.read('users/user-a/subjects/subject-1'), {
+    ...subject,
+    progress: .25,
+    streakDays: 1,
+    updatedAt: 'SERVER_TIMESTAMP',
+  });
+  assert.deepEqual(
+    db.read(`users/user-a/study_activity_receipts/${mutationA}`),
+    { appliedAt: 'SERVER_TIMESTAMP' },
+  );
+  const afterFirstApply = cloneValue(Object.fromEntries(db.data));
+
+  const replay = await apply(db, { subjectId: 'subject-1' });
+
+  assert.equal(replay.alreadyApplied, true);
+  assert.deepEqual(Object.fromEntries(db.data), afterFirstApply);
+});
+
+test('subject sem progress aplica default e preserva streakDays em evento antigo', async () => {
+  const studyInfo = {
+    progress: .2,
+    streak: 5,
+    lastStudyDate: new Date('2026-09-10T12:00:00.000Z'),
+  };
   const subject = { streakDays: 2 };
   const db = firestoreWithStudyInfo(studyInfo, subject);
-  await assert.rejects(
-    apply(db, { subjectId: 'subject-1' }),
-    (error) =>
-      error.statusCode === 409 &&
-      error.code === 'STUDY_ACTIVITY_STATE_INVALID',
-  );
-  assert.deepEqual(db.read('users/user-a/study_info/main'), studyInfo);
-  assert.deepEqual(db.read('users/user-a/subjects/subject-1'), subject);
-  assert.equal(
+
+  await apply(db, { subjectId: 'subject-1' });
+
+  assert.equal(db.read('users/user-a/study_info/main').progress, .45);
+  assert.deepEqual(db.read('users/user-a/subjects/subject-1'), {
+    progress: .25,
+    streakDays: 2,
+    updatedAt: 'SERVER_TIMESTAMP',
+  });
+  assert.deepEqual(
     db.read(`users/user-a/study_activity_receipts/${mutationA}`),
-    undefined,
+    { appliedAt: 'SERVER_TIMESTAMP' },
   );
 });
 
-test('subject sem streakDays falha fechado sem escrita ou receipt', async () => {
-  const studyInfo = { progress: .2 };
+test('subject sem streakDays materializa streak e soma progress existente', async () => {
   const subject = { progress: .3 };
-  const db = firestoreWithStudyInfo(studyInfo, subject);
-  await assert.rejects(
-    apply(db, { subjectId: 'subject-1' }),
-    (error) =>
-      error.statusCode === 409 &&
-      error.code === 'STUDY_ACTIVITY_STATE_INVALID',
-  );
-  assert.deepEqual(db.read('users/user-a/study_info/main'), studyInfo);
-  assert.deepEqual(db.read('users/user-a/subjects/subject-1'), subject);
-  assert.equal(
+  const db = firestoreWithStudyInfo({ progress: .2 }, subject);
+
+  await apply(db, { subjectId: 'subject-1' });
+
+  assert.equal(db.read('users/user-a/study_info/main').progress, .45);
+  assert.deepEqual(db.read('users/user-a/subjects/subject-1'), {
+    progress: .55,
+    streakDays: 1,
+    updatedAt: 'SERVER_TIMESTAMP',
+  });
+  assert.deepEqual(
     db.read(`users/user-a/study_activity_receipts/${mutationA}`),
-    undefined,
+    { appliedAt: 'SERVER_TIMESTAMP' },
   );
+});
+
+test('present invalid subject fields fail closed without partial writes', async (t) => {
+  const cases = [
+    ['progress undefined', 'progress', undefined],
+    ['progress string', 'progress', '0'],
+    ['progress negative', 'progress', -1],
+    ['progress above one', 'progress', 1.1],
+    ['progress NaN', 'progress', NaN],
+    ['progress Infinity', 'progress', Infinity],
+    ['progress -Infinity', 'progress', -Infinity],
+    ['streakDays undefined', 'streakDays', undefined],
+    ['streakDays string', 'streakDays', '0'],
+    ['streakDays negative', 'streakDays', -1],
+    ['streakDays fractional', 'streakDays', .5],
+    ['streakDays NaN', 'streakDays', NaN],
+    ['streakDays Infinity', 'streakDays', Infinity],
+  ];
+
+  for (const [name, field, value] of cases) {
+    await t.test(name, async () => {
+      const subject = { progress: .3, streakDays: 2, [field]: value };
+      const db = firestoreWithStudyInfo({ progress: .2 }, subject);
+      const before = cloneValue(Object.fromEntries(db.data));
+
+      await assert.rejects(
+        apply(db, { subjectId: 'subject-1' }),
+        (error) =>
+          error.statusCode === 409 &&
+          error.code === 'STUDY_ACTIVITY_STATE_INVALID',
+      );
+
+      assert.deepEqual(Object.fromEntries(db.data), before);
+      assert.equal(
+        db.read(`users/user-a/study_activity_receipts/${mutationA}`),
+        undefined,
+      );
+    });
+  }
 });
 
 test('receipt contém somente timestamp server-owned', async () => {
