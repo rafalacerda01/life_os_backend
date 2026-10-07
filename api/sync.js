@@ -777,6 +777,25 @@ function validateSubjectCreatePayload(body) {
   };
 }
 
+// Deletion is terminal for this user/entity identity. These server-only markers
+// have no TTL: an arbitrarily late CREATE must still observe the deletion.
+function syncTombstoneRef(userRef, entityType, entityId) {
+  return userRef.collection('sync_tombstones').doc(
+    `${entityType}__${entityId}`,
+  );
+}
+
+function persistSyncTombstone(transaction, tombstoneRef, snapshot, entityType, entityId) {
+  if (snapshot.exists) return;
+
+  transaction.set(tombstoneRef, {
+    entityType,
+    entityId,
+    deletedAt: FieldValue.serverTimestamp(),
+    schemaVersion: 1,
+  });
+}
+
 async function createTransactionWithQuota({
   userId,
   transactionId,
@@ -794,6 +813,8 @@ async function createTransactionWithQuota({
       .collection('transactions')
       .doc(transactionId);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'transactions', transactionId);
+
   return db.runTransaction(
     async (transaction) => {
       const userSnapshot =
@@ -804,6 +825,8 @@ async function createTransactionWithQuota({
           transactionRef,
         );
 
+      const tombstoneSnapshot = await transaction.get(tombstoneRef);
+
       if (!userSnapshot.exists) {
         const error = new Error(
           'Usuário não encontrado.',
@@ -813,6 +836,10 @@ async function createTransactionWithQuota({
         error.code = 'USER_NOT_FOUND';
 
         throw error;
+      }
+
+      if (tombstoneSnapshot.exists) {
+        return { skippedAsDeleted: true };
       }
 
       if (transactionSnapshot.exists) {
@@ -912,6 +939,8 @@ async function deleteTransactionWithQuota({
       .collection('transactions')
       .doc(transactionId);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'transactions', transactionId);
+
   return db.runTransaction(
     async (transaction) => {
       const userSnapshot =
@@ -921,6 +950,8 @@ async function deleteTransactionWithQuota({
         await transaction.get(
           transactionRef,
         );
+
+      const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
       if (!userSnapshot.exists) {
         const error = new Error(
@@ -934,6 +965,10 @@ async function deleteTransactionWithQuota({
       }
 
       if (!transactionSnapshot.exists) {
+        persistSyncTombstone(
+          transaction, tombstoneRef, tombstoneSnapshot, 'transactions', transactionId,
+        );
+
         return {
           alreadyDeleted: true,
         };
@@ -963,6 +998,10 @@ async function deleteTransactionWithQuota({
 
         throw error;
       }
+
+      persistSyncTombstone(
+        transaction, tombstoneRef, tombstoneSnapshot, 'transactions', transactionId,
+      );
 
       transaction.delete(
         transactionRef,
@@ -1533,12 +1572,16 @@ async function createMedicationWithQuota({
   const medicationRef =
     userRef.collection('medications').doc(medicationId);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'medications', medicationId);
+
   return db.runTransaction(async (transaction) => {
     const userSnapshot =
       await transaction.get(userRef);
 
     const medicationSnapshot =
       await transaction.get(medicationRef);
+
+    const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
     if (!userSnapshot.exists) {
       const error = new Error(
@@ -1549,6 +1592,10 @@ async function createMedicationWithQuota({
       error.code = 'USER_NOT_FOUND';
 
       throw error;
+    }
+
+    if (tombstoneSnapshot.exists) {
+      return { skippedAsDeleted: true };
     }
 
     if (medicationSnapshot.exists) {
@@ -1651,12 +1698,16 @@ async function deleteMedicationWithQuota({
       .collection('notifications')
       .doc(`health_med_${medicationId}`);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'medications', medicationId);
+
   return db.runTransaction(async (transaction) => {
     const userSnapshot =
       await transaction.get(userRef);
 
     const medicationSnapshot =
       await transaction.get(medicationRef);
+
+    const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
     if (!userSnapshot.exists) {
       const error = new Error(
@@ -1670,6 +1721,10 @@ async function deleteMedicationWithQuota({
     }
 
     if (!medicationSnapshot.exists) {
+      persistSyncTombstone(
+        transaction, tombstoneRef, tombstoneSnapshot, 'medications', medicationId,
+      );
+
       return {
         alreadyDeleted: true,
       };
@@ -1696,6 +1751,10 @@ async function deleteMedicationWithQuota({
 
       throw error;
     }
+
+    persistSyncTombstone(
+      transaction, tombstoneRef, tombstoneSnapshot, 'medications', medicationId,
+    );
 
     transaction.delete(
       medicationRef,
@@ -1736,12 +1795,16 @@ async function createSubjectWithQuota({
   const subjectRef =
     userRef.collection('subjects').doc(subjectId);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'subjects', subjectId);
+
   return db.runTransaction(async (transaction) => {
     const userSnapshot =
       await transaction.get(userRef);
 
     const subjectSnapshot =
       await transaction.get(subjectRef);
+
+    const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
     if (!userSnapshot.exists) {
       const error = new Error(
@@ -1752,6 +1815,10 @@ async function createSubjectWithQuota({
       error.code = 'USER_NOT_FOUND';
 
       throw error;
+    }
+
+    if (tombstoneSnapshot.exists) {
+      return { skippedAsDeleted: true };
     }
 
     if (subjectSnapshot.exists) {
@@ -1857,6 +1924,8 @@ async function deleteSubjectWithQuota({
       .collection('review_queue')
       .where('subjectId', '==', subjectId);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'subjects', subjectId);
+
   return db.runTransaction(async (transaction) => {
     // Todas as leituras antes das escritas.
     const userSnapshot =
@@ -1864,6 +1933,8 @@ async function deleteSubjectWithQuota({
 
     const subjectSnapshot =
       await transaction.get(subjectRef);
+
+    const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
     const studyInfoSnapshot =
       await transaction.get(studyInfoRef);
@@ -1883,6 +1954,10 @@ async function deleteSubjectWithQuota({
     }
 
     if (!subjectSnapshot.exists) {
+      persistSyncTombstone(
+        transaction, tombstoneRef, tombstoneSnapshot, 'subjects', subjectId,
+      );
+
       return {
         alreadyDeleted: true,
       };
@@ -1941,6 +2016,10 @@ async function deleteSubjectWithQuota({
         currentReviewQueue - flashcardsSnapshot.size,
       );
 
+    persistSyncTombstone(
+      transaction, tombstoneRef, tombstoneSnapshot, 'subjects', subjectId,
+    );
+
     for (const flashcardDoc of flashcardsSnapshot.docs) {
       transaction.delete(
         flashcardDoc.ref,
@@ -1998,12 +2077,16 @@ async function createGoalWithQuota({
   const goalRef =
     userRef.collection('goals').doc(goalId);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'goals', goalId);
+
   return db.runTransaction(async (transaction) => {
     const userSnapshot =
       await transaction.get(userRef);
 
     const goalSnapshot =
       await transaction.get(goalRef);
+
+    const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
     if (!userSnapshot.exists) {
       const error = new Error(
@@ -2014,6 +2097,10 @@ async function createGoalWithQuota({
       error.code = 'USER_NOT_FOUND';
 
       throw error;
+    }
+
+    if (tombstoneSnapshot.exists) {
+      return { skippedAsDeleted: true };
     }
 
     // Retry da mesma criação não incrementa novamente.
@@ -2110,12 +2197,16 @@ async function deleteGoalWithQuota({
   const goalRef =
     userRef.collection('goals').doc(goalId);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'goals', goalId);
+
   return db.runTransaction(async (transaction) => {
     const userSnapshot =
       await transaction.get(userRef);
 
     const goalSnapshot =
       await transaction.get(goalRef);
+
+    const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
     if (!userSnapshot.exists) {
       const error = new Error(
@@ -2130,6 +2221,10 @@ async function deleteGoalWithQuota({
 
     // Retry da exclusão não decrementa novamente.
     if (!goalSnapshot.exists) {
+      persistSyncTombstone(
+        transaction, tombstoneRef, tombstoneSnapshot, 'goals', goalId,
+      );
+
       return {
         alreadyDeleted: true,
       };
@@ -2156,6 +2251,10 @@ async function deleteGoalWithQuota({
 
       throw error;
     }
+
+    persistSyncTombstone(
+      transaction, tombstoneRef, tombstoneSnapshot, 'goals', goalId,
+    );
 
     transaction.delete(goalRef);
 
@@ -2186,9 +2285,13 @@ async function createTaskWithQuota({
   const userRef = db.collection('users').doc(userId);
   const taskRef = userRef.collection('tasks').doc(taskId);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'tasks', taskId);
+
   return db.runTransaction(async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
     const taskSnapshot = await transaction.get(taskRef);
+
+    const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
     if (!userSnapshot.exists) {
       const error = new Error(
@@ -2199,6 +2302,10 @@ async function createTaskWithQuota({
       error.code = 'USER_NOT_FOUND';
 
       throw error;
+    }
+
+    if (tombstoneSnapshot.exists) {
+      return { skippedAsDeleted: true };
     }
 
     // Idempotência: retry da mesma criação não aumenta o contador.
@@ -2282,9 +2389,13 @@ async function deleteTaskWithQuota({
   const userRef = db.collection('users').doc(userId);
   const taskRef = userRef.collection('tasks').doc(taskId);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'tasks', taskId);
+
   return db.runTransaction(async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
     const taskSnapshot = await transaction.get(taskRef);
+
+    const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
     if (!userSnapshot.exists) {
       const error = new Error(
@@ -2299,6 +2410,10 @@ async function deleteTaskWithQuota({
 
     // Idempotência: retry da exclusão não decrementa duas vezes.
     if (!taskSnapshot.exists) {
+      persistSyncTombstone(
+        transaction, tombstoneRef, tombstoneSnapshot, 'tasks', taskId,
+      );
+
       return {
         alreadyDeleted: true,
       };
@@ -2322,6 +2437,10 @@ async function deleteTaskWithQuota({
 
       throw error;
     }
+
+    persistSyncTombstone(
+      transaction, tombstoneRef, tombstoneSnapshot, 'tasks', taskId,
+    );
 
     transaction.delete(taskRef);
 
@@ -2350,9 +2469,13 @@ async function createHabitWithQuota({
   const userRef = db.collection('users').doc(userId);
   const habitRef = userRef.collection('habits').doc(habitId);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'habits', habitId);
+
   return db.runTransaction(async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
     const habitSnapshot = await transaction.get(habitRef);
+
+    const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
     if (!userSnapshot.exists) {
       const error = new Error(
@@ -2363,6 +2486,10 @@ async function createHabitWithQuota({
       error.code = 'USER_NOT_FOUND';
 
       throw error;
+    }
+
+    if (tombstoneSnapshot.exists) {
+      return { skippedAsDeleted: true };
     }
 
     // Idempotência:
@@ -2457,10 +2584,14 @@ async function deleteHabitWithQuota({
     .collection('notifications')
     .doc(`habit_${habitId}`);
 
+  const tombstoneRef = syncTombstoneRef(userRef, 'habits', habitId);
+
   return db.runTransaction(async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
     const habitSnapshot =
       await transaction.get(habitRef);
+
+    const tombstoneSnapshot = await transaction.get(tombstoneRef);
 
     if (!userSnapshot.exists) {
       const error = new Error(
@@ -2476,6 +2607,10 @@ async function deleteHabitWithQuota({
     // Idempotência:
     // se o hábito já foi removido, não decrementamos novamente.
     if (!habitSnapshot.exists) {
+      persistSyncTombstone(
+        transaction, tombstoneRef, tombstoneSnapshot, 'habits', habitId,
+      );
+
       return {
         alreadyDeleted: true,
       };
@@ -2500,6 +2635,10 @@ async function deleteHabitWithQuota({
 
       throw error;
     }
+
+    persistSyncTombstone(
+      transaction, tombstoneRef, tombstoneSnapshot, 'habits', habitId,
+    );
 
     transaction.delete(habitRef);
     transaction.delete(notificationRef1);
