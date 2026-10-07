@@ -32,7 +32,8 @@ function collection(path) {
     doc: id => document(`${path}/${id}`),
     where: (field, operator, value) => {
       assert.equal(operator, '==');
-      return { path, query: true, field, value };
+      return { path, query: true, field, value,
+        limit(size) { return { ...this, limitCount: size }; } };
     },
   };
 }
@@ -75,7 +76,7 @@ function fixture(t, config, count = 0) {
       const reads = new Map();
       const queryReads = new Map();
       const pending = [];
-      const attemptRecord = { label, attempt, reads, pending };
+      const attemptRecord = { label, attempt, reads, queryReads, querySnapshots: [], pending };
       attempts.push(attemptRecord);
       const result = await callback({
         async get(ref) {
@@ -85,7 +86,9 @@ function fixture(t, config, count = 0) {
             queryReads.set(ref.path, startCollectionVersions.get(ref.path) ?? 0);
             const matches = [...state.keys()].filter(path =>
               path.slice(0, path.lastIndexOf('/')) === ref.path && state.get(path)[ref.field] === ref.value);
-            value = { size: matches.length, docs: matches.map(path => snapshot(path, state)) };
+            const selected = matches.slice(0, ref.limitCount ?? Infinity);
+            value = { size: selected.length, docs: selected.map(path => snapshot(path, state)) };
+            attemptRecord.querySnapshots.push({ ref, snapshot: value });
           } else {
             reads.set(ref.path, startVersions.get(ref.path) ?? 0);
             value = snapshot(ref.path, state);
@@ -107,7 +110,7 @@ function fixture(t, config, count = 0) {
         continue;
       }
       // Conservative legacy write budget; Firestore removed the 500-write cap.
-      assert.ok(pending.length <= 500, 'conservative transaction write budget');
+      assert.ok(pending.length <= (queryReads.size ? 201 : 500), 'bounded transaction write budget');
       // No await during commit: all writes become visible atomically.
       for (const write of pending) {
         writes.push(write);
@@ -124,6 +127,7 @@ function fixture(t, config, count = 0) {
         collectionVersions.set(parent, (collectionVersions.get(parent) ?? 0) + 1);
       }
       attemptRecord.result = result;
+      await hooks.afterCommit?.(attemptRecord);
       return result;
     }
     throw new Error('Exceeded conflict retry limit');
@@ -198,7 +202,8 @@ for (const config of operations) {
     await f.invoke();
     success(await f.invoke('delete'), config, 'delete');
     deleted(f, config);
-    const pending = f.attempts.at(-1).pending;
+    const pending = f.attempts.find(attempt => attempt.pending.some(write =>
+      write.path === f.target && write.type === 'delete')).pending;
     assert.ok(pending.some(write => write.path === f.marker && write.type === 'set'));
     assert.ok(pending.some(write => write.path === f.target && write.type === 'delete'));
     assert.ok(pending.some(write => write.path === USER && write.type === 'update'));
@@ -364,27 +369,214 @@ for (const [entity, notifications] of [
   });
 }
 
-for (const size of [450, 451]) {
-  test(`subject: existing ${size}-flashcard deletion boundary is preserved`, async t => {
-    const config = operations.find(config => config.entity === 'subject');
-    const f = fixture(t, config, 1);
-    f.docs.set(f.target, config.payload);
-    f.docs.set(`${USER}/study_info/main`, { reviewQueue: size });
-    for (let i = 0; i < size; i++) f.docs.set(`${USER}/review_queue/card-${i}`, { subjectId: ID });
-    const response = await f.invoke('delete');
-    if (size === 450) {
-      success(response, config, 'delete');
-      deleted(f, config);
-      assert.equal(f.writes.length, 454); // cards + subject + study_info + user + marker
-      assert.equal(f.docs.get(`${USER}/study_info/main`).reviewQueue, 0);
-      assert.equal([...f.docs.keys()].filter(path => path.startsWith(`${USER}/review_queue/`)).length, 0);
-    } else {
-      assert.equal(response.statusCode, 409);
-      assert.equal(response.body.code, 'SUBJECT_DELETE_TOO_MANY_FLASHCARDS');
-      assert.equal(f.docs.has(f.target), true);
-      assert.equal(f.docs.has(f.marker), false);
-      assert.equal(f.count(), 1);
-      assert.equal(f.writes.length, 0);
+// Subject deletion uses the same MVCC harness as the six-family tombstone tests.
+const subjectConfig = operations.find(config => config.entity === 'subject');
+const STUDY = `${USER}/study_info/main`;
+const CARDS = `${USER}/review_queue`;
+const CHUNK_SIZE = 200;
+
+function subjectFixture(t, size, { subjectExists = true, markerExists = false,
+  subjectsCount = 3, reviewQueue = size + 7 } = {}) {
+  const f = fixture(t, subjectConfig, subjectsCount);
+  if (subjectExists) f.docs.set(f.target, subjectConfig.payload);
+  if (markerExists) f.docs.set(f.marker, { entityType: 'subjects', entityId: ID,
+    deletedAt: new Date(DATE), schemaVersion: 1 });
+  f.docs.set(STUDY, { reviewQueue, unrelated: 'preserved' });
+  for (let i = 0; i < size; i++) f.docs.set(`${CARDS}/card-${i}`, { subjectId: ID });
+  f.docs.set(`${CARDS}/other-subject-card`, { subjectId: 'other-subject' });
+  f.remaining = () => [...f.docs.values()].filter(data => data.subjectId === ID).length;
+  f.reviewQueue = () => f.docs.get(STUDY)?.reviewQueue;
+  f.chunks = () => f.attempts.filter(attempt => attempt.queryReads.size && attempt.result?.deleted > 0);
+  return f;
+}
+
+function assertSubjectCleanup(f, expectedSubjects = 2, expectedReviewQueue = 7) {
+  deleted(f, subjectConfig, expectedSubjects);
+  assert.equal(f.remaining(), 0);
+  assert.equal(f.reviewQueue(), expectedReviewQueue);
+  assert.equal(f.docs.has(`${CARDS}/other-subject-card`), true);
+  assert.equal(f.docs.get(STUDY).unrelated, 'preserved');
+  const cardDeletes = f.writes.filter(write => write.type === 'delete' && write.path.startsWith(`${CARDS}/`));
+  assert.equal(new Set(cardDeletes.map(write => write.path)).size, cardDeletes.length,
+    'no card is deleted or counted twice');
+  for (const attempt of f.attempts.filter(attempt => attempt.queryReads.size)) {
+    assert.deepEqual([...attempt.reads.keys()], [STUDY]);
+    assert.equal(attempt.querySnapshots[0].ref.limitCount, CHUNK_SIZE);
+    assert.ok(attempt.querySnapshots[0].snapshot.size <= CHUNK_SIZE);
+    assert.ok(attempt.pending.length <= CHUNK_SIZE + 1);
+    if (attempt.result?.deleted > 0) {
+      assert.equal(attempt.pending.filter(write => write.type === 'delete').length, attempt.result.deleted);
+      assert.equal(attempt.pending.filter(write => write.path === STUDY).length, 1);
     }
+  }
+}
+
+for (const size of [0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 450, 451, 1001]) {
+  test(`subject chunks: ${size} cards succeed without a total-size rejection`, async t => {
+    const f = subjectFixture(t, size);
+    success(await f.invoke('delete'), subjectConfig, 'delete');
+    assertSubjectCleanup(f);
+    assert.equal(f.chunks().length, Math.ceil(size / CHUNK_SIZE));
+    assert.equal(f.chunks().reduce((total, chunk) => total + chunk.result.deleted, 0), size);
+    const seal = f.attempts[0];
+    assert.deepEqual([...seal.reads.keys()], [USER, f.target, f.marker]);
+    assert.equal(seal.queryReads.size, 0, 'phase 1 does not read study_info or query cards');
+    assert.equal(seal.pending.length, 3);
+    assert.equal(f.attempts.at(-1).result.deleted, 0);
+    assert.equal(f.attempts.at(-1).pending.length, 0);
+  });
+}
+
+for (const afterChunk of [false, true]) {
+  test(`subject chunks: interruption after ${afterChunk ? 'one chunk' : 'phase 1'} resumes on another invocation`, async t => {
+    const f = subjectFixture(t, 451);
+    let interrupted = false;
+    f.hooks.afterCommit = async attempt => {
+      const isPhase1 = attempt.pending.some(write => write.path === f.target && write.type === 'delete');
+      const isChunk = attempt.queryReads.size && attempt.result.deleted > 0;
+      if (!interrupted && (afterChunk ? isChunk : isPhase1)) {
+        interrupted = true;
+        throw new Error('simulated process interruption after committed transaction');
+      }
+    };
+    assert.equal((await f.invoke('delete', 'first-request')).statusCode, 500);
+    assert.equal(interrupted, true);
+    deleted(f, subjectConfig, 2);
+    assert.equal(f.remaining(), afterChunk ? 251 : 451);
+    assert.equal(f.reviewQueue(), afterChunk ? 258 : 458);
+    const originalMarker = f.docs.get(f.marker);
+    const committedDeletes = f.writes.filter(write => write.type === 'delete').map(write => write.path);
+    f.hooks.afterCommit = undefined;
+    success(await f.invoke('delete', 'retry-request'), subjectConfig, 'delete');
+    assertSubjectCleanup(f);
+    assert.deepEqual(f.docs.get(f.marker), originalMarker);
+    assert.equal(f.writes.filter(write => write.path === USER).length, 1);
+    assert.equal(f.writes.filter(write => write.path === f.marker).length, 1);
+    const retried = f.chunks().filter(chunk => chunk.label === 'retry-request');
+    assert.equal(retried.reduce((total, chunk) => total + chunk.result.deleted, 0), afterChunk ? 251 : 451);
+    for (const chunk of retried) for (const write of chunk.pending.filter(write => write.type === 'delete')) {
+      assert.equal(committedDeletes.includes(write.path), false);
+    }
+    const committed = f.writes.length;
+    success(await f.invoke('delete', 'completed-retry'), subjectConfig, 'delete');
+    assert.equal(f.writes.length, committed);
+  });
+}
+
+for (const markerExists of [false, true]) {
+  test(`subject chunks: absent subject and ${markerExists ? 'existing' : 'missing'} tombstone still clean orphan cards`, async t => {
+    const f = subjectFixture(t, 451, { subjectExists: false, markerExists });
+    success(await f.invoke('delete'), subjectConfig, 'delete');
+    assertSubjectCleanup(f, 3);
+    assert.equal(f.writes.some(write => write.path === USER), false);
+    assert.equal(f.writes.filter(write => write.path === f.marker).length, markerExists ? 0 : 1);
+  });
+}
+
+test('subject chunks: two overlapping deletes retry phase 1 and the same chunk without double decrement', { timeout: 5000 }, async t => {
+  const f = subjectFixture(t, 451);
+  const phase1 = gate();
+  const chunk1 = gate();
+  const chunk2 = gate();
+  for (const held of [phase1, chunk1, chunk2]) t.after(held.release);
+  f.hooks.afterRead = async ({ label, attempt, ref }) => {
+    if (label === 'D1' && attempt === 1 && ref.path === f.marker) await phase1.hold();
+    if (attempt === 1 && ref.query) await (label === 'D1' ? chunk1 : chunk2).hold();
+  };
+  const d1 = f.invoke('delete', 'D1');
+  await phase1.reached;
+  const d2 = f.invoke('delete', 'D2');
+  await chunk2.reached;
+  phase1.release();
+  await chunk1.reached;
+  chunk2.release();
+  success(await d2, subjectConfig, 'delete');
+  chunk1.release();
+  success(await d1, subjectConfig, 'delete');
+  assertSubjectCleanup(f);
+  assert.equal(f.writes.filter(write => write.path === USER).length, 1);
+  assert.equal(f.writes.filter(write => write.path === f.marker).length, 1);
+  assert.ok(f.conflicts.some(conflict => conflict.label === 'D1' && conflict.paths.includes(f.target)));
+  assert.ok(f.conflicts.some(conflict => conflict.label === 'D1' &&
+    conflict.paths.includes(STUDY) && conflict.paths.includes(CARDS)));
+  const staleChunk = f.attempts.find(attempt => attempt.label === 'D1' && attempt.queryReads.size && attempt.attempt === 1);
+  const retryChunk = f.attempts.find(attempt => attempt.label === 'D1' && attempt.queryReads.size && attempt.attempt === 2);
+  assert.equal(staleChunk.querySnapshots[0].snapshot.size, CHUNK_SIZE);
+  assert.equal(staleChunk.result, undefined, 'conflicting buffered writes were discarded');
+  assert.equal(retryChunk.querySnapshots[0].snapshot.size, 0, 'retry rereads the current query');
+  assert.equal(retryChunk.result.deleted, 0);
+  assert.equal(retryChunk.pending.length, 0);
+});
+
+test('subject chunks: conflicting chunk discards its counter adjustment and rereads study_info', { timeout: 5000 }, async t => {
+  const f = subjectFixture(t, 201);
+  const held = gate();
+  t.after(held.release);
+  f.hooks.afterRead = async ({ label, attempt, ref }) => {
+    if (label === 'stale-request' && attempt === 1 && ref.query) await held.hold();
+  };
+  const stale = f.invoke('delete', 'stale-request');
+  await held.reached;
+  success(await f.invoke('delete', 'other-request'), subjectConfig, 'delete');
+  held.release();
+  success(await stale, subjectConfig, 'delete');
+  assertSubjectCleanup(f);
+  assert.deepEqual(f.conflicts, [{ label: 'stale-request', attempt: 1, paths: [STUDY, CARDS] }]);
+  const chunks = f.attempts.filter(attempt => attempt.label === 'stale-request' && attempt.queryReads.size);
+  assert.equal(chunks.length, 2);
+  assert.ok(chunks[1].reads.get(STUDY) > chunks[0].reads.get(STUDY));
+  assert.ok(chunks[1].queryReads.get(CARDS) > chunks[0].queryReads.get(CARDS));
+  assert.equal(f.writes.filter(write => write.path === STUDY).length, 2);
+});
+
+test('subject chunks: invalid subjectsCount aborts sealing before any cleanup', async t => {
+  const f = subjectFixture(t, 451, { subjectsCount: -1 });
+  assert.equal((await f.invoke('delete')).statusCode, 412);
+  assert.equal(f.docs.has(f.target), true);
+  assert.equal(f.docs.has(f.marker), false);
+  assert.equal(f.remaining(), 451);
+  assert.equal(f.reviewQueue(), 458);
+  assert.equal(f.writes.length, 0);
+  assert.equal(f.attempts.length, 1);
+  assert.equal(f.attempts[0].queryReads.size, 0);
+});
+
+test('subject chunks: missing user retains USER_NOT_FOUND and starts no cleanup', async t => {
+  const f = subjectFixture(t, 451);
+  f.docs.delete(USER);
+  const response = await f.invoke('delete');
+  assert.equal(response.statusCode, 404);
+  assert.equal(response.body.code, 'USER_NOT_FOUND');
+  assert.equal(f.docs.has(f.target), true);
+  assert.equal(f.remaining(), 451);
+  assert.equal(f.writes.length, 0);
+  assert.equal(f.attempts.length, 1);
+});
+
+test('subject chunks: late subject CREATE stays blocked even during interrupted cleanup', async t => {
+  const f = subjectFixture(t, 451);
+  f.hooks.afterCommit = async attempt => {
+    if (attempt.pending.some(write => write.path === f.target && write.type === 'delete')) {
+      throw new Error('simulated interruption after sealing');
+    }
+  };
+  assert.equal((await f.invoke('delete')).statusCode, 500);
+  f.hooks.afterCommit = undefined;
+  const committed = f.writes.length;
+  success(await f.invoke('create', 'late-create'), subjectConfig, 'create');
+  deleted(f, subjectConfig, 2);
+  assert.equal(f.remaining(), 451);
+  assert.equal(f.writes.length, committed);
+  assert.deepEqual(f.attempts.at(-1).result, { skippedAsDeleted: true });
+  success(await f.invoke('delete', 'cleanup-retry'), subjectConfig, 'delete');
+  assertSubjectCleanup(f);
+});
+
+for (const initial of [1, -1, 'invalid', undefined]) {
+  test(`subject chunks: reviewQueue ${String(initial)} retains normalization and floor zero`, async t => {
+    const f = subjectFixture(t, 201);
+    f.docs.set(STUDY, { reviewQueue: initial, unrelated: 'preserved' });
+    success(await f.invoke('delete'), subjectConfig, 'delete');
+    assertSubjectCleanup(f, 2, 0);
   });
 }

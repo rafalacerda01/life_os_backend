@@ -87,6 +87,7 @@ const GOALS_FREE_LIMIT = 3;
 const GOALS_PREMIUM_LIMIT = 30;
 const SUBJECTS_FREE_LIMIT = 3;
 const SUBJECTS_PREMIUM_LIMIT = 30;
+const SUBJECT_DELETE_FLASHCARD_CHUNK_SIZE = 200;
 
 const MAX_SUBJECT_TITLE_LENGTH = 200;
 const MAX_SUBJECT_ID_LENGTH = 128;
@@ -162,12 +163,6 @@ const SAFE_SYNC_DOMAIN_ERRORS = Object.freeze({
     messages: Object.freeze([
       'Limite Premium de 30 matérias atingido.',
       'Limite gratuito de 3 matérias atingido.',
-    ]),
-  }),
-  SUBJECT_DELETE_TOO_MANY_FLASHCARDS: Object.freeze({
-    statusCode: 409,
-    messages: Object.freeze([
-      'A matéria possui flashcards demais para exclusão transacional.',
     ]),
   }),
   STUDY_ACTIVITY_SUBJECT_NOT_FOUND: Object.freeze({
@@ -1922,11 +1917,13 @@ async function deleteSubjectWithQuota({
   const flashcardsQuery =
     userRef
       .collection('review_queue')
-      .where('subjectId', '==', subjectId);
+      .where('subjectId', '==', subjectId)
+      .limit(SUBJECT_DELETE_FLASHCARD_CHUNK_SIZE);
 
   const tombstoneRef = syncTombstoneRef(userRef, 'subjects', subjectId);
 
-  return db.runTransaction(async (transaction) => {
+  // Phase 1 seals the identity and decrements the subject count at most once.
+  const deletion = await db.runTransaction(async (transaction) => {
     // Todas as leituras antes das escritas.
     const userSnapshot =
       await transaction.get(userRef);
@@ -1935,12 +1932,6 @@ async function deleteSubjectWithQuota({
       await transaction.get(subjectRef);
 
     const tombstoneSnapshot = await transaction.get(tombstoneRef);
-
-    const studyInfoSnapshot =
-      await transaction.get(studyInfoRef);
-
-    const flashcardsSnapshot =
-      await transaction.get(flashcardsQuery);
 
     if (!userSnapshot.exists) {
       const error = new Error(
@@ -1985,61 +1976,12 @@ async function deleteSubjectWithQuota({
       throw error;
     }
 
-    if (flashcardsSnapshot.size > 450) {
-      const error = new Error(
-        'A matéria possui flashcards demais para exclusão transacional.',
-      );
-
-      error.statusCode = 409;
-      error.code =
-        'SUBJECT_DELETE_TOO_MANY_FLASHCARDS';
-
-      throw error;
-    }
-
-    const studyInfoData =
-      studyInfoSnapshot.data() ?? {};
-
-    const rawReviewQueue =
-      studyInfoData.reviewQueue;
-
-    const currentReviewQueue =
-      typeof rawReviewQueue === 'number' &&
-      Number.isInteger(rawReviewQueue) &&
-      rawReviewQueue >= 0
-        ? rawReviewQueue
-        : 0;
-
-    const newReviewQueue =
-      Math.max(
-        0,
-        currentReviewQueue - flashcardsSnapshot.size,
-      );
-
     persistSyncTombstone(
       transaction, tombstoneRef, tombstoneSnapshot, 'subjects', subjectId,
     );
 
-    for (const flashcardDoc of flashcardsSnapshot.docs) {
-      transaction.delete(
-        flashcardDoc.ref,
-      );
-    }
-
     transaction.delete(
       subjectRef,
-    );
-
-    transaction.set(
-      studyInfoRef,
-      {
-        reviewQueue: newReviewQueue,
-        updatedAt:
-          FieldValue.serverTimestamp(),
-      },
-      {
-        merge: true,
-      },
     );
 
     transaction.update(
@@ -2056,12 +1998,46 @@ async function deleteSubjectWithQuota({
 
     return {
       alreadyDeleted: false,
-      deletedFlashcards:
-        flashcardsSnapshot.size,
-      reviewQueue:
-        newReviewQueue,
     };
   });
+
+  // Phase 2 is resumable: remaining documents are the durable progress state.
+  // Each chunk commits its deletes and reviewQueue adjustment atomically.
+  let deletedFlashcards = 0;
+  let reviewQueue;
+  for (;;) {
+    const chunk = await db.runTransaction(async (transaction) => {
+      const studyInfoSnapshot = await transaction.get(studyInfoRef);
+      const flashcardsSnapshot = await transaction.get(flashcardsQuery);
+
+      if (flashcardsSnapshot.size === 0) return { deleted: 0 };
+
+      const rawReviewQueue = studyInfoSnapshot.data()?.reviewQueue;
+      const currentReviewQueue =
+        typeof rawReviewQueue === 'number' &&
+        Number.isInteger(rawReviewQueue) &&
+        rawReviewQueue >= 0
+          ? rawReviewQueue
+          : 0;
+      const newReviewQueue = Math.max(0, currentReviewQueue - flashcardsSnapshot.size);
+
+      for (const flashcardDoc of flashcardsSnapshot.docs) {
+        transaction.delete(flashcardDoc.ref);
+      }
+      transaction.set(studyInfoRef, {
+        reviewQueue: newReviewQueue,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      return { deleted: flashcardsSnapshot.size, reviewQueue: newReviewQueue };
+    });
+
+    if (chunk.deleted === 0) break;
+    deletedFlashcards += chunk.deleted;
+    reviewQueue = chunk.reviewQueue;
+  }
+
+  return { ...deletion, deletedFlashcards, reviewQueue };
 }
 async function createGoalWithQuota({
   userId,

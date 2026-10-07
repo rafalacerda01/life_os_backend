@@ -70,7 +70,7 @@ const operations = [
 function collection(path) {
   return {
     doc: id => document(`${path}/${id}`),
-    where: () => ({ path, query: true }),
+    where: () => ({ path, query: true, limit: () => ({ path, query: true }) }),
   };
 }
 
