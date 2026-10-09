@@ -88,6 +88,8 @@ const GOALS_PREMIUM_LIMIT = 30;
 const SUBJECTS_FREE_LIMIT = 3;
 const SUBJECTS_PREMIUM_LIMIT = 30;
 const SUBJECT_DELETE_FLASHCARD_CHUNK_SIZE = 200;
+// Includes size rejections; a later invocation resumes from remaining cards.
+const SUBJECT_DELETE_MAX_CHUNK_TRANSACTIONS = 64;
 
 const MAX_SUBJECT_TITLE_LENGTH = 200;
 const MAX_SUBJECT_ID_LENGTH = 128;
@@ -1901,6 +1903,15 @@ async function createSubjectWithQuota({
   });
 }
 
+function isSubjectDeleteTransactionSizeError(error) {
+  // INVALID_ARGUMENT alone is not sufficient (e.g. invalid queries). The SDK
+  // exposes the backend diagnostic as details, or a prefixed gRPC message.
+  if (error?.code !== 3) return false;
+  const diagnostic = typeof error.details === 'string' ? error.details : error.message;
+  return typeof diagnostic === 'string' &&
+    /^(?:3 INVALID_ARGUMENT: )?Transaction too big\. Decrease transaction size\.$/.test(diagnostic);
+}
+
 async function deleteSubjectWithQuota({
   userId,
   subjectId,
@@ -1917,8 +1928,7 @@ async function deleteSubjectWithQuota({
   const flashcardsQuery =
     userRef
       .collection('review_queue')
-      .where('subjectId', '==', subjectId)
-      .limit(SUBJECT_DELETE_FLASHCARD_CHUNK_SIZE);
+      .where('subjectId', '==', subjectId);
 
   const tombstoneRef = syncTombstoneRef(userRef, 'subjects', subjectId);
 
@@ -2005,39 +2015,50 @@ async function deleteSubjectWithQuota({
   // Each chunk commits its deletes and reviewQueue adjustment atomically.
   let deletedFlashcards = 0;
   let reviewQueue;
-  for (;;) {
-    const chunk = await db.runTransaction(async (transaction) => {
-      const studyInfoSnapshot = await transaction.get(studyInfoRef);
-      const flashcardsSnapshot = await transaction.get(flashcardsQuery);
+  let chunkSize = SUBJECT_DELETE_FLASHCARD_CHUNK_SIZE;
+  for (let chunkAttempt = 0; chunkAttempt < SUBJECT_DELETE_MAX_CHUNK_TRANSACTIONS; chunkAttempt++) {
+    let chunk;
+    try {
+      chunk = await db.runTransaction(async (transaction) => {
+        const studyInfoSnapshot = await transaction.get(studyInfoRef);
+        const flashcardsSnapshot = await transaction.get(flashcardsQuery.limit(chunkSize));
 
-      if (flashcardsSnapshot.size === 0) return { deleted: 0 };
+        if (flashcardsSnapshot.size === 0) return { deleted: 0 };
 
-      const rawReviewQueue = studyInfoSnapshot.data()?.reviewQueue;
-      const currentReviewQueue =
-        typeof rawReviewQueue === 'number' &&
-        Number.isInteger(rawReviewQueue) &&
-        rawReviewQueue >= 0
-          ? rawReviewQueue
-          : 0;
-      const newReviewQueue = Math.max(0, currentReviewQueue - flashcardsSnapshot.size);
+        const rawReviewQueue = studyInfoSnapshot.data()?.reviewQueue;
+        const currentReviewQueue =
+          typeof rawReviewQueue === 'number' &&
+          Number.isInteger(rawReviewQueue) &&
+          rawReviewQueue >= 0
+            ? rawReviewQueue
+            : 0;
+        const newReviewQueue = Math.max(0, currentReviewQueue - flashcardsSnapshot.size);
 
-      for (const flashcardDoc of flashcardsSnapshot.docs) {
-        transaction.delete(flashcardDoc.ref);
-      }
-      transaction.set(studyInfoRef, {
-        reviewQueue: newReviewQueue,
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
+        for (const flashcardDoc of flashcardsSnapshot.docs) {
+          transaction.delete(flashcardDoc.ref);
+        }
+        transaction.set(studyInfoRef, {
+          reviewQueue: newReviewQueue,
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
 
-      return { deleted: flashcardsSnapshot.size, reviewQueue: newReviewQueue };
-    });
+        return { deleted: flashcardsSnapshot.size, reviewQueue: newReviewQueue };
+      });
+    } catch (error) {
+      if (!isSubjectDeleteTransactionSizeError(error) || chunkSize === 1) throw error;
+      // Strictly decreases (at most seven reductions), never reusing writes or
+      // snapshots from a rejected transaction and never repeating phase 1.
+      chunkSize = Math.max(1, Math.floor(chunkSize / 2));
+      continue;
+    }
 
-    if (chunk.deleted === 0) break;
+    if (chunk.deleted === 0) return { ...deletion, deletedFlashcards, reviewQueue };
     deletedFlashcards += chunk.deleted;
     reviewQueue = chunk.reviewQueue;
   }
 
-  return { ...deletion, deletedFlashcards, reviewQueue };
+  // The existing handler sanitizes this to retryable HTTP 500, without an ACK.
+  throw new Error('Subject cleanup transaction budget exhausted.');
 }
 async function createGoalWithQuota({
   userId,
