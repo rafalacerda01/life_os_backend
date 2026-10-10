@@ -13,6 +13,7 @@ import {
 } from './activity/_sync_updates.js';
 import { checkDistributedRateLimit } from './_distributed_rate_limit.js';
 import { hasValidGooglePlayPremium } from './billing/google/_entitlement.js';
+import { syncWater, waterErrorResponse, WATER_V2_ENABLED } from './health/_sync_water.js';
 import {
   applyStudyActivity,
   validateStudyActivityPayload,
@@ -2835,6 +2836,17 @@ export async function syncHandler(req, res, runtime = {}) {
     // ------------------------------------------------------------------------
 
     const operation = rawBody.operation;
+    if (operation === 'increment_water' || operation === 'reconcile_water') {
+      try {
+        const result = await syncWater({ db, userId, body: rawBody,
+          enabled: runtime.waterV2Enabled ?? WATER_V2_ENABLED });
+        return res.status(200).json({ success: true, operation, ...result });
+      } catch (error) {
+        console.error('[sync] Falha ao sincronizar hidratação V2.');
+        const response = waterErrorResponse(error);
+        return res.status(response.status).json(response.body);
+      }
+    }
     if (
       operation === 'update_task' ||
       operation === 'update_habit' ||
