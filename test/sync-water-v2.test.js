@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
 import { getApps, initializeApp } from 'firebase-admin/app';
@@ -25,7 +26,7 @@ const GUARD = `account_deletion_guards/${UID}`;
 const receiptPath = id => `${USER}/water_increment_receipts/${id}`;
 const increment = (id = A, overrides = {}) => ({ operation: 'increment_water', version: 2,
   mutationId: id, healthDay: DAY, deltaMl: 250, occurredAt: `${DAY}T10:00:00.000Z`,
-  timeZoneOffsetMinutes: 0, ...overrides });
+  timeZoneOffsetMinutes: 0, originEpoch: EPOCH, ...overrides });
 const reconcile = (ids = [], overrides = {}) => ({ operation: 'reconcile_water', version: 2,
   healthDay: DAY, pendingMutationIds: ids, ...overrides });
 function collection(path) { return { doc: id => document(`${path}/${id}`) }; }
@@ -123,6 +124,36 @@ function rejected(res, status, code) { assert.equal(res.statusCode, status); if 
 function unchanged(f, before) { assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, 0); }
 const check = (name, fn) => test(name, { timeout: 5000 }, fn);
 
+function recognizedReceipt(receipt) {
+  return { mutationId: receipt.mutationId, healthDay: receipt.healthDay,
+    deltaMl: receipt.deltaMl, occurredAt: receipt.occurredAt,
+    timeZoneOffsetMinutes: receipt.timeZoneOffsetMinutes, fingerprint: receipt.fingerprint,
+    effectiveCreditMl: receipt.effectiveCreditMl, appliedRevision: receipt.revision };
+}
+
+check('R2C originEpoch is required before any transaction', async t => {
+  const f = fixture(t); const before = [...f.docs]; const body = increment();
+  delete body.originEpoch;
+  rejected(await f.invoke(body), 400, 'WATER_INVALID_PAYLOAD');
+  unchanged(f, before); assert.equal(f.attempts.length, 0);
+});
+check('R2C recognized returns the complete original receipt identity', async t => {
+  const f = fixture(t); success(await f.invoke());
+  const before = [...f.docs]; const writeCount = f.writes.length;
+  const result = success(await f.invoke(reconcile([A], { expectedEpoch: EPOCH, expectedRevision: 1 })));
+  assert.deepEqual(result.recognized, [recognizedReceipt(f.docs.get(receiptPath(A)))]);
+  assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, writeCount);
+});
+check('R2C known revision zero reconciles the current revision after a lost response', async t => {
+  const f = fixture(t); success(await f.invoke());
+  const before = [...f.docs]; const writeCount = f.writes.length;
+  const result = success(await f.invoke(reconcile([A, C], { expectedEpoch: EPOCH, expectedRevision: 0 })));
+  assert.equal(result.revision, 1); assert.equal(result.waterIntakeMl, 1250);
+  assert.deepEqual(result.recognized, [recognizedReceipt(f.docs.get(receiptPath(A)))]);
+  assert.deepEqual(result.unrecognizedMutationIds, [C]);
+  assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, writeCount);
+});
+
 check('first 250ml increment commits state, projection and durable receipt only', async t => {
   const f = fixture(t, 0);
   const result = success(await f.invoke());
@@ -207,15 +238,15 @@ check('zero-credit receipt never earns new credit after incompatible epoch chang
   f.put(ACTIVATION, { ...f.docs.get(ACTIVATION), epoch: OTHER_EPOCH });
   f.put(STATE, { ...f.docs.get(STATE), epoch: OTHER_EPOCH, waterIntakeMl: 0, revision: 0 });
   f.put(PROJECTION, { ...f.docs.get(PROJECTION), waterIntakeMl: 0 });
-  rejected(await f.invoke(), 409, 'WATER_SNAPSHOT_MISMATCH'); assert.equal(f.total(), 0); assert.equal(f.writes.length, 3);
+  rejected(await f.invoke(), 409, 'WATER_EPOCH_MISMATCH'); assert.equal(f.total(), 0); assert.equal(f.writes.length, 3);
 });
 check('reconcile returns applied memberships and missing IDs from a read-only snapshot', async t => {
   const f = fixture(t); await f.invoke(); await f.invoke(increment(B));
   const result = success(await f.invoke(reconcile([A, C, B], { expectedEpoch: EPOCH, expectedRevision: 2 })));
   assert.deepEqual(result, { success: true, operation: 'reconcile_water', version: 2,
     healthDay: DAY, epoch: EPOCH, revision: 2, waterIntakeMl: 1500, complete: true,
-    recognized: [{ mutationId: A, effectiveCreditMl: 250, appliedRevision: 1 },
-      { mutationId: B, effectiveCreditMl: 250, appliedRevision: 2 }], unrecognizedMutationIds: [C] });
+    recognized: [recognizedReceipt(f.docs.get(receiptPath(A))),
+      recognizedReceipt(f.docs.get(receiptPath(B)))], unrecognizedMutationIds: [C] });
   assert.equal(f.writes.length, 6); assert.equal(f.attempts.at(-1).pending.length, 0);
 });
 check('reconcile retries if a concurrent increment changes its snapshot', async t => {
@@ -474,4 +505,223 @@ check('V1 create/replay keeps its existing response, writes and quota with V2 di
   assert.equal(f.docs.get(USER).tasksCount, 1); assert.equal(f.writes.length, 2);
   success(await f.invoke(body, { disabled: true })); assert.equal(f.docs.get(USER).tasksCount, 1); assert.equal(f.writes.length, 2);
   assert.deepEqual([f.docs.get(STATE), f.docs.get(PROJECTION), f.docs.get(ACTIVATION)], waterBefore);
+});
+
+for (const originEpoch of [undefined, null, '', 'legacy', A.toUpperCase(),
+  'aaaaaaaa-aaaa-1aaa-8aaa-aaaaaaaaaaaa', 'aaaaaaaa-aaaa-4aaa-7aaa-aaaaaaaaaaaa',
+  ` ${EPOCH}`, `${EPOCH} `, 2, {}, []]) {
+  check(`R2C malformed originEpoch ${JSON.stringify(originEpoch)} is rejected before reads`, async t => {
+    const f = fixture(t); const before = [...f.docs];
+    rejected(await f.invoke(increment(A, { originEpoch })), 400, 'WATER_INVALID_PAYLOAD');
+    unchanged(f, before); assert.equal(f.attempts.length, 0);
+  });
+}
+check('R2C valid epoch fence leaves origin out of durable fingerprint and receipt schema', async t => {
+  const f = fixture(t); const result = success(await f.invoke());
+  assert.equal(result.epoch, EPOCH); assert.equal(result.alreadyApplied, false);
+  const receipt = f.docs.get(receiptPath(A));
+  assert.equal(Object.hasOwn(receipt, 'originEpoch'), false);
+  assert.equal(receipt.epoch, EPOCH);
+  const canonical = `[2,"${A}","${DAY}",250,"${DAY}T10:00:00.000Z",0]`;
+  assert.equal(JSON.stringify([2, receipt.mutationId, receipt.healthDay, receipt.deltaMl,
+    receipt.occurredAt, receipt.timeZoneOffsetMinutes]), canonical);
+  assert.equal(receipt.fingerprint, '4746ff0a42ce8ecf80440c58f92e321904a8308463998482ec8af640cd36fe44');
+  assert.equal(createHash('sha256').update(canonical, 'utf8').digest('hex'), receipt.fingerprint);
+  const before = [...f.docs]; const count = f.writes.length;
+  assert.equal(success(await f.invoke()).alreadyApplied, true);
+  assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, count);
+});
+for (const hadReceipt of [false, true]) {
+  check(`R2C rotated epoch blocks old ${hadReceipt ? 'receipt replay' : 'unsent intent'} with no writes`, async t => {
+    const f = fixture(t); if (hadReceipt) success(await f.invoke());
+    f.put(ACTIVATION, { ...f.docs.get(ACTIVATION), epoch: OTHER_EPOCH });
+    f.put(STATE, { protocolVersion: 2, epoch: OTHER_EPOCH, revision: 0, waterIntakeMl: 0 });
+    f.put(PROJECTION, { ...f.docs.get(PROJECTION), waterIntakeMl: 0 });
+    const before = [...f.docs]; const count = f.writes.length;
+    const res = await f.invoke(); rejected(res, 409, 'WATER_EPOCH_MISMATCH');
+    assert.equal(res.body.retryable, true);
+    assert.doesNotMatch(JSON.stringify(res.body), new RegExp(`${UID}|${EPOCH}|${OTHER_EPOCH}|${A}`));
+    assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, count);
+    assert.equal(f.total(), 0); assert.equal(f.revision(), 0);
+    assert.equal(f.docs.has(receiptPath(A)), hadReceipt);
+    assert.equal(f.attempts.at(-1).pending.length, 0);
+    if (hadReceipt) {
+      // Even spoofing the new origin cannot reuse an old-epoch durable UUID.
+      rejected(await f.invoke(increment(A, { originEpoch: OTHER_EPOCH })), 409, 'WATER_SNAPSHOT_MISMATCH');
+      assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, count);
+    } else {
+      const valid = success(await f.invoke(increment(B, { originEpoch: OTHER_EPOCH })));
+      assert.equal(valid.epoch, OTHER_EPOCH); assert.equal(valid.waterIntakeMl, 250);
+    }
+  });
+}
+for (const hadReceipt of [false, true]) {
+  check(`R2C concurrent marker rotation forces retry and fences ${hadReceipt ? 'replay' : 'new credit'}`, async t => {
+    const f = fixture(t); if (hadReceipt) success(await f.invoke());
+    const count = f.writes.length; const hold = gate();
+    f.hooks.beforeCommit = async record => {
+      if (record.label === 'rotating' && record.attempt === 1) await hold.hold();
+    };
+    const pending = f.invoke(increment(), { label: 'rotating' });
+    await hold.reached;
+    f.put(ACTIVATION, { ...f.docs.get(ACTIVATION), epoch: OTHER_EPOCH });
+    f.put(STATE, { protocolVersion: 2, epoch: OTHER_EPOCH, revision: 0, waterIntakeMl: 0 });
+    f.put(PROJECTION, { ...f.docs.get(PROJECTION), waterIntakeMl: 0 });
+    const rotated = [...f.docs]; hold.release();
+    const res = await pending; rejected(res, 409, 'WATER_EPOCH_MISMATCH');
+    assert.equal(res.body.retryable, true);
+    assert.equal(f.conflicts.length, 1); assert.ok(f.conflicts[0].paths.includes(ACTIVATION));
+    const attempts = f.attempts.filter(record => record.label === 'rotating');
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts[0].pending.length, hadReceipt ? 0 : 3);
+    assert.equal(attempts[1].pending.length, 0);
+    assert.deepEqual([...f.docs], rotated); assert.equal(f.writes.length, count);
+    assert.equal(f.docs.has(receiptPath(A)), hadReceipt);
+  });
+}
+check('R2C epoch rotated during marker read cannot commit the initial snapshot', async t => {
+  const f = fixture(t); const hold = gate();
+  f.hooks.onRead = async record => {
+    if (record.attempt === 1 && record.path === ACTIVATION) await hold.hold();
+  };
+  const pending = f.invoke(); await hold.reached;
+  f.put(ACTIVATION, { ...f.docs.get(ACTIVATION), epoch: OTHER_EPOCH });
+  const rotated = [...f.docs]; hold.release();
+  rejected(await pending, 409, 'WATER_EPOCH_MISMATCH');
+  unchanged(f, rotated); assert.deepEqual(f.conflicts[0].paths, [ACTIVATION]);
+  assert.equal(f.attempts.length, 2); assert.equal(f.attempts[1].pending.length, 0);
+});
+for (const knownRevision of [0, 1, 2]) {
+  check(`R2C lost response and another increment reconcile from revision floor ${knownRevision}`, async t => {
+    const f = fixture(t);
+    f.hooks.afterCommit = async () => { throw new Error('fake lost-response secret'); };
+    rejected(await f.invoke(), 503, 'WATER_FIRESTORE_UNAVAILABLE');
+    assert.equal(f.total(), 1250); assert.equal(f.revision(), 1);
+    delete f.hooks.afterCommit; success(await f.invoke(increment(B)));
+    const before = [...f.docs]; const count = f.writes.length;
+    const res = success(await f.invoke(reconcile([B, C, A], { expectedEpoch: EPOCH, expectedRevision: knownRevision })));
+    assert.equal(res.revision, 2); assert.equal(res.waterIntakeMl, 1500);
+    assert.deepEqual(res.recognized, [recognizedReceipt(f.docs.get(receiptPath(B))), recognizedReceipt(f.docs.get(receiptPath(A)))]);
+    assert.deepEqual(res.unrecognizedMutationIds, [C]);
+    assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, count);
+    assert.equal(f.attempts.at(-1).pending.length, 0);
+  });
+}
+check('R2C current remote revision below the known lower bound is rejected without writes', async t => {
+  const f = fixture(t); success(await f.invoke()); const before = [...f.docs];
+  const res = await f.invoke(reconcile([A], { expectedEpoch: EPOCH, expectedRevision: 2 }));
+  rejected(res, 409, 'WATER_SNAPSHOT_MISMATCH'); assert.equal(res.body.retryable, true);
+  assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, 3);
+  assert.equal(f.attempts.at(-1).pending.length, 0);
+});
+check('R2C reconcile returns a newer consistent snapshot after transactional retry', async t => {
+  const f = fixture(t); success(await f.invoke()); const hold = gate();
+  f.hooks.beforeCommit = async record => {
+    if (record.label === 'reconcile' && record.attempt === 1) await hold.hold();
+  };
+  const pending = f.invoke(reconcile([A, B, C], { expectedEpoch: EPOCH, expectedRevision: 1 }), { label: 'reconcile' });
+  await hold.reached; success(await f.invoke(increment(B))); const before = [...f.docs]; hold.release();
+  const res = success(await pending);
+  assert.equal(res.revision, 2); assert.equal(res.waterIntakeMl, 1500);
+  assert.deepEqual(res.recognized, [recognizedReceipt(f.docs.get(receiptPath(A))), recognizedReceipt(f.docs.get(receiptPath(B)))]);
+  assert.deepEqual(res.unrecognizedMutationIds, [C]); assert.equal(res.complete, true);
+  assert.equal(f.conflicts.length, 1); assert.deepEqual([...f.docs], before);
+  assert.equal(f.writes.length, 6);
+  assert.ok(f.attempts.filter(record => record.label === 'reconcile').every(record => record.pending.length === 0));
+});
+check('R2C reconcile epoch still must match after concurrent rotation and retry', async t => {
+  const f = fixture(t); const hold = gate();
+  f.hooks.beforeCommit = async record => { if (record.attempt === 1) await hold.hold(); };
+  const pending = f.invoke(reconcile([A], { expectedEpoch: EPOCH, expectedRevision: 0 }));
+  await hold.reached;
+  f.put(ACTIVATION, { ...f.docs.get(ACTIVATION), epoch: OTHER_EPOCH });
+  f.put(STATE, { ...f.docs.get(STATE), epoch: OTHER_EPOCH });
+  const before = [...f.docs]; hold.release();
+  rejected(await pending, 409, 'WATER_SNAPSHOT_MISMATCH'); unchanged(f, before);
+  assert.equal(f.conflicts.length, 1); assert.equal(f.attempts.length, 2);
+});
+
+const tamperedIdentity = [
+  { mutationId: B }, { occurredAt: `${DAY}T11:00:00.000Z` }, { timeZoneOffsetMinutes: -180 },
+  { healthDay: '2026-08-22', occurredAt: '2026-08-22T10:00:00.000Z' },
+  { fingerprint: 'f'.repeat(64) }, { fingerprint: null },
+  { fingerprint: '4746FF0A42CE8ECF80440C58F92E321904A8308463998482EC8AF640CD36FE44' },
+  { appliedAt: null }, { extra: 'untrusted' }, { revision: Number.MAX_SAFE_INTEGER + 1 },
+];
+for (const change of tamperedIdentity) {
+  check(`R2C full receipt identity tampering ${JSON.stringify(change)} fails closed`, async t => {
+    const f = fixture(t); success(await f.invoke());
+    f.put(receiptPath(A), { ...f.docs.get(receiptPath(A)), ...change });
+    const before = [...f.docs]; const count = f.writes.length;
+    const res = await f.invoke(reconcile([C, A], { expectedEpoch: EPOCH, expectedRevision: 0 }));
+    rejected(res, 409, 'WATER_INVALID_REMOTE_STATE'); assert.equal(res.body.retryable, true);
+    assert.equal(Object.hasOwn(res.body, 'recognized'), false);
+    assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, count);
+  });
+}
+for (const credit of [0, 100]) {
+  check(`R2C valid-range credit ${credit} is inconsistent away from cap`, async t => {
+    const f = fixture(t); success(await f.invoke());
+    f.put(receiptPath(A), { ...f.docs.get(receiptPath(A)), effectiveCreditMl: credit });
+    const before = [...f.docs];
+    rejected(await f.invoke(reconcile([A])), 409, 'WATER_INVALID_REMOTE_STATE');
+    rejected(await f.invoke(), 409, 'WATER_INVALID_REMOTE_STATE');
+    assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, 3);
+  });
+}
+for (const [initial, credit] of [[999900, 100], [1000000, 0]]) {
+  check(`R2C recognized preserves valid cap credit ${credit} and original appliedRevision`, async t => {
+    const f = fixture(t, initial); success(await f.invoke()); success(await f.invoke(increment(B)));
+    const before = [...f.docs]; const res = success(await f.invoke(reconcile([A], { expectedEpoch: EPOCH, expectedRevision: 0 })));
+    assert.deepEqual(res.recognized, [recognizedReceipt(f.docs.get(receiptPath(A)))]);
+    assert.equal(res.recognized[0].effectiveCreditMl, credit);
+    assert.equal(res.recognized[0].appliedRevision, 1); assert.equal(res.revision, 2);
+    assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, 6);
+  });
+}
+check('R2C a valid receipt under the wrong UUID path is never recognized', async t => {
+  const f = fixture(t); success(await f.invoke()); f.put(receiptPath(B), f.docs.get(receiptPath(A)));
+  const before = [...f.docs];
+  rejected(await f.invoke(reconcile([B])), 409, 'WATER_INVALID_REMOTE_STATE');
+  assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, 3);
+});
+check('R2C 100 queried UUIDs are partitioned completely without duplicates or foreign receipts', async t => {
+  const f = fixture(t);
+  const ids = Array.from({ length: 100 }, (_, i) => `${i.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`);
+  success(await f.invoke()); // Existing unrequested UUID must stay out of response.
+  for (const id of ids.filter((_, i) => i % 2 === 0)) success(await f.invoke(increment(id)));
+  const before = [...f.docs]; const count = f.writes.length;
+  const res = success(await f.invoke(reconcile(ids, { expectedEpoch: EPOCH, expectedRevision: 0 })));
+  assert.equal(res.recognized.length, 50); assert.equal(res.unrecognizedMutationIds.length, 50);
+  const output = [...res.recognized.map(receipt => receipt.mutationId), ...res.unrecognizedMutationIds];
+  assert.equal(new Set(output).size, 100); assert.deepEqual(output.toSorted(), ids.toSorted());
+  assert.ok(!output.includes(A)); assert.equal(res.revision, 51); assert.equal(res.waterIntakeMl, 13750);
+  for (const receipt of res.recognized) assert.deepEqual(receipt, recognizedReceipt(f.docs.get(receiptPath(receipt.mutationId))));
+  assert.equal(f.attempts.at(-1).reads.size, 105); assert.equal(f.attempts.at(-1).pending.length, 0);
+  assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, count);
+});
+for (const operation of [increment, reconcile]) {
+  check(`R2C ${operation.name} client fingerprint is never accepted as evidence`, async t => {
+    const f = fixture(t); const before = [...f.docs];
+    rejected(await f.invoke({ ...operation(), fingerprint: 'f'.repeat(64) }), 400, 'WATER_INVALID_PAYLOAD');
+    unchanged(f, before); assert.equal(f.attempts.length, 0);
+  });
+  check(`R2C ${operation.name} shared Auth and App Check remain mandatory`, async t => {
+    const f = fixture(t);
+    rejected(await f.invoke(operation(), { headers: { authorization: undefined } }), 401);
+    rejected(await f.invoke(operation(), { headers: { 'x-firebase-appcheck': undefined } }), 401, 'APP_CHECK_REQUIRED');
+    assert.equal(f.writes.length, 0); assert.equal(f.attempts.length, 0);
+  });
+}
+check('R2C storage cannot forge the new epoch error or leak secrets to response or logs', async t => {
+  const f = fixture(t); const before = [...f.docs]; const logged = [];
+  t.mock.method(console, 'error', (...args) => logged.push(args));
+  f.hooks.beforeCommit = async () => {
+    throw Object.assign(new Error('fake-secret-token users/third-party internal-stack'),
+      { code: 'WATER_EPOCH_MISMATCH', status: 409, retryable: true });
+  };
+  const res = await f.invoke(); rejected(res, 503, 'WATER_FIRESTORE_UNAVAILABLE');
+  assert.equal(res.body.retryable, true);
+  assert.doesNotMatch(JSON.stringify([res.body, logged]), /fake-secret|third-party|internal-stack/);
+  assert.deepEqual(logged, [['[sync] Falha ao sincronizar hidratação V2.']]); unchanged(f, before);
 });

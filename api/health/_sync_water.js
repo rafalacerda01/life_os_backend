@@ -7,7 +7,7 @@ export const WATER_V2_ENABLED = false;
 const MAX_WATER_ML = 1_000_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const INCREMENT_KEYS = ['operation', 'version', 'mutationId', 'healthDay',
-  'deltaMl', 'occurredAt', 'timeZoneOffsetMinutes'];
+  'deltaMl', 'occurredAt', 'timeZoneOffsetMinutes', 'originEpoch'];
 const RECONCILE_KEYS = ['operation', 'version', 'healthDay', 'pendingMutationIds'];
 const ERRORS = Object.freeze({
   WATER_INVALID_PAYLOAD: [400, false, 'Payload de hidratação inválido.'],
@@ -18,6 +18,7 @@ const ERRORS = Object.freeze({
   WATER_MIGRATION_NOT_READY: [503, true, 'Hidratação V2 ainda não preparada.'],
   WATER_INVALID_REMOTE_STATE: [409, true, 'Estado de hidratação inconsistente.'],
   WATER_SNAPSHOT_MISMATCH: [409, true, 'Snapshot de hidratação incompatível.'],
+  WATER_EPOCH_MISMATCH: [409, true, 'Origem de hidratação incompatível com o protocolo atual.'],
   WATER_FIRESTORE_UNAVAILABLE: [503, true, 'Não foi possível sincronizar hidratação.'],
 });
 class WaterError extends Error {
@@ -59,7 +60,7 @@ function validIntent(value) {
 function validate(body) {
   if (!object(body) || body.version !== 2 || !day(body.healthDay)) fail('WATER_INVALID_PAYLOAD');
   if (body.operation === 'increment_water') {
-    if (!exact(body, INCREMENT_KEYS) || !validIntent(body)) fail('WATER_INVALID_PAYLOAD');
+    if (!exact(body, INCREMENT_KEYS) || !validIntent(body) || !uuid(body.originEpoch)) fail('WATER_INVALID_PAYLOAD');
   } else if (body.operation === 'reconcile_water') {
     const optional = ['expectedEpoch', 'expectedRevision'].filter(key => Object.hasOwn(body, key));
     if (!exact(body, [...RECONCILE_KEYS, ...optional]) ||
@@ -95,6 +96,11 @@ function validateReceipt(receipt, mutationId, state, healthDay) {
   validateReceiptIdentity(receipt, mutationId);
   if (receipt.epoch !== state.epoch || receipt.healthDay !== healthDay || receipt.revision > state.revision) {
     fail('WATER_SNAPSHOT_MISMATCH');
+  }
+  // Water is monotonic within an epoch. Partial/zero credits only occur at cap.
+  if (receipt.effectiveCreditMl > state.waterIntakeMl ||
+      (receipt.effectiveCreditMl < 250 && state.waterIntakeMl !== MAX_WATER_ML)) {
+    fail('WATER_INVALID_REMOTE_STATE');
   }
 }
 function snapshot(state, healthDay) {
@@ -137,6 +143,11 @@ export async function syncWater({ db, userId, body, enabled = WATER_V2_ENABLED }
     if (!exact(active, ['protocolVersion', 'epoch', 'status', 'legacyWritesBlocked']) ||
         active.protocolVersion !== 2 || !uuid(active.epoch) || active.status !== 'ACTIVE' ||
         active.legacyWritesBlocked !== true) fail('WATER_MIGRATION_NOT_READY');
+    // A condition on the authoritative marker, never a choice of server epoch.
+    // Re-executed on Firestore transaction retry before any buffered write.
+    if (body.operation === 'increment_water' && body.originEpoch !== active.epoch) {
+      fail('WATER_EPOCH_MISMATCH');
+    }
     // A UUID is account-wide, so divergent reuse must conflict even if the new
     // requested day has not been provisioned. Account/activation checks precede
     // this; a receipt never grants permission to a deleted or inactive account.
@@ -152,15 +163,19 @@ export async function syncWater({ db, userId, body, enabled = WATER_V2_ENABLED }
         projection.waterIntakeMl !== state.waterIntakeMl) fail('WATER_INVALID_REMOTE_STATE');
     if (body.operation === 'reconcile_water') {
       if ((Object.hasOwn(body, 'expectedEpoch') && body.expectedEpoch !== state.epoch) ||
-          (Object.hasOwn(body, 'expectedRevision') && body.expectedRevision !== state.revision)) fail('WATER_SNAPSHOT_MISMATCH');
+          // A known lower bound: a lost response may have advanced the server.
+          (Object.hasOwn(body, 'expectedRevision') && body.expectedRevision > state.revision)) fail('WATER_SNAPSHOT_MISMATCH');
       const recognized = [];
       const unrecognizedMutationIds = [];
       receiptDocs.forEach((doc, index) => {
         if (!doc.exists) { unrecognizedMutationIds.push(ids[index]); return; }
         const receipt = doc.data();
         validateReceipt(receipt, ids[index], state, body.healthDay);
-        recognized.push({ mutationId: ids[index], effectiveCreditMl: receipt.effectiveCreditMl,
-          appliedRevision: receipt.revision });
+        // All identity fields come from the validated durable remote receipt.
+        recognized.push({ mutationId: receipt.mutationId, healthDay: receipt.healthDay,
+          deltaMl: receipt.deltaMl, occurredAt: receipt.occurredAt,
+          timeZoneOffsetMinutes: receipt.timeZoneOffsetMinutes, fingerprint: receipt.fingerprint,
+          effectiveCreditMl: receipt.effectiveCreditMl, appliedRevision: receipt.revision });
       });
       return { ...snapshot(state, body.healthDay), complete: true, recognized, unrecognizedMutationIds };
     }
