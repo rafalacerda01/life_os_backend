@@ -113,8 +113,13 @@ export function createWaterProvisioningTestHarness({ db, uid, runId, now = () =>
         admission.runId !== runId || admission.policy !== 'NEW_ACCOUNT_V2_ONLY' ||
         admission.legacyWritersExcluded !== true || !dayValid(admission.initialHealthDay) ||
         !time(admission.issuedAt) || !time(root.createTime) || !time(admissionDoc.createTime) ||
-        !admission.issuedAt.isEqual(root.createTime) || !admissionDoc.createTime.isEqual(root.createTime) ||
-        admission.issuedAt.toMillis() > clock.toMillis()) fail('WATER_PROVISION_UNAUTHORIZED');
+        !admissionDoc.createTime.isEqual(root.createTime) ||
+        admission.issuedAt.seconds > clock.seconds ||
+        (admission.issuedAt.seconds === clock.seconds && admission.issuedAt.nanoseconds > clock.nanoseconds)) {
+        fail('WATER_PROVISION_UNAUTHORIZED');
+      }
+      // issuedAt is the server's processing time, not creation metadata. It must
+      // be valid/non-future; atomic origin is checked by the two exact createTimes.
       const createdDayMin = new Date(admission.issuedAt.toMillis() - 840 * 60_000).toISOString().slice(0, 10);
       const createdDayMax = new Date(admission.issuedAt.toMillis() + 840 * 60_000).toISOString().slice(0, 10);
       if (admission.initialHealthDay < createdDayMin || admission.initialHealthDay > createdDayMax) {

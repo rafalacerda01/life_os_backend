@@ -549,3 +549,46 @@ check('F1 opening a new later day validates initial S/H once and retains advance
   assert.equal(reads.filter(p => p === H(DAY)).length, 1);
   assert.deepEqual([f.db.docs.get(S(DAY)), f.db.docs.get(H(DAY)), f.db.docs.get(R)], initial);
 });
+
+// H2-R3-E-F2: creation metadata proves the atomic origin; issuedAt is informational.
+for (const issuedAt of [Timestamp.fromMillis(CREATED.toMillis() - 2), Timestamp.fromMillis(CREATED.toMillis() + 2),
+  new Timestamp(CREATED.seconds, CREATED.nanoseconds + 1), new Timestamp(CREATED.seconds - 1, 999999999)]) {
+  check(`F2 equal createTimes admit distinct issuedAt ${issuedAt.seconds}/${issuedAt.nanoseconds}`, async () => {
+    const f = fixture(); f.db.put(E, { ...f.db.docs.get(E), issuedAt });
+    const first = await f.call(), before = [...f.db.docs];
+    assert.equal(first.alreadyProvisioned, false); assert.equal(first.revision, 0); assert.equal(first.waterIntakeMl, 0);
+    assert.equal((await f.call()).epoch, first.epoch); unchanged(f.db, before, 4);
+    assert.equal(f.db.created.get(ROOT).isEqual(f.db.created.get(E)), true);
+    assert.equal(issuedAt.isEqual(f.db.created.get(ROOT)), false);
+  });
+}
+for (const issuedAt of ['malformed', Timestamp.fromMillis(CLOCK.toMillis() + 1), new Timestamp(CLOCK.seconds, CLOCK.nanoseconds + 1)]) {
+  check(`F2 malformed/future issuedAt refuses ${JSON.stringify(issuedAt)}`, async () => {
+    const f = fixture(); f.db.put(E, { ...f.db.docs.get(E), issuedAt }); const before = [...f.db.docs];
+    await rejected(f.call(), 'WATER_PROVISION_UNAUTHORIZED'); unchanged(f.db, before);
+  });
+}
+check('F2 equal millis but different creation nanos cannot admit a later eligibility', async () => {
+  const f = fixture(); f.db.created.set(E, new Timestamp(CREATED.seconds, CREATED.nanoseconds + 1));
+  assert.equal(f.db.created.get(E).toMillis(), f.db.created.get(ROOT).toMillis());
+  const before = [...f.db.docs]; await rejected(f.call(), 'WATER_PROVISION_UNAUTHORIZED'); unchanged(f.db, before);
+});
+check('F2 root recreated with old eligibility refuses without repairing any document', async () => {
+  const f = fixture(); f.db.put(ROOT, undefined); f.db.put(ROOT, {}, Timestamp.fromMillis(CREATED.toMillis() + 1));
+  const before = [...f.db.docs]; await rejected(f.call(), 'WATER_PROVISION_UNAUTHORIZED'); unchanged(f.db, before);
+});
+check('F2 valid distinct issuedAt cannot authorize another UID or runId', async () => {
+  for (const change of [{ uid: 'other-owner' }, { runId: OTHER }]) {
+    const f = fixture(); f.db.put(E, { ...f.db.docs.get(E), issuedAt: Timestamp.fromMillis(CREATED.toMillis() - 1), ...change });
+    const before = [...f.db.docs]; await rejected(f.call(), 'WATER_PROVISION_UNAUTHORIZED'); unchanged(f.db, before);
+  }
+});
+check('F2 valid distinct issuedAt cannot bypass a deletion guard or V1 history', async () => {
+  for (const kind of ['guard', 'V1']) {
+    const f = fixture(); f.db.put(E, { ...f.db.docs.get(E), issuedAt: Timestamp.fromMillis(CREATED.toMillis() - 1) });
+    f.db.put('users/f2-other/health_info/2026-10-13', { date: CREATED, waterIntakeMl: 750 });
+    if (kind === 'guard') f.db.put(G, {}); else f.db.put(H(DAY), { date: CREATED, waterIntakeMl: 0 });
+    const before = [...f.db.docs]; await rejected(f.call(), kind === 'guard' ? 'WATER_ACCOUNT_DELETING' : 'WATER_PROVISION_NOT_ELIGIBLE');
+    unchanged(f.db, before);
+  }
+});
