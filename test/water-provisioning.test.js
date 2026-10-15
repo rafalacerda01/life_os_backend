@@ -43,6 +43,7 @@ function gate() {
 // optimistic fake retries the real callback, discards rejected buffered writes,
 // and catches query phantoms. Real Admin Firestore normally uses pessimistic locks.
 class FakeFirestore {
+  projectId = "demo-life-os";
   docs = new Map(); versions = new Map(); created = new Map();
   attempts = []; conflicts = []; writes = []; hooks = {}; recursiveDeletes = [];
   query(path, group = false, filters = [], limit = Infinity) {
@@ -356,10 +357,21 @@ check('next-day concurrent initialization and increment cannot reset another dev
   const result = await pending; assert.equal(result.revision, 1); assert.equal(result.waterIntakeMl, 250);
   unchanged(f.db, before, count); assert.equal(f.db.conflicts.length, 1);
 });
+function deletionAuth(calls = []) {
+  let present = true;
+  return {
+    async getUser(uid) {
+      assert.equal(uid, UID);
+      if (!present) throw Object.assign(new Error('synthetic absent'), {code: 'auth/user-not-found'});
+      return {uid, metadata: {creationTime: CREATED.toDate().toUTCString()}};
+    },
+    async deleteUser(uid) {assert.equal(uid, UID); calls.push(uid); present = false;},
+  };
+}
 for (const partial of [false, true]) check(`real deleteAccount removes provisioned account tree; partial retry=${partial}`, async () => {
   const f = fixture(); await f.call(); await f.next(); await increment(f);
   f.db.put('users/other-account/health_info/2026-10-13', { date: CREATED, waterIntakeMl: 750 });
-  const calls = [], auth = { deleteUser: async uid => { calls.push(uid); } };
+  const calls = [], auth = deletionAuth(calls);
   if (partial) {
     f.db.partialCleanup = true;
     await assert.rejects(deleteAccount({ db: f.db, auth, uid: UID }), /partial recursive cleanup/);
@@ -377,7 +389,7 @@ check('actual concurrent deletion wins, provision retries without resurrecting d
     if (r.label === 'provision' && r.attempt === 1) await hold.hold();
   };
   const pending = f.call('provision'); await hold.reached;
-  await deleteAccount({ db: f.db, auth: { deleteUser: async () => {} }, uid: UID });
+  await deleteAccount({ db: f.db, auth: deletionAuth(), uid: UID });
   const before = [...f.db.docs], count = f.db.writes.length; hold.release();
   await rejected(pending, 'WATER_USER_NOT_FOUND'); unchanged(f.db, before, count);
   assert.equal(f.db.conflicts.length, 1); assert.equal(f.db.docs.has(A), false);

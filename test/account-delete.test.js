@@ -203,6 +203,7 @@ class FakeTransaction extends FakeWriter {
 
 class FakeFirestore {
   constructor() {
+    this.projectId = "demo-life-os";
     this.store = new Map();
     this.transactions = [];
     this.transactionCount = 0;
@@ -333,6 +334,15 @@ class FakeAuth {
     this.verifyCalls = [];
     this.deleteCalls = [];
     this.deleted = false;
+  }
+
+  async getUser(uid) {
+    if (this.deleted || this.options.absent) {
+      const error = new Error('Auth user absent');
+      error.code = 'auth/user-not-found';
+      throw error;
+    }
+    return { uid };
   }
 
   async verifyIdToken(token, checkRevoked) {
@@ -1245,7 +1255,7 @@ test('ambiguous missing membership state fails closed', async () => {
 
 test('commit transaction rereads a raced memberCount', async () => {
   const db = seedNormalCircle(new FakeFirestore());
-  db.beforeTransactions.set(3, (firestore) => {
+  db.beforeTransactions.set(4, (firestore) => {
     firestore.seed(
       path('circles', CIRCLE_ID, 'members', 'new-user'),
       member('member'),
@@ -1484,7 +1494,7 @@ test('billing index cleanup conflict aborts before Auth and user deletion', asyn
   db.seed(path('users', UID), { activeCircleId: null });
   db.seed(path('billing_google_accounts', accountHash), { uid: UID, state: 'ACTIVE' });
   db.seed(indexPath, { accountHash });
-  db.beforeTransactions.set(3, (firestore) => {
+  db.beforeTransactions.set(4, (firestore) => {
     firestore.seed(indexPath, { accountHash: sha256('other-user') });
   });
   const auth = new FakeAuth({});
@@ -1518,7 +1528,7 @@ test('billing cleanup transport failure retains DELETING barrier without deletin
   const indexPath = path('billing_google_tokens', sha256('token-a'));
   db.seed(path('users', UID), { activeCircleId: null });
   db.seed(indexPath, { accountHash: sha256(UID) });
-  db.beforeTransactions.set(3, () => { throw new Error('private-billing-transport-error'); });
+  db.beforeTransactions.set(4, () => { throw new Error('private-billing-transport-error'); });
   const auth = new FakeAuth({});
 
   await assert.rejects(deleteAccount({ db, auth, uid: UID }));
@@ -1545,7 +1555,7 @@ test('user-tree cleanup failure after Auth leaves billing barrier closed', async
 
 test('missing user evidence fails closed', async () => {
   const db = new FakeFirestore();
-  const auth = new FakeAuth({});
+  const auth = new FakeAuth({}, { absent: true });
   await assert.rejects(
     deleteAccount({ db, auth, uid: UID }),
     (error) => error.code === 'ACCOUNT_STATE_CONFLICT',
@@ -1654,6 +1664,7 @@ test('global history in Circle A and current membership B are both cleaned', asy
     assert.equal(marker.scope, 'GLOBAL_CIRCLE_UID');
     assert.equal(marker.deletionId, db.data(GUARD_PATH).deletionId);
     auth.deleteCalls.push(owner);
+    auth.deleted = true;
   };
   await deleteAccount({db, auth, uid: UID});
   assert.deepEqual(db.data(`${old}/progress/other-user`), foreign);
@@ -1783,9 +1794,9 @@ test('historical sole-admin Circle without activeCircleId is safely removed', as
 });
 
 test('current and legacy challenge attribution is anonymized without deleting shared content', async () => {
-  const db = new FakeFirestore();
-  db.seed(`users/${UID}`, {});
   for (const version of [undefined, 2]) {
+    const db = new FakeFirestore();
+    db.seed(`users/${UID}`, {});
     const key = `circles/shared/challenges/author-${String(version)}`;
     const original = {createdBy: UID, title: 'Shared challenge', targetValue: 100};
     if (version) original.schemaVersion = version;
@@ -1794,7 +1805,6 @@ test('current and legacy challenge attribution is anonymized without deleting sh
     await deleteAccount({db, auth: new FakeAuth({}), uid: UID});
     assert.deepEqual(db.data(key), {...original, createdBy: ''});
     assert.deepEqual(db.data(`${key}/progress/other-user`), {value: 4});
-    db.seed(`users/${UID}`, {});
   }
 });
 

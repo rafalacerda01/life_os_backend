@@ -1,5 +1,6 @@
 import { Timestamp } from 'firebase-admin/firestore';
 import circleCleanup from './_circle_cleanup.cjs';
+import * as birthCleanup from './_birth_ledger_cleanup.js';
 import {
   establishBillingDeletionBarrier,
   finishBillingDeletion,
@@ -288,7 +289,7 @@ async function finishSoleAdminRetry({ db, circleId }) {
 async function cleanupExternalAccountData({ db, uid }) {
   const userRef = db.collection('users').doc(uid);
   const userSnapshot = await userRef.get();
-  if (!userSnapshot.exists) throw stateConflict();
+  if (!userSnapshot.exists) return { circleDeleted: false, activeCircleId: null };
 
   const userData = userSnapshot.data();
   const deletionState = validateDeletionState(userData);
@@ -391,10 +392,9 @@ async function ensureExternalCleanupMarker({ db, uid, userRef, guard }) {
 export async function deleteAccount({ db, auth, uid }) {
   const userRef = db.collection('users').doc(uid);
   try {
-    const guard = await circleCleanup.beginGuard(db, uid, async (transaction) => {
+    const admission = await birthCleanup.prepare({ db, auth, uid, preflight: async (transaction) => {
       const user = await transaction.get(userRef);
       const marker = await transaction.get(accountDeletionMarkerRef(userRef));
-      if (!user.exists && !marker.exists) throw stateConflict();
       if (marker.exists && validateExternalCleanupMarker(marker.data()).version === 2) throw stateConflict();
       const data = user.data() ?? {};
       const deletionState = validateDeletionState(data);
@@ -406,17 +406,20 @@ export async function deleteAccount({ db, auth, uid }) {
       } else if (circleId !== null) {
         await resolveCircleMembership({ db, uid, circleId, commit: false, transaction });
       }
-    });
+    } });
+    const { guard } = admission;
     await establishBillingDeletionBarrier({ db, uid });
     const cleanup = await ensureExternalCleanupMarker({ db, uid, userRef, guard });
+    await birthCleanup.verifySnapshot(db, admission);
     try {
       await auth.deleteUser(uid);
     } catch (error) {
       if (error?.code !== 'auth/user-not-found') throw error;
     }
+    await birthCleanup.beforeRootRemoval(db, auth, admission);
     await db.recursiveDelete(userRef);
     await finishBillingDeletion({ db, uid });
-    await circleCleanup.completeGuard(db, uid, guard);
+    await birthCleanup.finish(db, auth, admission);
     return { body: { deleted: true, circleDeleted: cleanup.circleDeleted } };
   } catch (error) {
     if (!(error instanceof AccountHttpError) && error?.code === 'ACCOUNT_STATE_CONFLICT') {
