@@ -391,8 +391,9 @@ async function ensureExternalCleanupMarker({ db, uid, userRef, guard }) {
 
 export async function deleteAccount({ db, auth, uid }) {
   const userRef = db.collection('users').doc(uid);
+  let admission;
   try {
-    const admission = await birthCleanup.prepare({ db, auth, uid, preflight: async (transaction) => {
+    admission = await birthCleanup.prepare({ db, auth, uid, preflight: async (transaction) => {
       const user = await transaction.get(userRef);
       const marker = await transaction.get(accountDeletionMarkerRef(userRef));
       if (marker.exists && validateExternalCleanupMarker(marker.data()).version === 2) throw stateConflict();
@@ -408,8 +409,13 @@ export async function deleteAccount({ db, auth, uid }) {
       }
     } });
     const { guard } = admission;
-    await establishBillingDeletionBarrier({ db, uid });
-    const cleanup = await ensureExternalCleanupMarker({ db, uid, userRef, guard });
+    if (guard.state === 'COMPLETE') {
+      await birthCleanup.finish(db, auth, admission);
+      return { body: { deleted: true, circleDeleted: false } };
+    }
+    const cleanupDb = circleCleanup.withActiveGuard(db, uid, guard);
+    await establishBillingDeletionBarrier({ db: cleanupDb, uid });
+    const cleanup = await ensureExternalCleanupMarker({ db: cleanupDb, uid, userRef, guard });
     await birthCleanup.verifySnapshot(db, admission);
     try {
       await auth.deleteUser(uid);
@@ -418,10 +424,20 @@ export async function deleteAccount({ db, auth, uid }) {
     }
     await birthCleanup.beforeRootRemoval(db, auth, admission);
     await db.recursiveDelete(userRef);
-    await finishBillingDeletion({ db, uid });
+    await finishBillingDeletion({ db: cleanupDb, uid });
     await birthCleanup.finish(db, auth, admission);
     return { body: { deleted: true, circleDeleted: cleanup.circleDeleted } };
-  } catch (error) {
+  } catch (caught) {
+    let error = caught;
+    if (error?.code === 'ACCOUNT_CLEANUP_COMPLETE' && admission) {
+      try {
+        // The sentinel alone proves nothing: require the full terminal proof.
+        await birthCleanup.finish(db, auth, admission);
+        return { body: { deleted: true, circleDeleted: false } };
+      } catch (terminalError) {
+        error = terminalError;
+      }
+    }
     if (!(error instanceof AccountHttpError) && error?.code === 'ACCOUNT_STATE_CONFLICT') {
       throw stateConflict();
     }

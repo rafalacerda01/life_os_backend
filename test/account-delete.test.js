@@ -32,6 +32,17 @@ class FakeDocumentReference {
     this.kind = 'document';
   }
 
+  // Match Admin listDocuments(showMissing): descendants imply an ancestor ID.
+  async listCollections() {
+    const prefix = this.path + "/";
+    const names = [...new Set([...this.db.store.keys()]
+        .filter(p => p.startsWith(prefix)).map(p => p.slice(prefix.length).split("/")[0]))];
+    return names.map(name => ({listDocuments: async () => [...new Set([...this.db.store.keys()]
+      .filter(p => p.startsWith(prefix + name + "/"))
+      .map(p => p.slice(0, (prefix + name + "/").length) +
+        p.slice((prefix + name + "/").length).split("/")[0]))]}));
+  }
+
   collection(name) {
     return new FakeCollectionReference(this.db, path(this.path, name));
   }

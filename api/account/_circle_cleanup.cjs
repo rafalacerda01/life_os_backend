@@ -6,8 +6,7 @@ const {Timestamp, FieldPath} = require("firebase-admin/firestore");
 const PAGE_SIZE = 200;
 const GUARD_COLLECTION = "account_deletion_guards";
 const ANONYMOUS_AUTHOR = "";
-// Keep the guard beyond the maximum lifetime of an already-issued ID token.
-const COMPLETED_GUARD_RETENTION_MS = 65 * 60 * 1000;
+// Terminal completion is exclusively owned by birthCleanup.finish().
 
 function conflict(code = "ACCOUNT_STATE_CONFLICT") {
   const error = new Error("Account cleanup state is inconsistent.");
@@ -66,17 +65,49 @@ async function requireGuard(tx, db, uid, guard) {
   const snapshot = await tx.get(guardRef(db, uid));
   if (!snapshot.exists || validateGuard(snapshot.data()).deletionId !== guard.deletionId) conflict();
 }
-async function completeGuard(db, uid, guard) {
-  await db.runTransaction(async (tx) => {
-    await requireGuard(tx, db, uid, guard);
-    const user = await tx.get(db.collection("users").doc(uid));
-    if (user.exists) conflict();
-    const snapshot = await tx.get(guardRef(db, uid));
-    if (snapshot.data().state === "COMPLETE") return;
-    tx.update(guardRef(db, uid), {state: "COMPLETE",
-      retainUntil: Timestamp.fromMillis(Date.now() + COMPLETED_GUARD_RETENTION_MS)});
-  });
+
+// Read the CURRENT guard in the same transaction as every preparatory write.
+// Retried callbacks must acquire authority again; a captured guard is not enough.
+async function requireActiveGuard(tx, db, uid, guard) {
+  const snapshot = await tx.get(guardRef(db, uid));
+  if (!snapshot.exists) conflict();
+  const current = validateGuard(snapshot.data());
+  if (current.deletionId !== guard.deletionId) conflict();
+  if (current.state !== "IN_PROGRESS") conflict("ACCOUNT_CLEANUP_COMPLETE");
 }
+// Internal cleanup capability only. Callbacks receive the original transaction,
+// so no nested transactions or callbacks replayed outside Firestore are needed.
+// Native references are used only for reads; mutations use this transaction seam.
+function withActiveGuard(db, uid, guard) {
+  return Object.freeze({projectId: db.projectId,
+    collection: db.collection.bind(db), collectionGroup: db.collectionGroup.bind(db),
+    runTransaction: (callback, ...options) => db.runTransaction(async (tx) => {
+      await requireActiveGuard(tx, db, uid, guard);
+      return callback(tx);
+    }, ...options),
+    // Existing batches contain only ownership-checked token deletes. They cannot
+    // recreate an obligation. Do not expose any preparatory batch write method.
+    batch: () => {
+      const batch = db.batch();
+      const writer = {delete: (ref) => {batch.delete(ref); return writer;},
+        commit: () => batch.commit()};
+      return writer;
+    },
+    // Pure deletion follows an ownership/closure claim made under the fence.
+    // Durable circle reservations and the UID non-reuse contract still apply.
+    recursiveDelete: db.recursiveDelete.bind(db)});
+}
+// listDocuments includes missing parent documents with existing descendants.
+// Querying only existing documents would miss an orphaned nested subcollection.
+// This inventory is outside the transaction. The only cleanup writer able to
+// add private descendants is runtime, whose range is read again in finish().
+async function assertUserTreeEmpty(db, uid) {
+  const collections = await db.collection("users").doc(uid).listCollections();
+  for (const collection of collections) {
+    if ((await collection.listDocuments()).length) conflict();
+  }
+}
+
 function pathParts(snapshot, group) {
   const parts = snapshot.ref.path.split("/");
   const expected = ["members", "ranking", "challenges"].includes(group) ? 4 : 6;
@@ -128,12 +159,12 @@ function validateHistory(snapshot, group, uid) {
     }
   }
 }
-async function scan(query, visit) {
+async function scan(query, visit, tx) {
   let cursor;
   for (;;) {
     let page = query.orderBy(FieldPath.documentId()).limit(PAGE_SIZE);
     if (cursor) page = page.startAfter(cursor);
-    const snapshot = await page.get();
+    const snapshot = await (tx ? tx.get(page) : page.get());
     if (!snapshot || !Array.isArray(snapshot.docs)) conflict();
     if (snapshot.docs.length === 0) return;
     for (const doc of snapshot.docs) await visit(doc);
@@ -320,19 +351,19 @@ async function assertEmpty(tx, db, uid) {
   const owned = await tx.get(db.collection("circles").where("adminId", "==", uid).limit(1));
   if (owned.docs.length) conflict();
 }
-async function verifyReferences(db, uid) {
+async function verifyReferences(db, uid, tx) {
   for (const group of ["progress", "ranking", "members"]) {
     await scan(db.collectionGroup(group), async (doc) => {
       if (doc.ref.path.split("/").at(-1) === uid) conflict();
-    });
+    }, tx);
   }
   await scan(db.collectionGroup("challenges"), async (doc) => {
     if (doc.data()?.createdBy === uid) conflict();
-  });
+  }, tx);
   await scan(db.collection("circle_deletions"), async (doc) => {
     if (doc.data()?.initiatedBy === uid || doc.data()?.memberUids?.includes(uid)) conflict();
-  });
+  }, tx);
 }
-module.exports = {PAGE_SIZE, storedPathSegment, guardRef, validateGuard, beginGuard, requireGuard,
-  completeGuard, preflightOwned, cleanupOwned, cleanupPendingMarkers, cleanupMemberships,
+module.exports = {PAGE_SIZE, storedPathSegment, guardRef, validateGuard, beginGuard, requireGuard, requireActiveGuard, withActiveGuard,
+  assertUserTreeEmpty, preflightOwned, cleanupOwned, cleanupPendingMarkers, cleanupMemberships,
   cleanupHistory, assertEmpty, verifyReferences};

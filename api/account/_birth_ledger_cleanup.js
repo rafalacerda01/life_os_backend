@@ -168,6 +168,21 @@ async function inspect(tx, db, bound) {
 }
 
 
+// Every range below belongs to the final transaction. A concurrent preparation
+// either commits before this snapshot (and is observed), or retries against
+// COMPLETE and loses its write authority.
+async function assertTerminal(tx, db, accountUid) {
+  const hash = createHash("sha256").update(accountUid, "utf8").digest("hex");
+  const billing = await tx.get(db.collection("billing_google_accounts").doc(hash));
+  const tokens = await tx.get(db.collection("billing_google_tokens")
+      .where("accountHash", "==", hash).limit(1));
+  const runtime = await tx.get(db.collection("users").doc(accountUid)
+      .collection("runtime").limit(1));
+  await circles.assertEmpty(tx, db, accountUid);
+  await circles.verifyReferences(db, accountUid, tx);
+  if (billing.exists || tokens.docs.length || runtime.docs.length) fail();
+}
+
 // Internal server seam. The HTTP wrapper must already have verified ID Token
 // (including revocation), App Check, own UID, recent auth and rate limit.
 // No client payload is accepted here as an alternative authority.
@@ -201,17 +216,22 @@ export async function prepare({db, auth, uid: accountUid, preflight}) {
   // Quarantine a root created after the original deletion barrier. This is
   // conservative conflict detection, not proof of an Auth generation.
   const bound = Object.freeze({...initial, rootCutoff: guard.startedAt});
-  const digest = await db.runTransaction(async tx => {
-    await circles.requireGuard(tx, db, accountUid, guard);
+  const observation = await db.runTransaction(async (tx) => {
+    await circles.requireGuard(tx, db, bound.uid, guard);
     const remaining = await inspect(tx, db, bound);
-    if (guard.state === "COMPLETE" &&
+    const snapshot = await tx.get(circles.guardRef(db, bound.uid));
+    const current = circles.validateGuard(snapshot.data());
+    // Preserve the existing, identity-validated root/ledger recovery only.
+    // An attempt admitted before COMPLETE cannot reopen a peer's finish.
+    if (guard.state === "COMPLETE" && current.state === "COMPLETE" &&
         (remaining.digest !== null || remaining.rootExists)) {
-      tx.update(db.collection("account_deletion_guards").doc(accountUid),
-        {state: "IN_PROGRESS", retainUntil: null});
+      tx.update(snapshot.ref, {state: "IN_PROGRESS", retainUntil: null});
+      return {digest: remaining.digest,
+        guard: {...current, state: "IN_PROGRESS", retainUntil: null}};
     }
-    return remaining.digest;
+    return {digest: remaining.digest, guard: current};
   });
-  return Object.freeze({bound, guard, digest});
+  return Object.freeze({bound, guard: observation.guard, digest: observation.digest});
 }
 
 async function requireAuthAbsent(auth, accountUid) {
@@ -244,6 +264,7 @@ export async function finish(db, auth, admission) {
   const {bound, guard, digest} = admission;
   if (db.projectId !== bound.projectId || !uid(bound.uid)) fail();
   await requireAuthAbsent(auth, bound.uid);
+  await circles.assertUserTreeEmpty(db, bound.uid);
   await db.runTransaction(async tx => {
     await circles.requireGuard(tx, db, bound.uid, guard);
     const guardRef = db.collection("account_deletion_guards").doc(bound.uid);
@@ -251,7 +272,7 @@ export async function finish(db, auth, admission) {
     const root = await tx.get(db.collection("users").doc(bound.uid));
     const ledgerRef = db.collection("account_birth_decisions").doc(bound.uid);
     const ledger = await tx.get(ledgerRef);
-    if (root.exists) fail();
+    if (root.exists || (currentGuard.data().state === "COMPLETE" && ledger.exists)) fail();
     if (ledger.exists) {
       validate(ledger.data(), bound);
       const current = createHash("sha256").update(
@@ -260,6 +281,7 @@ export async function finish(db, auth, admission) {
     }
     // The other legitimate cleaner may already have removed this snapshot.
     // Missing at admission + present now cannot authorize a new record.
+    await assertTerminal(tx, db, bound.uid);
     if (ledger.exists) tx.delete(ledgerRef);
     if (currentGuard.data().state !== "COMPLETE") {
       tx.update(guardRef, {state: "COMPLETE",

@@ -3,6 +3,7 @@ import test from 'node:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Timestamp } from 'firebase-admin/firestore';
 import { deleteAccount } from '../api/account/delete.js';
+import { deleteCircle } from '../api/circles/delete.js';
 import { prepare, finish } from '../api/account/_birth_ledger_cleanup.js';
 import { createAccountHandler } from '../api/account/_shared.js';
 import { sha256 } from '../api/billing/google/_reconciliation.js';
@@ -43,7 +44,14 @@ class FakeFirestore {
   }
   collectionGroup(name) { return this.query(name, true); }
   ref(path) {
-    return { path, kind: 'doc', collection: name => this.collection(`${path}/${name}`),
+    return { path, kind: 'doc', listCollections: async () => {
+      const names = [...new Set([...this.docs.keys()].filter(p => p.startsWith(path + "/"))
+        .map(p => p.slice(path.length + 1).split("/")[0]))];
+      return names.map(name => ({listDocuments: async () => [...new Set([...this.docs.keys()]
+        .filter(p => p.startsWith(path + "/" + name + "/"))
+        .map(p => p.slice(0, (path + "/" + name + "/").length) +
+          p.slice((path + "/" + name + "/").length).split("/")[0]))]}));
+    }, collection: name => this.collection(`${path}/${name}`),
       get: async () => this.snapshot(path, this.docs, this.created) };
   }
   snapshot(path, docs, created) {
@@ -407,4 +415,163 @@ test('authenticated token selects only its own UID even when another root exists
   assert.deepEqual(f.db.docs.get(ROOT), original); assert.deepEqual(f.db.docs.get(L), originalLedger);
   assert.deepEqual(f.auth.deleteCalls, [OTHER]);
   assert.equal(f.db.docs.has(`account_birth_decisions/${OTHER}`), false);
+});
+
+// D2-A: private deterministic MVCC regression. Both attempts pass the real
+// admission while Auth exists. Pause a preparatory commit, complete the first
+// deletion (optionally run the real onDelete via an external read-only probe),
+// then force the stale transaction to retry. No sleeps or services are used.
+export async function runD2aRace(artifact, options = {}) {
+  const f = fixture({root: options.root ?? true, birth: options.birth ?? true});
+  const billingPath = `billing_google_accounts/${sha256(UID)}`;
+  const runtimePath = `${ROOT}/runtime/account_deletion`;
+  const target = artifact === 'billing' ? billingPath : runtimePath;
+  const authGate = gate(), staleGate = gate(), finalGate = gate();
+  let stalePaused = false, finalPaused = false;
+  const lateWrites = [];
+  f.auth.hooks.beforeDelete = async () => {
+    if (context.getStore() === 'D2-A:first') await authGate.hold();
+  };
+  f.db.hooks.beforeCommit = async attempt => {
+    if (attempt.label === 'D2-A:second' && !stalePaused &&
+        attempt.pending.some(w => w.type === 'set' && w.ref.path === target)) {
+      stalePaused = true; await staleGate.hold();
+    }
+    if (attempt.label === 'D2-A:first' && !finalPaused &&
+        attempt.pending.some(w => w.ref.path === G && w.data?.state === 'COMPLETE')) {
+      finalPaused = true; await finalGate.hold();
+    }
+  };
+  f.db.hooks.afterCommit = attempt => {
+    if (attempt.label === 'D2-A:second' && f.db.docs.get(G)?.state === 'COMPLETE' &&
+        attempt.pending.some(w => w.type === 'set' && w.ref.path === target)) {
+      lateWrites.push(target);
+      throw new Error('D2A_RESPONSE_LOST_AFTER_PREPARATORY_COMMIT');
+    }
+  };
+  // Attach rejection handlers before releasing any barrier.
+  const first = f.call('D2-A:first').then(value => ({value}), error => ({error}));
+  await authGate.reached;
+  const id = f.db.docs.get(G).deletionId;
+  const second = f.call('D2-A:second').then(value => ({value}), error => ({error}));
+  await staleGate.reached;
+  authGate.release();
+  await finalGate.reached;
+  if (options.onDelete) await options.onDelete(f);
+  // COMPLETE is committed by the first backend attempt if no trigger was
+  // injected. With a trigger, the same guard is already COMPLETE here.
+  finalGate.release();
+  const firstResult = await first;
+  staleGate.release();
+  const secondResult = await second;
+  const evidence = {artifact, rootInitially: options.root ?? true, ledgerInitially: options.birth ?? true,
+    first: firstResult.value?.body ?? {error: firstResult.error?.code},
+    second: secondResult.value?.body ?? {error: secondResult.error?.code ?? secondResult.error?.message},
+    guard: f.db.docs.get(G)?.state, sameDeletionId: f.db.docs.get(G)?.deletionId === id,
+    rootPresent: f.db.docs.has(ROOT), ledgerPresent: f.db.docs.has(L),
+    billingPresent: f.db.docs.has(billingPath), runtimePresent: f.db.docs.has(runtimePath),
+    lateWrites, retries: f.db.conflicts.filter(c => c.label === 'D2-A:second').length};
+  return {f, evidence};
+}
+for (const artifact of ['billing', 'runtime']) {
+  for (const root of [true, false]) for (const birth of [true, false]) {
+    test(`D2-A RED blocks stale ${artifact} commit after COMPLETE (root=${root}, ledger=${birth})`,
+      {timeout: 10000}, async t => {
+        const {f, evidence} = await runD2aRace(artifact, {root, birth});
+        t.diagnostic(JSON.stringify(evidence));
+        assert.equal(evidence.first.deleted, true);
+        assert.equal(evidence.guard, 'COMPLETE');
+        assert.equal(evidence.sameDeletionId, true);
+        assert.equal(evidence.rootPresent, false);
+        assert.equal(evidence.ledgerPresent, false);
+        assert.deepEqual([...f.db.docs].filter(([p]) => p.endsWith(`/${OTHER}`)), f.beforeOther);
+        assert.ok(evidence.retries > 0, 'must reexecute the real transaction after a read conflict');
+        assert.equal(evidence.lateWrites.length, 0, 'COMPLETE must fence every preparatory commit');
+        assert.equal(evidence.billingPresent, false, 'integral success cannot leave Billing UID');
+        assert.equal(evidence.runtimePresent, false, 'integral success cannot leave a runtime marker');
+      });
+  }
+}
+
+// D2-A-R2: COMPLETE is a read-only terminal state, not deletion authority.
+test('R2 empty COMPLETE retry performs zero writes and no recursive delete', async () => {
+  const f = fixture({root: false, birth: false}); f.auth.present = false;
+  const g = guarded('COMPLETE'); f.db.put(G, g);
+  assert.equal((await f.call()).body.deleted, true);
+  assert.deepEqual(f.db.docs.get(G), g);
+  assert.equal(f.db.writes.length, 0); assert.deepEqual(f.db.recursiveDeletes, []);
+});
+for (const [name, path, data] of [
+  ['billing', 'billing_google_accounts/' + sha256(UID), {uid: UID, state: 'DELETING'}],
+  ['runtime', ROOT + '/runtime/account_deletion', {deletionId: guarded().deletionId}],
+  ['orphan descendant', ROOT + '/unknown/missing/nested/private', {pii: 'synthetic'}],
+  ['token', 'billing_google_tokens/residue', {accountHash: sha256(UID)}],
+  ['membership', 'circles/elsewhere/members/' + UID, {role: 'member'}],
+  ['history', 'circles/elsewhere/ranking/' + UID, {uid: UID}],
+  ['global marker', 'circle_deletions/residue', {initiatedBy: UID}],
+]) test('R2 historical COMPLETE refuses ' + name + ' without reopening or writes', async () => {
+  const f = fixture({root: false, birth: false}); f.auth.present = false;
+  f.db.put(G, guarded('COMPLETE')); f.db.put(path, data);
+  const before = [...f.db.docs];
+  await conflict(f.call());
+  assert.deepEqual([...f.db.docs], before); assert.equal(f.db.writes.length, 0);
+  assert.deepEqual(f.db.recursiveDeletes, []);
+});
+test('R2 IN_PROGRESS orphan descendants remain recoverable by recursive deletion', async () => {
+  const f = fixture({root: false, birth: false}); f.auth.present = false;
+  f.db.put(G, guarded()); f.db.put(ROOT + '/unknown/missing/nested/private', {pii: 'synthetic'});
+  assert.equal((await f.call()).body.deleted, true); integral(f);
+  assert.equal([...f.db.docs.keys()].some(p => p.startsWith(ROOT + '/')), false);
+});
+for (const artifact of ['runtime', 'membership', 'marker']) test('R2 final transaction retries and refuses late ' + artifact, async () => {
+  const f = fixture(); let injected = false;
+  f.db.hooks.beforeCommit = attempt => {
+    if (injected || !attempt.pending.some(w => w.ref.path === G && w.data?.state === 'COMPLETE')) return;
+    injected = true;
+    if (artifact === 'runtime') f.db.put(ROOT + '/runtime/account_deletion', {pii: 'synthetic'});
+    if (artifact === 'membership') f.db.put('circles/other/members/' + UID, {role: 'member'});
+    if (artifact === 'marker') f.db.put('circle_deletions/late', {initiatedBy: UID});
+  };
+  await conflict(f.call());
+  assert.equal(injected, true); assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS');
+  assert.ok(f.db.conflicts.length); assert.ok(f.db.docs.has(L));
+});
+
+for (const stage of ['billing', 'runtime']) test('R2 sentinel from ' + stage + ' alone never authorizes success', async () => {
+  const f = fixture(); let injected = false;
+  const path = stage === 'billing' ? 'billing_google_accounts/' + sha256(UID) : ROOT + '/runtime/account_deletion';
+  f.db.hooks.beforeCommit = attempt => {
+    if (!injected && attempt.pending.some(w => w.ref.path === path && w.type === 'set')) {
+      injected = true;
+      throw Object.assign(new Error('synthetic sentinel without terminal proof'), {code: 'ACCOUNT_CLEANUP_COMPLETE'});
+    }
+  };
+  await conflict(f.call()); assert.equal(injected, true);
+  assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS');
+  assert.ok(f.db.docs.has(ROOT)); assert.ok(f.db.docs.has(L));
+  assert.equal(f.auth.deleteCalls.length, 0);
+});
+
+test('R2 admitted Circle deletion cannot recreate a marker containing the deleted UID', async () => {
+  const f = fixture(), hold = gate(); let paused = false;
+  f.db.put('circles/shared', {schemaVersion: 2, adminId: OTHER, memberLimit: 3, memberCount: 2});
+  f.db.put('circles/shared/members/' + OTHER, {role: 'admin'});
+  f.db.put('circles/shared/members/' + UID, {role: 'member'});
+  f.beforeOther = [...f.db.docs].filter(([p]) => p.endsWith('/' + OTHER));
+  f.db.hooks.beforeCommit = async attempt => {
+    if (attempt.label === 'circle-request' && !paused && attempt.pending.some(w =>
+      w.ref.path === 'circle_deletions/shared' && w.type === 'set')) {
+      paused = true; await hold.hold();
+    }
+  };
+  const oldRequest = context.run('circle-request', () => deleteCircle({
+    db: f.db, uid: OTHER, body: {circleId: 'shared'}, now: CLOCK,
+  })).then(() => null, error => error);
+  await hold.reached;
+  assert.equal((await f.call()).body.deleted, true); integral(f);
+  const before = [...f.db.docs]; hold.release();
+  assert.equal((await oldRequest).code, 'CIRCLE_STATE_CONFLICT');
+  assert.deepEqual([...f.db.docs], before);
+  assert.ok(f.db.conflicts.some(c => c.label === 'circle-request'));
+  assert.equal(f.db.docs.has('circle_deletions/shared'), false);
 });
