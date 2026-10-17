@@ -1,0 +1,330 @@
+{
+  "formatVersion": 1,
+  "contractVersion": "R10-FIX1",
+  "cases": [
+    {
+      "id": "both-absent",
+      "input": {"reservation":{"exists":false},"guard":{"exists":false},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"LEGACY_OR_NEW_UNPROVEN","reservation":"ABSENT","guard":"ABSENT","guardContext":"NOT_APPLICABLE","operation":"UNBOUND","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "reservation-absent-active-guard",
+      "input": {"reservation":{"exists":false},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"LEGACY_OR_NEW_UNPROVEN","reservation":"ABSENT","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"GUARD_ONLY","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "v1-valid",
+      "input": {"reservation":{"exists":true,"data":{"version":1,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","authCreatedAtMs":1000},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"V1_REVIEW_REQUIRED","reservation":"V1_STRUCTURALLY_VALID","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"CONSISTENT","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "v1-missing-create-time",
+      "input": {"reservation":{"exists":true,"data":{"version":1,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","authCreatedAtMs":1000}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"V1_CONTEXT_INSUFFICIENT","reservation":"V1_STRUCTURALLY_VALID","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"INSUFFICIENT","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","V1_CONTEXT"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "v1-numeric-create-time",
+      "input": {"reservation":{"exists":true,"data":{"version":1,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","authCreatedAtMs":1000},"createTime":3000},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"V1_CONTEXT_INSUFFICIENT","reservation":"V1_STRUCTURALLY_VALID","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"INSUFFICIENT","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","V1_CONTEXT"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "v1-born-after-guard",
+      "input": {"reservation":{"exists":true,"data":{"version":1,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","authCreatedAtMs":4000},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"V1_CONTEXT_INCONSISTENT","reservation":"V1_STRUCTURALLY_VALID","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"INCONSISTENT","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "v1-reservation-before-guard",
+      "input": {"reservation":{"exists":true,"data":{"version":1,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","authCreatedAtMs":1000},"createTime":{"seconds":1,"nanoseconds":999999999}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"V1_CONTEXT_INCONSISTENT","reservation":"V1_STRUCTURALLY_VALID","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"INCONSISTENT","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "v2-pre-auth",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"PRE_AUTH_PROCEDURE_REVALIDATION_REQUIRED","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "v2-auth-event",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"AUTH_EVENT"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"MANAGED_AUTH_EVENT_REVALIDATION_REQUIRED","reservation":"V2_AUTH_EVENT","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "v2-legacy-review",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"LEGACY_REVIEW"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"LEGACY_REVIEW_REQUIRED","reservation":"V2_LEGACY_REVIEW","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "future-version",
+      "input": {"reservation":{"exists":true,"data":{"version":99,"email":"synthetic-private@example.invalid"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"VERSION_UNSUPPORTED","reservation":"UNKNOWN_VERSION","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "record-extra-field",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH","email":"synthetic-private@example.invalid"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"RECORD_INVALID","reservation":"MALFORMED","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "guard-in-progress",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"PRE_AUTH_PROCEDURE_REVALIDATION_REQUIRED","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "guard-complete",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"COMPLETE","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":{"seconds":20,"nanoseconds":0}},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"TERMINAL_PROOF_REQUIRED","reservation":"V2_PRE_AUTH","guard":"COMPLETE","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "complete-expired",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"COMPLETE","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":{"seconds":8,"nanoseconds":0}},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"TERMINAL_PROOF_REQUIRED","reservation":"V2_PRE_AUTH","guard":"COMPLETE_RETENTION_EXPIRED","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "complete-null-retention",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"COMPLETE","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"GUARD_INVALID","reservation":"V2_PRE_AUTH","guard":"MALFORMED","guardContext":"INSUFFICIENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","GUARD_TIME_CONTEXT","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "guard-missing",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":false},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"GUARD_MISSING_REVIEW_REQUIRED","reservation":"V2_PRE_AUTH","guard":"ABSENT","guardContext":"NOT_APPLICABLE","operation":"GUARD_MISSING","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "guard-deletion-id-conflict",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"DELETION_ID_CONFLICT","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"CONFLICT","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "expected-deletion-id-conflict",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"DELETION_ID_CONFLICT","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"CONFLICT","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "expected-origin-conflict",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":"AUTH_EVENT","now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"ORIGIN_CONFLICT","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "auth-present",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"PRESENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"AUTH_PRESENT_RECOVERY_BLOCKED","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"PRESENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "auth-absent",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"PRE_AUTH_PROCEDURE_REVALIDATION_REQUIRED","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "auth-ambiguous",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"AMBIGUOUS"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"IDENTITY_AMBIGUOUS","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"AMBIGUOUS","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "auth-unavailable",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"UNAVAILABLE"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"READ_UNAVAILABLE","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"UNAVAILABLE","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "reservation-unavailable",
+      "input": {"reservation":{"readError":true},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"READ_UNAVAILABLE","reservation":"UNAVAILABLE","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "guard-unavailable",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"readError":true},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"READ_UNAVAILABLE","reservation":"V2_PRE_AUTH","guard":"UNAVAILABLE","guardContext":"INSUFFICIENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","GUARD_TIME_CONTEXT","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "retention-exact-nanosecond",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"COMPLETE","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":{"seconds":10,"nanoseconds":123}},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":123}},
+      "decorations": [],
+      "expected": {"status":"TERMINAL_PROOF_REQUIRED","reservation":"V2_PRE_AUTH","guard":"COMPLETE","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "retention-one-nanosecond-after",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"COMPLETE","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":{"seconds":10,"nanoseconds":123}},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":124}},
+      "decorations": [],
+      "expected": {"status":"TERMINAL_PROOF_REQUIRED","reservation":"V2_PRE_AUTH","guard":"COMPLETE_RETENTION_EXPIRED","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "retention-one-nanosecond-before",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"COMPLETE","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":{"seconds":10,"nanoseconds":123}},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":122}},
+      "decorations": [],
+      "expected": {"status":"TERMINAL_PROOF_REQUIRED","reservation":"V2_PRE_AUTH","guard":"COMPLETE","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "v1-one-nanosecond-inconsistent",
+      "input": {"reservation":{"exists":true,"data":{"version":1,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","authCreatedAtMs":1000},"createTime":{"seconds":2,"nanoseconds":500}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":501},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"V1_CONTEXT_INCONSISTENT","reservation":"V1_STRUCTURALLY_VALID","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"INCONSISTENT","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "sdk-create-time-not-normalized",
+      "input": {"reservation":{"exists":true,"data":{"version":1,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","authCreatedAtMs":1000},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [{"path":"reservation.createTime","type":"UNNORMALIZED_TIMESTAMP"}],
+      "expected": {"status":"V1_CONTEXT_INSUFFICIENT","reservation":"V1_STRUCTURALLY_VALID","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"INSUFFICIENT","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","V1_CONTEXT"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "sdk-retention-not-normalized",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"COMPLETE","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":{"seconds":20,"nanoseconds":0}},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [{"path":"guard.data.retainUntil","type":"UNNORMALIZED_TIMESTAMP"}],
+      "expected": {"status":"TERMINAL_PROOF_REQUIRED","reservation":"V2_PRE_AUTH","guard":"COMPLETE_RETENTION_UNKNOWN","guardContext":"INSUFFICIENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","GUARD_TIME_CONTEXT","RETENTION_TIME_CONTEXT"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "false-plus-read-error",
+      "input": {"reservation":{"exists":false,"readError":true},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"RECORD_INVALID","reservation":"MALFORMED","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "false-plus-data",
+      "input": {"reservation":{"exists":false,"data":{}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"RECORD_INVALID","reservation":"MALFORMED","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "valid-v2-extra-frame-field",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0},"unexpected":true},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"RECORD_INVALID","reservation":"MALFORMED","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "valid-v1-extra-frame-field",
+      "input": {"reservation":{"exists":true,"data":{"version":1,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","authCreatedAtMs":1000},"createTime":{"seconds":3,"nanoseconds":0},"unexpected":true},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"RECORD_INVALID","reservation":"MALFORMED","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "valid-v2-without-metadata",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"PRE_AUTH_PROCEDURE_REVALIDATION_REQUIRED","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "valid-v2-with-metadata",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"PRE_AUTH_PROCEDURE_REVALIDATION_REQUIRED","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "guard-extra-field",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null,"unexpected":true},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"GUARD_INVALID","reservation":"V2_PRE_AUTH","guard":"MALFORMED","guardContext":"INSUFFICIENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","GUARD_TIME_CONTEXT","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "guard-invalid-state",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"ACTIVE","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"GUARD_INVALID","reservation":"V2_PRE_AUTH","guard":"MALFORMED","guardContext":"INSUFFICIENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","GUARD_TIME_CONTEXT","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "unbound-expected-operation",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":null,"expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"PRE_AUTH_PROCEDURE_REVALIDATION_REQUIRED","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH_UNBOUND","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "complete-without-clock",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"COMPLETE","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":{"seconds":20,"nanoseconds":0}},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":null},
+      "decorations": [],
+      "expected": {"status":"TERMINAL_PROOF_REQUIRED","reservation":"V2_PRE_AUTH","guard":"COMPLETE_RETENTION_UNKNOWN","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","RETENTION_TIME_CONTEXT"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "v1-without-guard",
+      "input": {"reservation":{"exists":true,"data":{"version":1,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","authCreatedAtMs":1000},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":false},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"GUARD_MISSING_REVIEW_REQUIRED","reservation":"V1_STRUCTURALLY_VALID","guard":"ABSENT","guardContext":"NOT_APPLICABLE","operation":"GUARD_MISSING","v1Context":"INSUFFICIENT","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","V1_CONTEXT","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "input-extra-field",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0},"permission":true},
+      "decorations": [],
+      "expected": {"status":"INPUT_INVALID","reservation":"UNDETERMINED","guard":"UNDETERMINED","guardContext":"INSUFFICIENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"AMBIGUOUS","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","GUARD_TIME_CONTEXT","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "invalid-expected-id",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"invalid","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"INPUT_INVALID","reservation":"UNDETERMINED","guard":"UNDETERMINED","guardContext":"INSUFFICIENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"AMBIGUOUS","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","GUARD_TIME_CONTEXT","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "guard-start-in-future",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":1,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"GUARD_CONTEXT_INCONSISTENT","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"INCONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "retention-before-start",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"COMPLETE","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":{"seconds":1,"nanoseconds":0}},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"GUARD_CONTEXT_INCONSISTENT","reservation":"V2_PRE_AUTH","guard":"COMPLETE_RETENTION_UNKNOWN","guardContext":"INCONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","RETENTION_TIME_CONTEXT"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "auth-metadata-is-not-generation",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"PRESENT","createdAtMs":1000},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"IDENTITY_AMBIGUOUS","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"AMBIGUOUS","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "unknown-origin",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"UNTRUSTED"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"RECORD_INVALID","reservation":"MALFORMED","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "sdk-start-not-normalized",
+      "input": {"reservation":{"exists":true,"data":{"version":2,"state":"RESERVED","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","origin":"PRE_AUTH"},"createTime":{"seconds":3,"nanoseconds":0}},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [{"path":"guard.data.startedAt","type":"UNNORMALIZED_TIMESTAMP"}],
+      "expected": {"status":"GUARD_CONTEXT_INSUFFICIENT","reservation":"V2_PRE_AUTH","guard":"IN_PROGRESS","guardContext":"INSUFFICIENT","operation":"MATCH","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","GUARD_TIME_CONTEXT"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "invalid-frame-existence",
+      "input": {"reservation":{"exists":"false"},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"RECORD_INVALID","reservation":"MALFORMED","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "false-read-error-is-malformed",
+      "input": {"reservation":{"readError":false},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"RECORD_INVALID","reservation":"MALFORMED","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "missing-record-data",
+      "input": {"reservation":{"exists":true},"guard":{"exists":true,"data":{"version":1,"state":"IN_PROGRESS","deletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","startedAt":{"seconds":2,"nanoseconds":0},"retainUntil":null},"createTime":{"seconds":3,"nanoseconds":0}},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"RECORD_INVALID","reservation":"MALFORMED","guard":"IN_PROGRESS","guardContext":"CONSISTENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    },
+    {
+      "id": "read-failure-does-not-promote-malformed-frame",
+      "input": {"reservation":{"exists":false,"data":{}},"guard":{"readError":true},"auth":{"state":"ABSENT"},"expectedDeletionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expectedOrigin":null,"now":{"seconds":10,"nanoseconds":0}},
+      "decorations": [],
+      "expected": {"status":"READ_UNAVAILABLE","reservation":"MALFORMED","guard":"UNAVAILABLE","guardContext":"INSUFFICIENT","operation":"UNDETERMINED","v1Context":"NOT_APPLICABLE","auth":"ABSENT","provenance":"UNPROVEN","terminalProof":"NOT_PERFORMED","requiredEvidence":["TRUSTED_PROVENANCE","IDENTITY_CONTINUITY","TERMINAL_PROOF","GUARD_TIME_CONTEXT","OPERATION_BINDING"],"destructiveAuthority":false,"admissionAuthority":false}
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "format": "lifeos-retired-identity-conformance",
+  "formatVersion": 1,
+  "contractVersion": "R10-FIX1",
+  "hashEncoding": "UTF-8/LF",
+  "canonical": {
+    "path": "functions/retired_identity_contract_v2.js",
+    "commit": "afe2e73d5ffe03823682155eb7c35c01e8ac1884",
+    "sha256": "2fe8be9e92ba6f15de6d621aaf5e96108a574043c7d0831527eeea5d6adfcc87"
+  },
+  "readerSha256": "643cfdb487aa5a15cb4b0f2385849525ada03b497fd08f877525a742f582a9f0",
+  "vectorsSha256": "420387c2a98220a6a9bb5a07d2fb063e09ced1bc9555f59a7650f344154404de",
+  "outputKeys": [
+    "status",
+    "reservation",
+    "guard",
+    "guardContext",
+    "operation",
+    "v1Context",
+    "auth",
+    "provenance",
+    "terminalProof",
+    "requiredEvidence",
+    "destructiveAuthority",
+    "admissionAuthority"
+  ],
+  "safety": {
+    "destructiveAuthority": false,
+    "admissionAuthority": false,
+    "provenance": "UNPROVEN",
+    "terminalProof": "NOT_PERFORMED"
+  }
+}
