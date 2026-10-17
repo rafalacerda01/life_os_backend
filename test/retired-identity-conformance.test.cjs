@@ -170,13 +170,31 @@ for (const [name, mutate, expected] of [
   ["new output key", (m) => {m.outputKeys.push("authorization");}, /OUTPUT_SCHEMA/],
   ["promoted authority", (m) => {m.safety.destructiveAuthority = true;}, /SAFETY_FIELD/],
   ["provenance relabel", (m) => {m.safety.provenance = "PROVEN";}, /SAFETY_FIELD/],
-  ["release provenance", (m) => {m.canonical.commit = "0".repeat(40);}, /RELEASE_HASH_MISMATCH/],
 ]) {
   test(`R12 refuses divergent ${name}`, () => {
     const manifest = JSON.parse(manifestText); mutate(manifest);
     assert.throws(() => verifyArtifacts({...artifacts, manifestText: JSON.stringify(manifest)}), expected);
   });
 }
+function manifestWithCommit(commit) {
+  const original = JSON.stringify(JSON.parse(manifestText).canonical.commit);
+  assert.equal(manifestText.split(original).length, 2, "UNIQUE_COMMIT_TOKEN_REQUIRED");
+  return manifestText.replace(original, JSON.stringify(commit));
+}
+test("R12 release provenance control preserves exact original text", () => {
+  const unchanged = manifestWithCommit(JSON.parse(manifestText).canonical.commit);
+  assert.equal(unchanged, manifestText);
+  assert.doesNotThrow(() => verifyArtifacts({...artifacts, manifestText: unchanged}));
+});
+test("R12 refuses divergent release provenance without formatting changes", () => {
+  const original = JSON.parse(manifestText);
+  const commit = "0".repeat(40);
+  assert.notEqual(original.canonical.commit, commit);
+  const changed = manifestWithCommit(commit);
+  assert.equal(changed.replace(JSON.stringify(commit), JSON.stringify(original.canonical.commit)), manifestText);
+  assert.deepEqual(JSON.parse(changed), {...original, canonical: {...original.canonical, commit}});
+  assert.throws(() => verifyArtifacts({...artifacts, manifestText: changed}), /RELEASE_HASH_MISMATCH/);
+});
 for (const [name, mutate, expected] of [
   ["vector version", (v) => {v.formatVersion++;}, /VERSION_UNSUPPORTED/],
   ["extra vector field", (v) => {v.cases[0].authority = true;}, /VECTOR_SCHEMA/],
