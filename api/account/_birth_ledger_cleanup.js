@@ -231,7 +231,10 @@ export async function prepare({db, auth, uid: accountUid, preflight}) {
     }
     return {digest: remaining.digest, guard: current};
   });
-  return Object.freeze({bound, guard: observation.guard, digest: observation.digest});
+  // A presence observation only, never an Auth generation or cleanup authority.
+  // The endpoint uses it solely to avoid retroactive PRE_AUTH deny records.
+  return Object.freeze({bound, guard: observation.guard, digest: observation.digest,
+    authPresent: !absent});
 }
 
 async function requireAuthAbsent(auth, accountUid) {

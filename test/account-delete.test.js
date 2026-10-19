@@ -198,6 +198,13 @@ class FakeTransaction extends FakeWriter {
     return this;
   }
 
+  create(ref, data) {
+    this.hasWritten = true;
+    this.operations.push({ type: 'write', operation: 'create', path: ref.path });
+    this.writes.push({ type: 'create', ref, data });
+    return this;
+  }
+
   commit() {
     if (this.writes.some((write) => /\/(processed_events|progress|ranking)\//.test(write.ref.path))) {
       this.db.historyCommits = (this.db.historyCommits ?? 0) + 1;
@@ -290,7 +297,10 @@ class FakeFirestore {
     for (const write of writes) {
       if (write.type === 'delete') {
         nextStore.delete(write.ref.path);
-      } else if (write.type === 'set') {
+      } else if (write.type === 'set' || write.type === 'create') {
+        if (write.type === 'create' && nextStore.has(write.ref.path)) {
+          throw new Error('document already exists');
+        }
         nextStore.set(write.ref.path, { ...write.data });
       } else {
         if (!nextStore.has(write.ref.path)) {
@@ -1505,7 +1515,8 @@ test('billing index cleanup conflict aborts before Auth and user deletion', asyn
   db.seed(path('users', UID), { activeCircleId: null });
   db.seed(path('billing_google_accounts', accountHash), { uid: UID, state: 'ACTIVE' });
   db.seed(indexPath, { accountHash });
-  db.beforeTransactions.set(4, (firestore) => {
+  // The retirement commit now precedes the existing Billing barrier transaction.
+  db.beforeTransactions.set(5, (firestore) => {
     firestore.seed(indexPath, { accountHash: sha256('other-user') });
   });
   const auth = new FakeAuth({});
@@ -1539,7 +1550,7 @@ test('billing cleanup transport failure retains DELETING barrier without deletin
   const indexPath = path('billing_google_tokens', sha256('token-a'));
   db.seed(path('users', UID), { activeCircleId: null });
   db.seed(indexPath, { accountHash: sha256(UID) });
-  db.beforeTransactions.set(4, () => { throw new Error('private-billing-transport-error'); });
+  db.beforeTransactions.set(5, () => { throw new Error('private-billing-transport-error'); });
   const auth = new FakeAuth({});
 
   await assert.rejects(deleteAccount({ db, auth, uid: UID }));
@@ -1718,7 +1729,7 @@ test('global progress events and ranking all converge across multiple bounded pa
     assert.equal(pages.length, 3);
     assert.ok(pages.every((tx) => tx.writes.length <= 200));
   }
-  assert.deepEqual([...db.store.keys()], [GUARD_PATH]);
+  assert.deepEqual([...db.store.keys()], [GUARD_PATH, `retired_auth_identities/${UID}`]);
 });
 
 for (const [name, documentPath, document] of [

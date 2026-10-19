@@ -575,3 +575,225 @@ test('R2 admitted Circle deletion cannot recreate a marker containing the delete
   assert.ok(f.db.conflicts.some(c => c.label === 'circle-request'));
   assert.equal(f.db.docs.has('circle_deletions/shared'), false);
 });
+
+const RETIRED = `retired_auth_identities/${UID}`;
+const denyRecord = deletionId => ({version: 2, state: 'RESERVED', deletionId, origin: 'PRE_AUTH'});
+const denyCreates = f => f.db.writes.filter(w => w.ref.path === RETIRED);
+async function denyHttp(f, body = {}) {
+  const handler = createAccountHandler('delete', 'ACCOUNT_DELETE_FAILED', deleteAccount, {
+    nowProvider: () => f.auth.now,
+    getServices: () => ({db: f.db, auth: f.auth,
+      appCheck: {verifyToken: async token => {assert.equal(token, 'synthetic-app-check');}}}),
+  });
+  const res = {statusCode: 200, setHeader() {}, status(value) {this.statusCode = value; return this;},
+    json(value) {this.body = value; return this;}};
+  await handler({method: 'POST', headers: {authorization: 'Bearer synthetic-id-token',
+    'x-firebase-appcheck': 'synthetic-app-check'}, body}, res, {checkRateLimit: async () => true});
+  return res;
+}
+
+test('deny writer: authenticated own-UID request persists a minimal record before any destructive work', async () => {
+  const f = fixture();
+  f.auth.hooks.beforeDelete = () => {
+    assert.deepEqual(f.db.docs.get(RETIRED), denyRecord(f.db.docs.get(G).deletionId));
+  };
+  const response = await denyHttp(f);
+  assert.equal(response.statusCode, 200); assert.equal(response.body.deleted, true); integral(f);
+  assert.deepEqual(f.db.docs.get(RETIRED), denyRecord(f.db.docs.get(G).deletionId));
+  const marker = denyCreates(f);
+  assert.equal(marker.length, 1); assert.equal(marker[0].type, 'create');
+  const index = f.db.writes.indexOf(marker[0]);
+  assert.ok(index >= 0);
+  assert.ok(f.db.writes.slice(0, index).every(w => w.ref.path === G), 'only guard admission precedes retirement');
+  const attempt = f.db.attempts.find(a => a.pending.includes(marker[0]));
+  assert.ok(attempt.reads.has(G)); assert.ok(attempt.reads.has(RETIRED));
+  assert.deepEqual(f.auth.verifyCalls, [{token: 'synthetic-id-token', checkRevoked: true}]);
+});
+
+test('deny writer: failed persistence prevents cleanup and the same authenticated request can retry', async () => {
+  const f = fixture();
+  f.db.hooks.beforeCommit = attempt => {
+    if (attempt.pending.some(w => w.ref.path === RETIRED)) throw new Error('synthetic marker commit failed');
+  };
+  await assert.rejects(f.call(), /synthetic marker commit failed/);
+  assert.equal(f.auth.present, true); assert.deepEqual(f.auth.deleteCalls, []);
+  assert.deepEqual(f.db.recursiveDeletes, []); assert.ok(f.db.docs.has(ROOT)); assert.ok(f.db.docs.has(L));
+  assert.equal(f.db.docs.has(RETIRED), false);
+  assert.ok(f.db.writes.every(w => w.ref.path === G));
+  const id = f.db.docs.get(G).deletionId;
+  f.db.hooks = {};
+  assert.equal((await denyHttp(f)).statusCode, 200); integral(f);
+  assert.deepEqual(f.db.docs.get(RETIRED), denyRecord(id)); assert.equal(denyCreates(f).length, 1);
+});
+
+test('deny writer: lost persistence response keeps the marker and retry never overwrites it', async () => {
+  const f = fixture(); let lost = false;
+  f.db.hooks.afterCommit = attempt => {
+    if (!lost && attempt.pending.some(w => w.ref.path === RETIRED)) {
+      lost = true; throw new Error('synthetic lost marker response');
+    }
+  };
+  await assert.rejects(f.call(), /synthetic lost marker response/);
+  assert.equal(f.auth.present, true); assert.deepEqual(f.auth.deleteCalls, []);
+  assert.ok(f.db.docs.has(RETIRED)); assert.deepEqual(f.db.recursiveDeletes, []);
+  const marker = copy(f.db.docs.get(RETIRED)), created = f.db.created.get(RETIRED);
+  f.db.hooks = {};
+  assert.equal((await denyHttp(f)).statusCode, 200); integral(f);
+  assert.deepEqual(f.db.docs.get(RETIRED), marker);
+  assert.ok(f.db.created.get(RETIRED).isEqual(created)); assert.equal(denyCreates(f).length, 1);
+});
+
+test('deny writer: later failure with live Auth preserves authenticated continuation and the original marker', async () => {
+  const f = fixture();
+  f.auth.hooks.beforeDelete = () => {throw new Error('synthetic Auth transport failure');};
+  await assert.rejects(f.call(), /synthetic Auth transport failure/);
+  const marker = copy(f.db.docs.get(RETIRED));
+  assert.ok(marker); assert.equal(f.auth.present, true); assert.ok(f.db.docs.has(ROOT));
+  assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS');
+  f.auth.hooks = {};
+  assert.equal((await denyHttp(f)).statusCode, 200); integral(f);
+  assert.deepEqual(f.db.docs.get(RETIRED), marker); assert.equal(denyCreates(f).length, 1);
+});
+
+test('deny writer: identical preexisting marker and guard are idempotent', async () => {
+  const f = fixture(), g = guarded(); f.db.put(G, g); f.db.put(RETIRED, denyRecord(g.deletionId));
+  const created = f.db.created.get(RETIRED);
+  assert.equal((await f.call()).body.deleted, true); integral(f);
+  assert.deepEqual(f.db.docs.get(RETIRED), denyRecord(g.deletionId));
+  assert.ok(f.db.created.get(RETIRED).isEqual(created)); assert.equal(denyCreates(f).length, 0);
+});
+
+for (const [label, make] of [
+  ['different deletionId', () => denyRecord('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')],
+  ['legacy V1', id => ({version: 1, state: 'RESERVED', deletionId: id, authCreatedAtMs: 1})],
+  ['AUTH_EVENT origin', id => ({...denyRecord(id), origin: 'AUTH_EVENT'})],
+  ['LEGACY_REVIEW origin', id => ({...denyRecord(id), origin: 'LEGACY_REVIEW'})],
+  ['unknown state', id => ({...denyRecord(id), state: 'COMPLETE'})],
+  ['extra field', id => ({...denyRecord(id), privateField: 'synthetic private data'})],
+  ['empty marker', () => ({})],
+]) test(`deny writer: ${label} is never adopted or overwritten`, async () => {
+  const f = fixture(), g = guarded(); f.db.put(G, g); const record = make(g.deletionId); f.db.put(RETIRED, record);
+  const before = [...f.db.docs];
+  await conflict(f.call()); assert.deepEqual([...f.db.docs], before);
+  assert.equal(f.db.writes.length, 0); assert.deepEqual(f.auth.deleteCalls, []);
+  assert.deepEqual(f.db.recursiveDeletes, []);
+});
+
+for (const [label, value] of [
+  ['malformed', {state: 'IN_PROGRESS'}], ['legacy', {version: 0}],
+  ['COMPLETE with live Auth', guarded('COMPLETE')],
+]) test(`deny writer: ${label} guard cannot authorize a reservation`, async () => {
+  const f = fixture(); f.db.put(G, value); const before = [...f.db.docs];
+  await conflict(f.call()); assert.deepEqual([...f.db.docs], before);
+  assert.equal(f.db.docs.has(RETIRED), false); assert.deepEqual(f.auth.deleteCalls, []);
+});
+
+for (const change of ['different operation', 'COMPLETE', 'absent']) {
+  test(`deny writer: guard becoming ${change} during marker commit forces fenced revalidation`, async () => {
+    const f = fixture(); let changed = false;
+    f.db.hooks.beforeCommit = attempt => {
+      if (!changed && attempt.pending.some(w => w.ref.path === RETIRED)) {
+        changed = true;
+        f.db.put(G, change === 'absent' ? undefined : change === 'COMPLETE' ? guarded('COMPLETE') :
+          {...guarded(), deletionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'});
+      }
+    };
+    await conflict(f.call()); assert.equal(changed, true);
+    assert.ok(f.db.conflicts.some(c => c.changed.includes(G)));
+    assert.equal(f.db.docs.has(RETIRED), false); assert.deepEqual(f.auth.deleteCalls, []);
+    assert.deepEqual(f.db.recursiveDeletes, []);
+  });
+}
+
+test('deny writer: concurrent foreign reservation wins without being overwritten', async () => {
+  const f = fixture(); let changed = false;
+  const foreign = denyRecord('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  f.db.hooks.beforeCommit = attempt => {
+    if (!changed && attempt.pending.some(w => w.ref.path === RETIRED)) {changed = true; f.db.put(RETIRED, foreign);}
+  };
+  await conflict(f.call()); assert.equal(changed, true);
+  assert.ok(f.db.conflicts.some(c => c.changed.includes(RETIRED)));
+  assert.deepEqual(f.db.docs.get(RETIRED), foreign); assert.equal(denyCreates(f).length, 0);
+  assert.deepEqual(f.auth.deleteCalls, []); assert.deepEqual(f.db.recursiveDeletes, []);
+});
+
+test('deny writer: concurrent identical requests converge without duplicate retirement', async t => {
+  const f = fixture(), hold = gate(); t.after(hold.release); let paused = false;
+  f.db.hooks.beforeCommit = async attempt => {
+    if (!paused && attempt.label === 'writer-first' && attempt.pending.some(w => w.ref.path === RETIRED)) {
+      paused = true; await hold.hold();
+    }
+  };
+  const first = f.call('writer-first').then(value => ({value}), error => ({error}));
+  await Promise.race([hold.reached, first.then(() => assert.fail('request finished without reaching the retirement write'))]);
+  assert.equal((await f.call('writer-second')).body.deleted, true);
+  hold.release(); const outcome = await first; assert.equal(outcome.error, undefined);
+  assert.equal(outcome.value.body.deleted, true); integral(f);
+  assert.equal(denyCreates(f).length, 1); assert.ok(f.db.conflicts.length > 0);
+});
+
+test('deny writer: marker alone never authorizes a new guard or post-Auth cleanup', async () => {
+  const f = fixture(); f.auth.present = false; f.db.put(RETIRED, denyRecord(guarded().deletionId));
+  const before = [...f.db.docs]; await conflict(f.call());
+  assert.deepEqual([...f.db.docs], before); assert.equal(f.db.writes.length, 0);
+  assert.deepEqual(f.db.recursiveDeletes, []); assert.deepEqual(f.auth.deleteCalls, []);
+});
+
+test('deny writer: an old reservation without a guard cannot be rebound to a new deletion', async () => {
+  const f = fixture(), record = denyRecord(guarded().deletionId);
+  f.db.put(RETIRED, record);
+  await conflict(f.call());
+  assert.notEqual(f.db.docs.get(G).deletionId, record.deletionId);
+  assert.deepEqual(f.db.docs.get(RETIRED), record);
+  assert.ok(f.db.docs.has(ROOT)); assert.ok(f.db.docs.has(L));
+  assert.ok(f.db.writes.every(w => w.ref.path === G));
+  assert.deepEqual(f.auth.deleteCalls, []); assert.deepEqual(f.db.recursiveDeletes, []);
+});
+
+test('deny writer: caller-selected UID is rejected before persistence', async () => {
+  const f = fixture(); const before = [...f.db.docs];
+  const response = await denyHttp(f, {uid: OTHER});
+  assert.equal(response.statusCode, 400); assert.deepEqual([...f.db.docs], before);
+  assert.deepEqual(f.auth.deleteCalls, []); assert.equal(f.db.writes.length, 0);
+});
+
+test('deny writer: record read failure stops before cleanup and HTTP details remain sanitized', async t => {
+  const f = fixture(), logs = [];
+  t.mock.method(console, 'error', (...values) => logs.push(values.join(' ')));
+  f.db.hooks.onRead = attempt => {
+    if (attempt.path === RETIRED) throw new Error('PRIVATE-RETIREMENT-STORAGE-DETAIL');
+  };
+  const response = await denyHttp(f);
+  assert.equal(response.statusCode, 500); assert.notEqual(response.body.deleted, true);
+  assert.doesNotMatch(JSON.stringify({response, logs}), /PRIVATE-RETIREMENT-STORAGE-DETAIL/);
+  assert.equal(f.db.docs.has(RETIRED), false);
+  assert.ok(f.db.writes.every(w => w.ref.path === G));
+  assert.equal(f.auth.present, true); assert.deepEqual(f.auth.deleteCalls, []);
+  assert.deepEqual(f.db.recursiveDeletes, []);
+});
+
+test('deny writer: a matching record cannot bypass an invalid guard', async () => {
+  const f = fixture();
+  f.db.put(G, {...guarded(), retainUntil: Timestamp.now()});
+  f.db.put(RETIRED, denyRecord(guarded().deletionId));
+  const before = [...f.db.docs]; await conflict(f.call());
+  assert.deepEqual([...f.db.docs], before); assert.equal(f.db.writes.length, 0);
+  assert.deepEqual(f.auth.deleteCalls, []); assert.deepEqual(f.db.recursiveDeletes, []);
+});
+
+test('deny writer: legacy post-Auth continuation does not fabricate PRE_AUTH or acquire new authority', async () => {
+  const f = fixture(); f.auth.present = false; f.db.put(G, guarded());
+  assert.equal((await f.call()).body.deleted, true); integral(f);
+  assert.equal(f.db.docs.has(RETIRED), false); assert.equal(denyCreates(f).length, 0);
+});
+
+test('deny writer: COMPLETE replay never backfills a marker and durable records outlive guard removal', async () => {
+  const empty = fixture({root: false, birth: false}); empty.auth.present = false;
+  empty.db.put(G, guarded('COMPLETE'));
+  assert.equal((await empty.call()).body.deleted, true);
+  assert.equal(empty.db.docs.has(RETIRED), false); assert.equal(empty.db.writes.length, 0);
+  const f = fixture(); await f.call(); const marker = copy(f.db.docs.get(RETIRED)); assert.ok(marker);
+  const writes = f.db.writes.length; await f.call();
+  assert.deepEqual(f.db.docs.get(RETIRED), marker); assert.equal(f.db.writes.length, writes);
+  f.db.put(G, undefined); assert.deepEqual(f.db.docs.get(RETIRED), marker);
+});

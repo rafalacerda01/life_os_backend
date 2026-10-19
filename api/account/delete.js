@@ -389,6 +389,28 @@ async function ensureExternalCleanupMarker({ db, uid, userRef, guard }) {
   return cleanup;
 }
 
+// This runs only after normal deletion admission, through withActiveGuard.
+// PRE_AUTH names this controller's phase; it proves no Auth generation and
+// grants no deletion/recovery authority. Never adopt a legacy/foreign record.
+async function persistRetiredUidDeny(db, admission) {
+  const { bound, guard, authPresent } = admission;
+  const ref = db.collection('retired_auth_identities').doc(bound.uid);
+  const expected = { version: 2, state: 'RESERVED',
+    deletionId: guard.deletionId, origin: 'PRE_AUTH' };
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(ref);
+    if (snapshot.exists) {
+      const current = snapshot.data();
+      if (!hasExactKeys(current, Object.keys(expected)) ||
+          Object.keys(expected).some(key => current[key] !== expected[key])) throw stateConflict();
+      return;
+    }
+    // Preserve the existing legacy post-Auth continuation, without fabricating
+    // a PRE_AUTH record or using absence/presence of a marker as authority.
+    if (authPresent === true) transaction.create(ref, expected);
+  });
+}
+
 export async function deleteAccount({ db, auth, uid }) {
   const userRef = db.collection('users').doc(uid);
   let admission;
@@ -414,6 +436,7 @@ export async function deleteAccount({ db, auth, uid }) {
       return { body: { deleted: true, circleDeleted: false } };
     }
     const cleanupDb = circleCleanup.withActiveGuard(db, uid, guard);
+    await persistRetiredUidDeny(cleanupDb, admission);
     await establishBillingDeletionBarrier({ db: cleanupDb, uid });
     const cleanup = await ensureExternalCleanupMarker({ db: cleanupDb, uid, userRef, guard });
     await birthCleanup.verifySnapshot(db, admission);
