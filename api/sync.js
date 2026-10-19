@@ -71,6 +71,10 @@ function runSyncTransaction(userId, callback, ...options) {
         throw syncDeletionBlocked();
       }
     }
+    // Presence only denies sync; record contents never prove an Auth generation
+    // or authorize cleanup. Reading absence here also fences concurrent creation.
+    const retired = await transaction.get(db.collection('retired_auth_identities').doc(userId));
+    if (retired.exists) throw syncDeletionBlocked();
     return callback(transaction);
   }, ...options);
 }

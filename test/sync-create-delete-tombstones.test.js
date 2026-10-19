@@ -11,6 +11,7 @@ const requestContext = new AsyncLocalStorage();
 const UID = 'tombstone-user';
 const USER = `users/${UID}`;
 const GUARD = `account_deletion_guards/${UID}`;
+const RETIRED = `retired_auth_identities/${UID}`;
 const ID = 'entity-1';
 const DATE = '2026-01-01T12:00:00.000Z';
 const operations = [
@@ -214,6 +215,114 @@ function assertDeletionBlocked(response) {
   assert.notEqual(response.body.success, true, 'a rejected operation never emits a success ACK');
 }
 
+function retiredRecord(overrides = {}) {
+  return { version: 1, state: 'RESERVED',
+    deletionId: '12345678-1234-4234-8234-123456789abc',
+    authCreatedAtMs: 1, ...overrides };
+}
+
+for (const config of operations) {
+  test(`${config.entity}: retired UID blocks create and delete without modifying any document`, async t => {
+    const f = fixture(t, config, 1);
+    f.put(f.target, config.payload);
+    f.put(RETIRED, retiredRecord());
+    const before = new Map(f.docs);
+    assertDeletionBlocked(await f.invoke());
+    assertDeletionBlocked(await f.invoke('delete'));
+    assert.deepEqual(f.docs, before);
+    assert.equal(f.docs.has(GUARD), false, 'sync never bootstraps a deletion guard');
+    assert.equal(f.writes.length, 0);
+  });
+}
+
+for (const action of ['create', 'delete']) {
+  test(`retired UID: marker created before ${action} commit causes conflict then retry refuses all writes`, async t => {
+    const f = fixture(t, operations[0], action === 'delete' ? 1 : 0);
+    if (action === 'delete') f.put(f.target, operations[0].payload);
+    const before = new Map(f.docs);
+    f.hooks.beforeCommit = ({ attempt }) => {
+      if (attempt === 1) f.put(RETIRED, retiredRecord());
+    };
+    assertDeletionBlocked(await f.invoke(action));
+    assert.deepEqual(f.conflicts, [{ label: action, attempt: 1, paths: [RETIRED] }]);
+    assert.equal(f.attempts.length, 2);
+    assert.equal(f.attempts[0].reads.get(RETIRED), 0, 'absence is part of the first read set');
+    assert.equal(f.attempts[1].reads.get(RETIRED), 1, 'retry reads the newly committed marker');
+    assert.equal(f.attempts[1].pending.length, 0);
+    before.set(RETIRED, retiredRecord());
+    assert.deepEqual(f.docs, before);
+    assert.equal(f.writes.length, 0);
+  });
+}
+
+for (const [label, record] of [
+  ['V1', retiredRecord()],
+  ...['PRE_AUTH', 'AUTH_EVENT', 'LEGACY_REVIEW'].map(origin =>
+    [`V2 ${origin}`, { version: 2, state: 'RESERVED',
+      deletionId: '12345678-1234-4234-8234-123456789abc', origin }]),
+  ['empty document', {}],
+  ['unknown version/state', { version: 99, state: 'UNKNOWN' }],
+  ['expired-looking data', { state: 'COMPLETE', retainUntil: Timestamp.fromMillis(2) }],
+]) {
+  test(`retired UID: presence of ${label} blocks without reading record data`, async t => {
+    const f = fixture(t, operations[0]);
+    f.put(RETIRED, record);
+    f.hooks.afterRead = ({ ref, snapshot }) => {
+      if (ref.path === RETIRED) snapshot.data = () => { throw new Error('record data must not grant authority'); };
+    };
+    assertDeletionBlocked(await f.invoke());
+    assert.equal(f.writes.length, 0);
+    assert.deepEqual(f.docs.get(RETIRED), record);
+  });
+}
+
+test('retired UID: expired COMPLETE cannot override a durable marker', async t => {
+  const f = fixture(t, operations[0]);
+  f.put(GUARD, deletionGuard({ state: 'COMPLETE', retainUntil: Timestamp.fromMillis(2) }));
+  f.put(RETIRED, retiredRecord());
+  const before = new Map(f.docs);
+  assertDeletionBlocked(await f.invoke());
+  assert.deepEqual(f.docs, before);
+  assert.equal(f.writes.length, 0);
+});
+
+test('retired UID: passage of time and offline replays never clear the marker or acknowledge the payload', async t => {
+  const f = fixture(t, operations[0]);
+  f.put(RETIRED, retiredRecord());
+  const payload = { operation: 'create_task', taskId: ID, ...operations[0].payload };
+  const before = structuredClone(payload);
+  assertDeletionBlocked(await f.invoke('create', 'offline-first', payload, { exactBody: true }));
+  t.mock.method(Date, 'now', () => 8_000_000_000_000);
+  assertDeletionBlocked(await f.invoke('create', 'offline-later', payload, { exactBody: true }));
+  assert.deepEqual(payload, before);
+  assert.deepEqual(f.docs.get(RETIRED), retiredRecord());
+  assert.equal(f.writes.length, 0);
+});
+
+test('retired UID: marker read failure is retryable and sanitized without writes', async t => {
+  const f = fixture(t, operations[0]);
+  const logs = [];
+  t.mock.method(console, 'error', (...values) => logs.push(values.join(' ')));
+  f.hooks.afterRead = ({ ref }) => {
+    if (ref.path === RETIRED) throw new Error('PRIVATE-RETIRED-READ-ERROR');
+  };
+  const response = await f.invoke();
+  assert.ok(response.statusCode >= 500);
+  assert.notEqual(response.body.success, true);
+  assert.equal(f.writes.length, 0);
+  assert.doesNotMatch(JSON.stringify({ response, logs }), /PRIVATE-RETIRED-READ-ERROR/);
+});
+
+test('retired UID: another UID marker does not block sync or get modified', async t => {
+  const f = fixture(t, operations[0]);
+  const other = 'retired_auth_identities/other-user';
+  f.put(other, retiredRecord());
+  success(await f.invoke(), operations[0], 'create');
+  assert.deepEqual(f.docs.get(other), retiredRecord());
+  assert.equal(f.docs.has(RETIRED), false, 'normal sync never creates a reservation');
+  assert.ok(f.writes.every(write => write.path.startsWith(`${USER}/`) || write.path === USER));
+});
+
 for (const config of operations) {
   test(`${config.entity}: deletion guard blocks create and delete without writes`, async t => {
     const f = fixture(t, config, 1);
@@ -331,6 +440,16 @@ const delegatedPayloads = [
   { operation: 'apply_study_review', cardId: ID, subjectId: ID, occurredAt: DATE, timeZoneOffsetMinutes: 0 },
 ];
 for (const body of delegatedPayloads) {
+  test(`retired UID: delegated ${body.operation} refuses without writes or success`, async t => {
+    const f = fixture(t, operations[0]);
+    f.put(RETIRED, retiredRecord());
+    const before = new Map(f.docs);
+    assertDeletionBlocked(await f.invoke('create', body.operation, body, { exactBody: true }));
+    assert.ok(f.attempts[0].reads.has(RETIRED));
+    assert.deepEqual(f.docs, before);
+    assert.equal(f.writes.length, 0);
+  });
+
   test(`deletion guard: delegated ${body.operation} uses the transactional barrier`, async t => {
     const f = fixture(t, operations[0]);
     f.put(GUARD, deletionGuard());
@@ -341,6 +460,22 @@ for (const body of delegatedPayloads) {
 }
 
 for (const operation of ['update_habit', 'apply_study_progress_reset']) {
+  test(`retired UID: delegated ${operation} revalidates concurrent reservation on retry`, async t => {
+    const f = fixture(t, operations[0]);
+    f.put(`${USER}/habits/${ID}`, { title: 'Habit', completedDates: [] });
+    const before = new Map(f.docs);
+    f.hooks.beforeCommit = ({ attempt }) => {
+      if (attempt === 1) f.put(RETIRED, retiredRecord());
+    };
+    const body = delegatedPayloads.find(payload => payload.operation === operation);
+    assertDeletionBlocked(await f.invoke('create', operation, body, { exactBody: true }));
+    assert.equal(f.conflicts.length, 1);
+    assert.deepEqual(f.conflicts[0].paths, [RETIRED]);
+    before.set(RETIRED, retiredRecord());
+    assert.deepEqual(f.docs, before);
+    assert.equal(f.writes.length, 0);
+  });
+
   for (const activateDuringCommit of [false, true]) {
     test(`deletion guard: delegated ${operation}, normal/racing commit (race=${activateDuringCommit})`, async t => {
       const f = fixture(t, operations[0]);
@@ -388,7 +523,7 @@ for (const config of operations) {
     assert.equal(f.docs.has(f.target), true);
     assert.equal(f.count(), 1);
     assert.equal(f.docs.has(f.marker), false);
-    assert.deepEqual([...f.attempts[0].reads.keys()], [GUARD, USER, f.target, f.marker]);
+    assert.deepEqual([...f.attempts[0].reads.keys()], [GUARD, RETIRED, USER, f.target, f.marker]);
     assert.equal(f.writes.length, 2);
   });
 
@@ -605,7 +740,7 @@ function assertSubjectCleanup(f, expectedSubjects = 2, expectedReviewQueue = 7, 
   assert.equal(new Set(cardDeletes.map(write => write.path)).size, cardDeletes.length,
     'no card is deleted or counted twice');
   for (const attempt of f.attempts.filter(attempt => attempt.queryReads.size)) {
-    assert.deepEqual([...attempt.reads.keys()], [GUARD, USER, STUDY]);
+    assert.deepEqual([...attempt.reads.keys()], [GUARD, RETIRED, USER, STUDY]);
     const limit = attempt.querySnapshots[0].ref.limitCount;
     if (adaptive) assert.ok(Number.isInteger(limit) && limit >= 1 && limit <= CHUNK_SIZE);
     else assert.equal(limit, CHUNK_SIZE);
@@ -616,6 +751,30 @@ function assertSubjectCleanup(f, expectedSubjects = 2, expectedReviewQueue = 7, 
       assert.equal(attempt.pending.filter(write => write.path === STUDY).length, 1);
     }
   }
+}
+
+for (const duringCommit of [false, true]) {
+  test(`retired UID: subject cleanup chunk cannot write after reservation (duringCommit=${duringCommit})`, async t => {
+    const f = subjectFixture(t, 1);
+    if (duringCommit) {
+      f.hooks.beforeCommit = ({ record }) => {
+        if (record.queryReads.size) f.put(RETIRED, retiredRecord());
+      };
+    } else {
+      f.hooks.afterCommit = record => {
+        if (record.pending.some(write => write.path === f.target && write.type === 'delete')) {
+          f.put(RETIRED, retiredRecord());
+          f.put(STUDY, undefined);
+        }
+      };
+    }
+    assertDeletionBlocked(await f.invoke('delete'));
+    assert.equal(f.remaining(), 1);
+    assert.ok(f.writes.every(write => write.path !== STUDY));
+    assert.deepEqual(f.docs.get(RETIRED), retiredRecord());
+    if (duringCommit) assert.ok(f.conflicts.some(conflict => conflict.paths.includes(RETIRED)));
+    else assert.equal(f.docs.has(STUDY), false);
+  });
 }
 
 for (const removeRoot of [false, true]) {
@@ -669,7 +828,7 @@ for (const size of [0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 450, 451, 1001]) {
     assert.equal(f.chunks().length, Math.ceil(size / CHUNK_SIZE));
     assert.equal(f.chunks().reduce((total, chunk) => total + chunk.result.deleted, 0), size);
     const seal = f.attempts[0];
-    assert.deepEqual([...seal.reads.keys()], [GUARD, USER, f.target, f.marker]);
+    assert.deepEqual([...seal.reads.keys()], [GUARD, RETIRED, USER, f.target, f.marker]);
     assert.equal(seal.queryReads.size, 0, 'phase 1 does not read study_info or query cards');
     assert.equal(seal.pending.length, 3);
     assert.equal(f.attempts.at(-1).result.deleted, 0);
