@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
 import { getApps, initializeApp } from 'firebase-admin/app';
-import { getFirestore } from 'firebase-admin/firestore';
+import { getFirestore, Timestamp } from 'firebase-admin/firestore';
 
 if (!getApps().length) initializeApp({ projectId: 'sync-tombstones-test' });
 const { syncHandler } = await import('../api/sync.js');
@@ -10,6 +10,7 @@ const firestore = getFirestore();
 const requestContext = new AsyncLocalStorage();
 const UID = 'tombstone-user';
 const USER = `users/${UID}`;
+const GUARD = `account_deletion_guards/${UID}`;
 const ID = 'entity-1';
 const DATE = '2026-01-01T12:00:00.000Z';
 const operations = [
@@ -31,8 +32,8 @@ function collection(path) {
   return {
     doc: id => document(`${path}/${id}`),
     where: (field, operator, value) => {
-      assert.equal(operator, '==');
-      return { path, query: true, field, value,
+      assert.ok(['==', '>'].includes(operator));
+      return { path, query: true, field, operator, value,
         limit(size) { return { ...this, limitCount: size }; } };
     },
   };
@@ -91,7 +92,8 @@ function fixture(t, config, count = 0) {
           if (ref.query) {
             queryReads.set(ref.path, startCollectionVersions.get(ref.path) ?? 0);
             const matches = [...state.keys()].filter(path =>
-              path.slice(0, path.lastIndexOf('/')) === ref.path && state.get(path)[ref.field] === ref.value);
+              path.slice(0, path.lastIndexOf('/')) === ref.path &&
+              (ref.operator === '>' ? state.get(path)[ref.field] > ref.value : state.get(path)[ref.field] === ref.value));
             const selected = matches.slice(0, ref.limitCount ?? Infinity);
             value = { size: selected.length, docs: selected.map(path => snapshot(path, state)) };
             attemptRecord.querySnapshots.push({ ref, snapshot: value });
@@ -154,14 +156,19 @@ function fixture(t, config, count = 0) {
     throw new Error('Exceeded conflict retry limit');
   });
 
-  async function invoke(action = 'create', label = action, body = {}) {
+  function put(path, data) {
+    if (data === undefined) docs.delete(path);
+    else docs.set(path, data);
+    versions.set(path, (versions.get(path) ?? 0) + 1);
+  }
+  async function invoke(action = 'create', label = action, body = {}, { exactBody = false } = {}) {
     const res = { statusCode: 200, setHeader() {},
       status(code) { this.statusCode = code; return this; },
       json(value) { this.body = value; return this; } };
     await requestContext.run(label, () => syncHandler({
       method: 'POST',
       headers: { authorization: 'Bearer test-token', 'x-firebase-appcheck': 'test-app-check' },
-      body: { operation: `${action}_${config.entity}`, [config.idField]: ID,
+      body: exactBody ? body : { operation: `${action}_${config.entity}`, [config.idField]: ID,
         ...(action === 'create' ? config.payload : {}), ...body },
     }, res, {
       verifyAppCheckToken: async () => ({ appId: 'test-app' }),
@@ -176,7 +183,7 @@ function fixture(t, config, count = 0) {
     }));
     return res;
   }
-  return { docs, writes, attempts, conflicts, hooks, storageBytes, rejectedSizes, target, marker, invoke,
+  return { docs, writes, attempts, conflicts, hooks, storageBytes, rejectedSizes, target, marker, invoke, put,
     count: () => docs.get(USER)[config.counter] };
 }
 
@@ -195,6 +202,183 @@ function deleted(f, config, count = 0) {
   assert.ok(marker.deletedAt instanceof Date);
 }
 
+function deletionGuard(overrides = {}) {
+  return { version: 1, state: 'IN_PROGRESS',
+    deletionId: '12345678-1234-4234-8234-123456789abc',
+    startedAt: Timestamp.fromMillis(1), retainUntil: null, ...overrides };
+}
+function assertDeletionBlocked(response) {
+  assert.equal(response.statusCode, 503);
+  assert.deepEqual(response.body, { code: 'ACCOUNT_DELETION_BLOCKED',
+    error: 'Conta indisponível para sincronização.' });
+  assert.notEqual(response.body.success, true, 'a rejected operation never emits a success ACK');
+}
+
+for (const config of operations) {
+  test(`${config.entity}: deletion guard blocks create and delete without writes`, async t => {
+    const f = fixture(t, config, 1);
+    f.put(f.target, config.payload);
+    f.put(GUARD, deletionGuard());
+    const before = new Map(f.docs);
+    assertDeletionBlocked(await f.invoke());
+    assertDeletionBlocked(await f.invoke('delete'));
+    assert.deepEqual(f.docs, before);
+    assert.equal(f.writes.length, 0);
+  });
+
+  test(`${config.entity}: guard created before commit invalidates the transaction and retry blocks`, async t => {
+    const f = fixture(t, config);
+    f.hooks.beforeCommit = ({ attempt }) => {
+      if (attempt === 1) f.put(GUARD, deletionGuard());
+    };
+    assertDeletionBlocked(await f.invoke());
+    assert.ok(f.conflicts.some(conflict => conflict.paths.includes(GUARD)));
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.docs.has(f.target), false);
+    assert.equal(f.count(), 0);
+  });
+}
+
+test('deletion guard: offline replay remains retryable and the identical request succeeds after unblocking', async t => {
+  const config = operations[0];
+  const f = fixture(t, config);
+  const pendingPayload = { operation: 'create_task', taskId: ID, ...config.payload };
+  const originalPayload = structuredClone(pendingPayload);
+  f.put(GUARD, deletionGuard());
+  for (let attempt = 0; attempt < 2; attempt++) {
+    assertDeletionBlocked(await f.invoke('create', 'offline', pendingPayload, { exactBody: true }));
+  }
+  assert.deepEqual(pendingPayload, originalPayload);
+  assert.equal(f.writes.length, 0);
+  // Synthetic state transition only; the endpoint never removes a guard.
+  f.put(GUARD, undefined);
+  success(await f.invoke('create', 'replay', pendingPayload, { exactBody: true }), config, 'create');
+  success(await f.invoke('create', 'replay-again', pendingPayload, { exactBody: true }), config, 'create');
+  assert.equal(f.count(), 1);
+  assert.equal(f.writes.length, 2);
+});
+
+for (const [label, guard] of [
+  ['COMPLETE retained', deletionGuard({ state: 'COMPLETE', retainUntil: Timestamp.fromMillis(8_000_000_000_000) })],
+  ['malformed COMPLETE null', deletionGuard({ state: 'COMPLETE' })],
+  ['legacy malformed record', { state: 'IN_PROGRESS' }],
+  ['unknown version', deletionGuard({ version: 2 })],
+  ['unexpected field', deletionGuard({ privateDetail: 'PRIVATE-GUARD-CONTENT' })],
+]) {
+  test(`deletion guard: ${label} fails closed without exposing contents`, async t => {
+    const f = fixture(t, operations[0]);
+    f.put(GUARD, guard);
+    const logs = [];
+    t.mock.method(console, 'error', (...values) => logs.push(values.join(' ')));
+    assertDeletionBlocked(await f.invoke());
+    assert.equal(f.writes.length, 0);
+    assert.doesNotMatch(JSON.stringify(logs), /PRIVATE-GUARD-CONTENT|12345678-1234/);
+    assert.deepEqual(f.docs.get(GUARD), guard);
+  });
+}
+
+test('deletion guard: expired valid COMPLETE preserves normal sync and its metadata', async t => {
+  const f = fixture(t, operations[0]);
+  const guard = deletionGuard({ state: 'COMPLETE', retainUntil: Timestamp.fromMillis(2) });
+  f.put(GUARD, guard);
+  success(await f.invoke(), operations[0], 'create');
+  assert.deepEqual(f.docs.get(GUARD), guard);
+  assert.ok(f.writes.every(write => write.path !== GUARD));
+});
+
+test('deletion guard: expired COMPLETE changed to active before commit blocks the retry', async t => {
+  const f = fixture(t, operations[0]);
+  f.put(GUARD, deletionGuard({ state: 'COMPLETE', retainUntil: Timestamp.fromMillis(2) }));
+  f.hooks.beforeCommit = ({ attempt }) => {
+    if (attempt === 1) f.put(GUARD, deletionGuard());
+  };
+  assertDeletionBlocked(await f.invoke());
+  assert.equal(f.conflicts.length, 1);
+  assert.equal(f.writes.length, 0);
+});
+
+test('deletion guard: read failure is sanitized, retryable and never confirms writes', async t => {
+  const f = fixture(t, operations[0]);
+  const logs = [];
+  t.mock.method(console, 'error', (...values) => logs.push(values.join(' ')));
+  f.hooks.afterRead = ({ ref }) => {
+    if (ref.path === GUARD) throw new Error('PRIVATE-FIRESTORE-ERROR');
+  };
+  const response = await f.invoke();
+  assert.ok(response.statusCode >= 500);
+  assert.notEqual(response.body.success, true);
+  assert.equal(f.writes.length, 0);
+  assert.doesNotMatch(JSON.stringify({ response, logs }), /PRIVATE-FIRESTORE-ERROR/);
+});
+
+test('deletion guard: another UID does not block this user or change its guard', async t => {
+  const f = fixture(t, operations[0]);
+  const otherGuard = 'account_deletion_guards/other-user';
+  f.put(otherGuard, deletionGuard());
+  success(await f.invoke(), operations[0], 'create');
+  assert.deepEqual(f.docs.get(otherGuard), deletionGuard());
+  assert.ok(f.writes.every(write => write.path.startsWith(`${USER}/`) || write.path === USER));
+});
+
+const delegatedPayloads = [
+  { operation: 'update_task', taskId: ID, isCompleted: true },
+  { operation: 'update_habit', habitId: ID, completedDates: [] },
+  { operation: 'update_habit_completion', habitId: ID, completedDates: [],
+    competitiveCompletionId: '12345678-1234-4234-8234-123456789abc' },
+  { operation: 'apply_study_activity', mutationId: '12345678-1234-4234-8234-123456789abc',
+    subjectId: null, progressDelta: 0.1, occurredAt: DATE, timeZoneOffsetMinutes: 0 },
+  { operation: 'apply_study_progress_reset', mutationId: '12345678-1234-4234-8234-123456789abc', occurredAt: DATE },
+  { operation: 'apply_study_review', cardId: ID, subjectId: ID, occurredAt: DATE, timeZoneOffsetMinutes: 0 },
+];
+for (const body of delegatedPayloads) {
+  test(`deletion guard: delegated ${body.operation} uses the transactional barrier`, async t => {
+    const f = fixture(t, operations[0]);
+    f.put(GUARD, deletionGuard());
+    assertDeletionBlocked(await f.invoke('create', body.operation, body, { exactBody: true }));
+    assert.equal(f.writes.length, 0);
+    assert.ok(f.attempts[0].reads.has(GUARD));
+  });
+}
+
+for (const operation of ['update_habit', 'apply_study_progress_reset']) {
+  for (const activateDuringCommit of [false, true]) {
+    test(`deletion guard: delegated ${operation}, normal/racing commit (race=${activateDuringCommit})`, async t => {
+      const f = fixture(t, operations[0]);
+      f.put(`${USER}/habits/${ID}`, { title: 'Habit', completedDates: [] });
+      const before = new Map(f.docs);
+      if (activateDuringCommit) f.hooks.beforeCommit = ({ attempt }) => {
+        if (attempt === 1) f.put(GUARD, deletionGuard());
+      };
+      const body = delegatedPayloads.find(payload => payload.operation === operation);
+      const response = await f.invoke('create', operation, body, { exactBody: true });
+      if (activateDuringCommit) {
+        assertDeletionBlocked(response);
+        assert.ok(f.conflicts.some(conflict => conflict.paths.includes(GUARD)));
+        assert.equal(f.writes.length, 0);
+        before.set(GUARD, deletionGuard());
+        assert.deepEqual(f.docs, before);
+      } else {
+        assert.equal(response.statusCode, 200);
+        assert.equal(response.body.success, true);
+        assert.equal(f.writes.length, operation === 'update_habit' ? 1 : 3);
+      }
+    });
+  }
+}
+
+for (const active of [false, true]) {
+  test(`deletion guard: missing root is never recreated (active=${active})`, async t => {
+    const f = fixture(t, operations[0]);
+    f.put(USER, undefined);
+    if (active) f.put(GUARD, deletionGuard());
+    const response = await f.invoke();
+    if (active) assertDeletionBlocked(response);
+    else assert.equal(response.statusCode, 404);
+    assert.equal(f.docs.has(USER), false);
+    assert.equal(f.writes.length, 0);
+  });
+}
+
 for (const config of operations) {
   const check = (name, fn) => test(`${config.entity}: ${name}`, { timeout: 5000 }, fn);
 
@@ -204,7 +388,7 @@ for (const config of operations) {
     assert.equal(f.docs.has(f.target), true);
     assert.equal(f.count(), 1);
     assert.equal(f.docs.has(f.marker), false);
-    assert.deepEqual([...f.attempts[0].reads.keys()], [USER, f.target, f.marker]);
+    assert.deepEqual([...f.attempts[0].reads.keys()], [GUARD, USER, f.target, f.marker]);
     assert.equal(f.writes.length, 2);
   });
 
@@ -421,7 +605,7 @@ function assertSubjectCleanup(f, expectedSubjects = 2, expectedReviewQueue = 7, 
   assert.equal(new Set(cardDeletes.map(write => write.path)).size, cardDeletes.length,
     'no card is deleted or counted twice');
   for (const attempt of f.attempts.filter(attempt => attempt.queryReads.size)) {
-    assert.deepEqual([...attempt.reads.keys()], [STUDY]);
+    assert.deepEqual([...attempt.reads.keys()], [GUARD, USER, STUDY]);
     const limit = attempt.querySnapshots[0].ref.limitCount;
     if (adaptive) assert.ok(Number.isInteger(limit) && limit >= 1 && limit <= CHUNK_SIZE);
     else assert.equal(limit, CHUNK_SIZE);
@@ -434,6 +618,49 @@ function assertSubjectCleanup(f, expectedSubjects = 2, expectedReviewQueue = 7, 
   }
 }
 
+for (const removeRoot of [false, true]) {
+  test(`subject chunks: account deletion between phases prevents study_info recreation (removeRoot=${removeRoot})`, async t => {
+    const f = subjectFixture(t, 1);
+    f.hooks.afterCommit = record => {
+      if (record.pending.some(write => write.path === f.target && write.type === 'delete')) {
+        f.put(GUARD, deletionGuard());
+        if (removeRoot) f.put(USER, undefined);
+        f.put(STUDY, undefined);
+      }
+    };
+    assertDeletionBlocked(await f.invoke('delete'));
+    assert.equal(f.docs.has(STUDY), false);
+    assert.equal(f.remaining(), 1);
+    assert.ok(f.writes.every(write => write.path !== STUDY));
+  });
+}
+
+test('subject chunks: guard activation during a chunk conflicts before any card or study_info write', async t => {
+  const f = subjectFixture(t, 1);
+  f.hooks.beforeCommit = record => {
+    if (record.record.queryReads.size) f.put(GUARD, deletionGuard());
+  };
+  assertDeletionBlocked(await f.invoke('delete'));
+  assert.equal(f.remaining(), 1);
+  assert.ok(f.conflicts.some(conflict => conflict.paths.includes(GUARD)));
+  assert.ok(f.writes.every(write => write.path !== STUDY));
+});
+
+test('subject chunks: missing root after phase 1 cannot recreate study_info even without a guard', async t => {
+  const f = subjectFixture(t, 1);
+  f.hooks.afterCommit = record => {
+    if (record.pending.some(write => write.path === f.target && write.type === 'delete')) {
+      f.put(USER, undefined);
+      f.put(STUDY, undefined);
+    }
+  };
+  const response = await f.invoke('delete');
+  assert.equal(response.statusCode, 404);
+  assert.equal(f.docs.has(USER), false);
+  assert.equal(f.docs.has(STUDY), false);
+  assert.equal(f.remaining(), 1);
+});
+
 for (const size of [0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 450, 451, 1001]) {
   test(`subject chunks: ${size} cards succeed without a total-size rejection`, async t => {
     const f = subjectFixture(t, size);
@@ -442,7 +669,7 @@ for (const size of [0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 450, 451, 1001]) {
     assert.equal(f.chunks().length, Math.ceil(size / CHUNK_SIZE));
     assert.equal(f.chunks().reduce((total, chunk) => total + chunk.result.deleted, 0), size);
     const seal = f.attempts[0];
-    assert.deepEqual([...seal.reads.keys()], [USER, f.target, f.marker]);
+    assert.deepEqual([...seal.reads.keys()], [GUARD, USER, f.target, f.marker]);
     assert.equal(seal.queryReads.size, 0, 'phase 1 does not read study_info or query cards');
     assert.equal(seal.pending.length, 3);
     assert.equal(f.attempts.at(-1).result.deleted, 0);

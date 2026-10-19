@@ -6,6 +6,7 @@ import {
   FieldValue,
 } from 'firebase-admin/firestore';
 import { ActivityHttpError } from './activity/_shared.js';
+import circleCleanup from './account/_circle_cleanup.cjs';
 import {
   syncHabitCompletionUpdate,
   syncHabitUpdate,
@@ -51,6 +52,35 @@ if (!getApps().length) {
 }
 
 const db = getFirestore();
+
+// The missing guard is also a transactional read: creation or replacement of
+// that document conflicts with this attempt. Revalidate on every SDK retry.
+function runSyncTransaction(userId, callback, ...options) {
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(circleCleanup.guardRef(db, userId));
+    if (snapshot.exists) {
+      let guard;
+      try {
+        guard = circleCleanup.validateGuard(snapshot.data());
+      } catch (_) {
+        throw syncDeletionBlocked();
+      }
+      // Match the existing retention barrier. Malformed/legacy guards fail
+      // closed; a valid expired COMPLETE is not permission to run a cleaner.
+      if (guard.state === 'IN_PROGRESS' || guard.retainUntil.toMillis() >= Date.now()) {
+        throw syncDeletionBlocked();
+      }
+    }
+    return callback(transaction);
+  }, ...options);
+}
+
+function syncDeletionBlocked() {
+  // The existing Flutter transport treats 5xx as retryable, preserving its
+  // offline queue. 403/409 would instead mark an ordinary item rejected.
+  return new ActivityHttpError(503, 'ACCOUNT_DELETION_BLOCKED',
+    'Conta indisponível para sincronização.');
+}
 
 // ============================================================================
 // RATE LIMIT
@@ -126,6 +156,10 @@ const MAX_HABIT_DATES = 5000;
 const MAX_HABIT_DATE_LENGTH = 20;
 
 const SAFE_SYNC_DOMAIN_ERRORS = Object.freeze({
+  ACCOUNT_DELETION_BLOCKED: Object.freeze({
+    statusCode: 503,
+    messages: Object.freeze(['Conta indisponível para sincronização.']),
+  }),
   USER_NOT_FOUND: Object.freeze({
     statusCode: 404,
     messages: Object.freeze(['Usuário não encontrado.']),
@@ -813,7 +847,7 @@ async function createTransactionWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'transactions', transactionId);
 
-  return db.runTransaction(
+  return runSyncTransaction(userId,
     async (transaction) => {
       const userSnapshot =
         await transaction.get(userRef);
@@ -939,7 +973,7 @@ async function deleteTransactionWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'transactions', transactionId);
 
-  return db.runTransaction(
+  return runSyncTransaction(userId,
     async (transaction) => {
       const userSnapshot =
         await transaction.get(userRef);
@@ -1572,7 +1606,7 @@ async function createMedicationWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'medications', medicationId);
 
-  return db.runTransaction(async (transaction) => {
+  return runSyncTransaction(userId, async (transaction) => {
     const userSnapshot =
       await transaction.get(userRef);
 
@@ -1698,7 +1732,7 @@ async function deleteMedicationWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'medications', medicationId);
 
-  return db.runTransaction(async (transaction) => {
+  return runSyncTransaction(userId, async (transaction) => {
     const userSnapshot =
       await transaction.get(userRef);
 
@@ -1795,7 +1829,7 @@ async function createSubjectWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'subjects', subjectId);
 
-  return db.runTransaction(async (transaction) => {
+  return runSyncTransaction(userId, async (transaction) => {
     const userSnapshot =
       await transaction.get(userRef);
 
@@ -1934,7 +1968,7 @@ async function deleteSubjectWithQuota({
   const tombstoneRef = syncTombstoneRef(userRef, 'subjects', subjectId);
 
   // Phase 1 seals the identity and decrements the subject count at most once.
-  const deletion = await db.runTransaction(async (transaction) => {
+  const deletion = await runSyncTransaction(userId, async (transaction) => {
     // Todas as leituras antes das escritas.
     const userSnapshot =
       await transaction.get(userRef);
@@ -2020,7 +2054,11 @@ async function deleteSubjectWithQuota({
   for (let chunkAttempt = 0; chunkAttempt < SUBJECT_DELETE_MAX_CHUNK_TRANSACTIONS; chunkAttempt++) {
     let chunk;
     try {
-      chunk = await db.runTransaction(async (transaction) => {
+      chunk = await runSyncTransaction(userId, async (transaction) => {
+        const userSnapshot = await transaction.get(userRef);
+        if (!userSnapshot.exists) {
+          throw new ActivityHttpError(404, 'USER_NOT_FOUND', 'Usuário não encontrado.');
+        }
         const studyInfoSnapshot = await transaction.get(studyInfoRef);
         const flashcardsSnapshot = await transaction.get(flashcardsQuery.limit(chunkSize));
 
@@ -2077,7 +2115,7 @@ async function createGoalWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'goals', goalId);
 
-  return db.runTransaction(async (transaction) => {
+  return runSyncTransaction(userId, async (transaction) => {
     const userSnapshot =
       await transaction.get(userRef);
 
@@ -2197,7 +2235,7 @@ async function deleteGoalWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'goals', goalId);
 
-  return db.runTransaction(async (transaction) => {
+  return runSyncTransaction(userId, async (transaction) => {
     const userSnapshot =
       await transaction.get(userRef);
 
@@ -2285,7 +2323,7 @@ async function createTaskWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'tasks', taskId);
 
-  return db.runTransaction(async (transaction) => {
+  return runSyncTransaction(userId, async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
     const taskSnapshot = await transaction.get(taskRef);
 
@@ -2389,7 +2427,7 @@ async function deleteTaskWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'tasks', taskId);
 
-  return db.runTransaction(async (transaction) => {
+  return runSyncTransaction(userId, async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
     const taskSnapshot = await transaction.get(taskRef);
 
@@ -2469,7 +2507,7 @@ async function createHabitWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'habits', habitId);
 
-  return db.runTransaction(async (transaction) => {
+  return runSyncTransaction(userId, async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
     const habitSnapshot = await transaction.get(habitRef);
 
@@ -2584,7 +2622,7 @@ async function deleteHabitWithQuota({
 
   const tombstoneRef = syncTombstoneRef(userRef, 'habits', habitId);
 
-  return db.runTransaction(async (transaction) => {
+  return runSyncTransaction(userId, async (transaction) => {
     const userSnapshot = await transaction.get(userRef);
     const habitSnapshot =
       await transaction.get(habitRef);
@@ -2836,6 +2874,13 @@ export async function syncHandler(req, res, runtime = {}) {
     // ------------------------------------------------------------------------
 
     const operation = rawBody.operation;
+    // Imported activity/study helpers keep the same transaction callback and
+    // native references; only transaction admission is wrapped here.
+    const guardedDb = {
+      collection: db.collection.bind(db),
+      runTransaction: (callback, ...options) =>
+        runSyncTransaction(userId, callback, ...options),
+    };
     if (operation === 'increment_water' || operation === 'reconcile_water') {
       try {
         const result = await syncWater({ db, userId, body: rawBody,
@@ -2855,15 +2900,15 @@ export async function syncHandler(req, res, runtime = {}) {
       try {
         let result;
         if (operation === 'update_task') {
-          result = await syncTaskUpdate({ body: rawBody, db, uid: userId });
+          result = await syncTaskUpdate({ body: rawBody, db: guardedDb, uid: userId });
         } else if (operation === 'update_habit_completion') {
           result = await syncHabitCompletionUpdate({
             body: rawBody,
-            db,
+            db: guardedDb,
             uid: userId,
           });
         } else {
-          result = await syncHabitUpdate({ body: rawBody, db, uid: userId });
+          result = await syncHabitUpdate({ body: rawBody, db: guardedDb, uid: userId });
         }
 
         return res.status(200).json(result.body);
@@ -2895,7 +2940,7 @@ export async function syncHandler(req, res, runtime = {}) {
         const result = await (
           runtime.applyStudyActivity ?? applyStudyActivity
         )({
-          db,
+          db: guardedDb,
           userId,
           ...validation.value,
         });
@@ -2927,7 +2972,7 @@ export async function syncHandler(req, res, runtime = {}) {
         const result = await (
           runtime.applyStudyProgressReset ?? applyStudyProgressReset
         )({
-          db,
+          db: guardedDb,
           userId,
           ...validation.value,
         });
@@ -2960,7 +3005,7 @@ export async function syncHandler(req, res, runtime = {}) {
         const result = await (
           runtime.applyStudyReview ?? applyStudyReview
         )({
-          db,
+          db: guardedDb,
           userId,
           ...validation.value,
         });
