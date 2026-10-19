@@ -23,6 +23,7 @@ const STATE = `${USER}/water_state/${DAY}`;
 const PROJECTION = `${USER}/health_info/${DAY}`;
 const ACTIVATION = `${USER}/water_protocol/activation`;
 const GUARD = `account_deletion_guards/${UID}`;
+const RETIRED = `retired_auth_identities/${UID}`;
 const receiptPath = id => `${USER}/water_increment_receipts/${id}`;
 const increment = (id = A, overrides = {}) => ({ operation: 'increment_water', version: 2,
   mutationId: id, healthDay: DAY, deltaMl: 250, occurredAt: `${DAY}T10:00:00.000Z`,
@@ -124,6 +125,111 @@ function rejected(res, status, code) { assert.equal(res.statusCode, status); if 
 function unchanged(f, before) { assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, 0); }
 const check = (name, fn) => test(name, { timeout: 5000 }, fn);
 
+function deletionBlocked(res) {
+  rejected(res, 503, 'ACCOUNT_DELETION_BLOCKED');
+  assert.deepEqual(res.body, { error: 'Conta indisponível para sincronização.',
+    code: 'ACCOUNT_DELETION_BLOCKED', retryable: true });
+  assert.notEqual(res.body.success, true);
+  for (const field of ['alreadyApplied', 'complete', 'recognized']) {
+    assert.equal(Object.hasOwn(res.body, field), false, 'a barrier never returns an ACK');
+  }
+}
+const retiredRecord = () => ({version: 2, state: 'RESERVED', deletionId: A, origin: 'PRE_AUTH'});
+
+for (const operation of [increment, reconcile]) {
+  for (const [name, guard] of [
+    ['COMPLETE retained', {version: 1, state: 'COMPLETE', deletionId: A,
+      startedAt: Timestamp.fromMillis(1), retainUntil: Timestamp.fromMillis(8_000_000_000_000)}],
+    ['COMPLETE null retention', {version: 1, state: 'COMPLETE', deletionId: A,
+      startedAt: Timestamp.fromMillis(1), retainUntil: null}],
+  ]) check(`deletion barrier ${operation.name}: ${name} is retryable without writes`, async t => {
+    const f = fixture(t); f.put(GUARD, guard); const before = [...f.docs];
+    deletionBlocked(await f.invoke(operation())); unchanged(f, before);
+  });
+
+  for (const [name, record] of [
+    ['V2', retiredRecord()],
+    ['V1', {version: 1, state: 'RESERVED', deletionId: A, authCreatedAtMs: 1}],
+    ['empty document', {}],
+    ['unknown expired-looking state', {version: 99, state: 'COMPLETE', retainUntil: Timestamp.fromMillis(2)}],
+  ]) check(`deletion barrier ${operation.name}: any retired UID document blocks (${name})`, async t => {
+    const f = fixture(t); f.put(RETIRED, record); const before = [...f.docs];
+    const res = await f.invoke(operation());
+    if (name === 'V2') t.diagnostic(JSON.stringify({statusCode: res.statusCode,
+      committedWrites: f.writes.length, totalMl: f.total(), revision: f.revision()}));
+    deletionBlocked(res); unchanged(f, before);
+  });
+
+  check(`deletion barrier ${operation.name}: expired guard and durable record never permit an ACK`, async t => {
+    const f = fixture(t);
+    f.put(GUARD, {version: 1, state: 'COMPLETE', deletionId: A,
+      startedAt: Timestamp.fromMillis(1), retainUntil: Timestamp.fromMillis(2)});
+    f.put(RETIRED, retiredRecord()); const before = [...f.docs];
+    deletionBlocked(await f.invoke(operation())); unchanged(f, before);
+  });
+
+  check(`deletion barrier ${operation.name}: marker created before commit conflicts and retry denies`, async t => {
+    const f = fixture(t);
+    f.hooks.beforeCommit = record => { if (record.attempt === 1) f.put(RETIRED, retiredRecord()); };
+    deletionBlocked(await f.invoke(operation()));
+    assert.deepEqual(f.conflicts, [{label: 'request', attempt: 1, paths: [RETIRED]}]);
+    assert.equal(f.attempts.length, 2);
+    assert.equal(f.attempts[0].reads.get(RETIRED), 0);
+    assert.equal(f.attempts[1].reads.get(RETIRED), 1);
+    assert.equal(f.attempts[1].pending.length, 0);
+    assert.equal(f.writes.length, 0); assert.equal(f.total(), 1000); assert.equal(f.revision(), 0);
+    assert.equal(f.docs.has(receiptPath(A)), false);
+  });
+
+  check(`deletion barrier ${operation.name}: receipt replay revalidates a concurrent retirement before ACK`, async t => {
+    const f = fixture(t); success(await f.invoke());
+    const before = [...f.docs]; const receipt = clone(f.docs.get(receiptPath(A)));
+    const writeCount = f.writes.length;
+    f.hooks.beforeCommit = record => {
+      if (record.label === 'replay' && record.attempt === 1) f.put(RETIRED, retiredRecord());
+    };
+    deletionBlocked(await f.invoke(operation === increment ? increment() : reconcile([A]), {label: 'replay'}));
+    assert.deepEqual(f.conflicts.at(-1).paths, [RETIRED]);
+    assert.deepEqual([...f.docs], [...before, [RETIRED, retiredRecord()]]);
+    assert.deepEqual(f.docs.get(receiptPath(A)), receipt);
+    assert.equal(f.total(), 1250); assert.equal(f.revision(), 1); assert.equal(f.writes.length, writeCount);
+  });
+
+  check(`deletion barrier ${operation.name}: marker read failure is sanitized and retryable`, async t => {
+    const f = fixture(t); const before = [...f.docs]; const logs = [];
+    t.mock.method(console, 'error', (...values) => logs.push(values.join(' ')));
+    f.hooks.onRead = ({path}) => { if (path === RETIRED) throw new Error('PRIVATE-WATER-MARKER-READ'); };
+    const res = await f.invoke(operation());
+    rejected(res, 503, 'WATER_FIRESTORE_UNAVAILABLE'); assert.equal(res.body.retryable, true);
+    assert.notEqual(res.body.success, true); unchanged(f, before);
+    assert.doesNotMatch(JSON.stringify({res, logs}), /PRIVATE-WATER-MARKER-READ/);
+  });
+
+  check(`deletion barrier ${operation.name}: another UID record cannot block or be changed`, async t => {
+    const f = fixture(t); const other = 'retired_auth_identities/other-owner';
+    f.put(other, retiredRecord()); success(await f.invoke(operation()));
+    assert.deepEqual(f.docs.get(other), retiredRecord());
+    assert.equal(f.docs.has(RETIRED), false);
+    assert.ok(f.writes.every(write => write.path.startsWith(`${USER}/`)));
+  });
+
+  for (const barrier of [GUARD, RETIRED]) {
+    check(`deletion barrier ${operation.name}: missing root with ${barrier} stays retryable`, async t => {
+      const f = fixture(t); f.put(USER, undefined);
+      f.put(barrier, barrier === RETIRED ? retiredRecord() : {state: 'IN_PROGRESS'});
+      const before = [...f.docs]; deletionBlocked(await f.invoke(operation()));
+      unchanged(f, before); assert.equal(f.docs.has(USER), false);
+    });
+  }
+
+  check(`deletion barrier ${operation.name}: repeated offline payload stays unacknowledged and unchanged`, async t => {
+    const f = fixture(t); f.put(RETIRED, retiredRecord());
+    const body = operation(), beforeBody = structuredClone(body), before = [...f.docs];
+    deletionBlocked(await f.invoke(body)); deletionBlocked(await f.invoke(body));
+    assert.deepEqual(body, beforeBody); unchanged(f, before);
+  });
+}
+
 function recognizedReceipt(receipt) {
   return { mutationId: receipt.mutationId, healthDay: receipt.healthDay,
     deltaMl: receipt.deltaMl, occurredAt: receipt.occurredAt,
@@ -161,7 +267,7 @@ check('first 250ml increment commits state, projection and durable receipt only'
     healthDay: DAY, epoch: EPOCH, revision: 1, waterIntakeMl: 250,
     alreadyApplied: false, effectiveCreditMl: 250, appliedRevision: 1 });
   assert.equal(f.writes.length, 3);
-  assert.deepEqual([...f.attempts[0].reads.keys()], [USER, GUARD, ACTIVATION, STATE, receiptPath(A), PROJECTION]);
+  assert.deepEqual([...f.attempts[0].reads.keys()], [USER, GUARD, RETIRED, ACTIVATION, STATE, receiptPath(A), PROJECTION]);
   const receipt = f.docs.get(receiptPath(A));
   assert.equal(receipt.mutationId, A); assert.equal(receipt.protocolVersion, 2);
   assert.equal(receipt.deltaMl, 250); assert.equal(receipt.healthDay, DAY);
@@ -266,7 +372,7 @@ check('reconcile accepts exactly 100 distinct UUIDs with bounded reads', async t
   const f = fixture(t);
   const ids = Array.from({ length: 100 }, (_, i) => `${i.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`);
   const result = success(await f.invoke(reconcile(ids)));
-  assert.equal(result.unrecognizedMutationIds.length, 100); assert.equal(f.attempts[0].reads.size, 105);
+  assert.equal(result.unrecognizedMutationIds.length, 100); assert.equal(f.attempts[0].reads.size, 106);
   assert.equal(f.writes.length, 0);
 });
 for (const overrides of [{ expectedEpoch: OTHER_EPOCH }, { expectedRevision: 1 }]) {
@@ -312,14 +418,14 @@ for (const operation of [increment, reconcile]) {
     ['COMPLETE even expired', { version: 1, state: 'COMPLETE', deletionId: A, startedAt: Timestamp.fromMillis(1), retainUntil: Timestamp.fromMillis(2) }],
   ]) check(`${operation.name}: existing deletion guard ${name} blocks`, async t => {
     const f = fixture(t); f.put(GUARD, guard); const before = [...f.docs];
-    rejected(await f.invoke(operation()), 403, 'WATER_ACCOUNT_DELETING'); unchanged(f, before);
+    deletionBlocked(await f.invoke(operation())); unchanged(f, before);
   });
   check(`${operation.name}: guard created between read and commit forces retry then rejection`, async t => {
     const f = fixture(t);
     const hold = gate(); f.hooks.beforeCommit = async r => { if (r.attempt === 1) await hold.hold(); };
     const pending = f.invoke(operation()); await hold.reached;
     f.put(GUARD, { state: 'IN_PROGRESS' }); hold.release();
-    rejected(await pending, 403, 'WATER_ACCOUNT_DELETING');
+    deletionBlocked(await pending);
     assert.deepEqual(f.conflicts[0].paths, [GUARD]); assert.equal(f.writes.length, 0);
     assert.equal(f.total(), 1000); assert.equal(f.docs.has(receiptPath(A)), false);
   });
@@ -327,10 +433,10 @@ for (const operation of [increment, reconcile]) {
 check('existing receipt cannot authorize replay or reconcile after deletion begins', async t => {
   const f = fixture(t); await f.invoke(); const receipt = f.docs.get(receiptPath(A));
   f.put(GUARD, { state: 'IN_PROGRESS' });
-  rejected(await f.invoke(), 403, 'WATER_ACCOUNT_DELETING');
-  rejected(await f.invoke(reconcile([A])), 403, 'WATER_ACCOUNT_DELETING');
+  deletionBlocked(await f.invoke());
+  deletionBlocked(await f.invoke(reconcile([A])));
   f.put(USER, undefined);
-  rejected(await f.invoke(), 404, 'WATER_USER_NOT_FOUND');
+  deletionBlocked(await f.invoke());
   assert.deepEqual(f.docs.get(receiptPath(A)), receipt); assert.equal(f.writes.length, 3);
   assert.equal(f.docs.has(USER), false);
 });
@@ -697,7 +803,7 @@ check('R2C 100 queried UUIDs are partitioned completely without duplicates or fo
   assert.equal(new Set(output).size, 100); assert.deepEqual(output.toSorted(), ids.toSorted());
   assert.ok(!output.includes(A)); assert.equal(res.revision, 51); assert.equal(res.waterIntakeMl, 13750);
   for (const receipt of res.recognized) assert.deepEqual(receipt, recognizedReceipt(f.docs.get(receiptPath(receipt.mutationId))));
-  assert.equal(f.attempts.at(-1).reads.size, 105); assert.equal(f.attempts.at(-1).pending.length, 0);
+  assert.equal(f.attempts.at(-1).reads.size, 106); assert.equal(f.attempts.at(-1).pending.length, 0);
   assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, count);
 });
 for (const operation of [increment, reconcile]) {

@@ -13,7 +13,7 @@ const ERRORS = Object.freeze({
   WATER_INVALID_PAYLOAD: [400, false, 'Payload de hidratação inválido.'],
   WATER_MUTATION_CONFLICT: [409, false, 'Identidade de hidratação reutilizada com conteúdo divergente.'],
   WATER_USER_NOT_FOUND: [404, false, 'Usuário não encontrado.'],
-  WATER_ACCOUNT_DELETING: [403, false, 'Conta indisponível para hidratação.'],
+  ACCOUNT_DELETION_BLOCKED: [503, true, 'Conta indisponível para sincronização.'],
   WATER_V2_DISABLED: [503, true, 'Protocolo de hidratação temporariamente indisponível.'],
   WATER_MIGRATION_NOT_READY: [503, true, 'Hidratação V2 ainda não preparada.'],
   WATER_INVALID_REMOTE_STATE: [409, true, 'Estado de hidratação inconsistente.'],
@@ -122,6 +122,7 @@ export async function syncWater({ db, userId, body, enabled = WATER_V2_ENABLED }
       /^__.*__$/.test(userId)) fail('WATER_USER_NOT_FOUND');
   const user = db.collection('users').doc(userId);
   const guard = db.collection('account_deletion_guards').doc(userId);
+  const retired = db.collection('retired_auth_identities').doc(userId);
   const activation = user.collection('water_protocol').doc('activation');
   const stateRef = user.collection('water_state').doc(body.healthDay);
   const projectionRef = user.collection('health_info').doc(body.healthDay);
@@ -130,14 +131,17 @@ export async function syncWater({ db, userId, body, enabled = WATER_V2_ENABLED }
   return db.runTransaction(async tx => {
     const userDoc = await tx.get(user);
     const guardDoc = await tx.get(guard);
+    const retiredDoc = await tx.get(retired);
     const activationDoc = await tx.get(activation);
     const stateDoc = await tx.get(stateRef);
     const receiptDocs = [];
     for (const ref of receiptRefs) receiptDocs.push(await tx.get(ref));
     const projectionDoc = await tx.get(projectionRef);
-    if (!userDoc.exists) fail('WATER_USER_NOT_FOUND');
     // Any existing guard blocks, including expired COMPLETE and malformed data.
-    if (guardDoc.exists) fail('WATER_ACCOUNT_DELETING');
+    // A retired UID is deny-only regardless of record data. Read absence in this
+    // same transaction, so concurrent creation is revalidated before any ACK.
+    if (guardDoc.exists || retiredDoc.exists) fail('ACCOUNT_DELETION_BLOCKED');
+    if (!userDoc.exists) fail('WATER_USER_NOT_FOUND');
     if (!activationDoc.exists) fail('WATER_MIGRATION_NOT_READY');
     const active = activationDoc.data();
     if (!exact(active, ['protocolVersion', 'epoch', 'status', 'legacyWritesBlocked']) ||
