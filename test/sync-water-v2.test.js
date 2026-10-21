@@ -267,7 +267,7 @@ check('first 250ml increment commits state, projection and durable receipt only'
     healthDay: DAY, epoch: EPOCH, revision: 1, waterIntakeMl: 250,
     alreadyApplied: false, effectiveCreditMl: 250, appliedRevision: 1 });
   assert.equal(f.writes.length, 3);
-  assert.deepEqual([...f.attempts[0].reads.keys()], [USER, GUARD, RETIRED, ACTIVATION, STATE, receiptPath(A), PROJECTION]);
+  assert.deepEqual([...f.attempts[0].reads.keys()], [USER, GUARD, RETIRED, `${USER}/runtime/account_deletion`, ACTIVATION, STATE, receiptPath(A), PROJECTION]);
   const receipt = f.docs.get(receiptPath(A));
   assert.equal(receipt.mutationId, A); assert.equal(receipt.protocolVersion, 2);
   assert.equal(receipt.deltaMl, 250); assert.equal(receipt.healthDay, DAY);
@@ -372,7 +372,7 @@ check('reconcile accepts exactly 100 distinct UUIDs with bounded reads', async t
   const f = fixture(t);
   const ids = Array.from({ length: 100 }, (_, i) => `${i.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`);
   const result = success(await f.invoke(reconcile(ids)));
-  assert.equal(result.unrecognizedMutationIds.length, 100); assert.equal(f.attempts[0].reads.size, 106);
+  assert.equal(result.unrecognizedMutationIds.length, 100); assert.equal(f.attempts[0].reads.size, 107);
   assert.equal(f.writes.length, 0);
 });
 for (const overrides of [{ expectedEpoch: OTHER_EPOCH }, { expectedRevision: 1 }]) {
@@ -803,7 +803,7 @@ check('R2C 100 queried UUIDs are partitioned completely without duplicates or fo
   assert.equal(new Set(output).size, 100); assert.deepEqual(output.toSorted(), ids.toSorted());
   assert.ok(!output.includes(A)); assert.equal(res.revision, 51); assert.equal(res.waterIntakeMl, 13750);
   for (const receipt of res.recognized) assert.deepEqual(receipt, recognizedReceipt(f.docs.get(receiptPath(receipt.mutationId))));
-  assert.equal(f.attempts.at(-1).reads.size, 106); assert.equal(f.attempts.at(-1).pending.length, 0);
+  assert.equal(f.attempts.at(-1).reads.size, 107); assert.equal(f.attempts.at(-1).pending.length, 0);
   assert.deepEqual([...f.docs], before); assert.equal(f.writes.length, count);
 });
 for (const operation of [increment, reconcile]) {
@@ -831,3 +831,12 @@ check('R2C storage cannot forge the new epoch error or leak secrets to response 
   assert.doesNotMatch(JSON.stringify([res.body, logged]), /fake-secret|third-party|internal-stack/);
   assert.deepEqual(logged, [['[sync] Falha ao sincronizar hidratação V2.']]); unchanged(f, before);
 });
+
+for (const path of [USER+'/runtime/account_deletion',USER]) {
+  check('runtime/root deletion denial precedes Water ACK '+path,async t=>{
+    const f=fixture(t); f.docs.set(path,path===USER ? {_serverAccountDeletion:{state:'DENY'}} : {});
+    const before=[...f.docs]; const result=await f.invoke(increment());
+    assert.equal(result.statusCode,503); assert.equal(result.body.code,'ACCOUNT_DELETION_BLOCKED');
+    assert.equal(result.body.retryable,true); assert.deepEqual([...f.docs],before);
+  });
+}

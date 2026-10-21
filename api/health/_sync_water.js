@@ -57,7 +57,7 @@ function validIntent(value) {
   const local = new Date(instant + value.timeZoneOffsetMinutes * 60_000).toISOString();
   return local.slice(0, 10) === value.healthDay;
 }
-function validate(body) {
+export function validateWaterPayload(body) {
   if (!object(body) || body.version !== 2 || !day(body.healthDay)) fail('WATER_INVALID_PAYLOAD');
   if (body.operation === 'increment_water') {
     if (!exact(body, INCREMENT_KEYS) || !validIntent(body) || !uuid(body.originEpoch)) fail('WATER_INVALID_PAYLOAD');
@@ -115,7 +115,7 @@ function snapshot(state, healthDay) {
 // new, proven-empty day starts at 0/revision 0 in the same account epoch. Missing
 // documents here are never bootstrapped from an absolute legacy value.
 export async function syncWater({ db, userId, body, enabled = WATER_V2_ENABLED }) {
-  validate(body);
+  validateWaterPayload(body);
   if (enabled !== true) fail('WATER_V2_DISABLED');
   if (typeof userId !== 'string' || userId.length === 0 || userId.length > 128 ||
       userId.trim() !== userId || userId.includes('/') || ['.', '..'].includes(userId) ||
@@ -132,6 +132,7 @@ export async function syncWater({ db, userId, body, enabled = WATER_V2_ENABLED }
     const userDoc = await tx.get(user);
     const guardDoc = await tx.get(guard);
     const retiredDoc = await tx.get(retired);
+    const deletionDoc = await tx.get(user.collection('runtime').doc('account_deletion'));
     const activationDoc = await tx.get(activation);
     const stateDoc = await tx.get(stateRef);
     const receiptDocs = [];
@@ -140,7 +141,8 @@ export async function syncWater({ db, userId, body, enabled = WATER_V2_ENABLED }
     // Any existing guard blocks, including expired COMPLETE and malformed data.
     // A retired UID is deny-only regardless of record data. Read absence in this
     // same transaction, so concurrent creation is revalidated before any ACK.
-    if (guardDoc.exists || retiredDoc.exists) fail('ACCOUNT_DELETION_BLOCKED');
+    if (guardDoc.exists || retiredDoc.exists || deletionDoc.exists ||
+        (userDoc.exists && Object.hasOwn(userDoc.data(),'_serverAccountDeletion'))) fail('ACCOUNT_DELETION_BLOCKED');
     if (!userDoc.exists) fail('WATER_USER_NOT_FOUND');
     if (!activationDoc.exists) fail('WATER_MIGRATION_NOT_READY');
     const active = activationDoc.data();

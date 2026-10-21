@@ -14,7 +14,9 @@ import {
 } from './activity/_sync_updates.js';
 import { checkDistributedRateLimit } from './_distributed_rate_limit.js';
 import { hasValidGooglePlayPremium } from './billing/google/_entitlement.js';
-import { syncWater, waterErrorResponse, WATER_V2_ENABLED } from './health/_sync_water.js';
+import { syncWater, waterErrorResponse, validateWaterPayload, WATER_V2_ENABLED } from './health/_sync_water.js';
+import { createWaterLifecycle, waterLifecycleError } from './health/_water_lifecycle.js';
+import {createWaterGoals,validateGoalPayload,goalErrorResponse} from './health/_water_goal.js';
 import {
   applyStudyActivity,
   validateStudyActivityPayload,
@@ -2885,7 +2887,35 @@ export async function syncHandler(req, res, runtime = {}) {
       runTransaction: (callback, ...options) =>
         runSyncTransaction(userId, callback, ...options),
     };
+    if (operation === 'bootstrap_water') {
+      try {
+        const lifecycle = runtime.waterLifecycle ?? createWaterLifecycle({db, auth:getAuth()});
+        return res.status(200).json(await lifecycle.bootstrap(userId,rawBody));
+      } catch (error) {
+        const response=waterLifecycleError(error);
+        return res.status(response.status).json(response.body);
+      }
+    }
+    if (operation === 'set_water_goal') {
+      try {validateGoalPayload(rawBody);} catch (error) {
+        const r=goalErrorResponse(error); return res.status(r.status).json(r.body);
+      }
+      try {
+        await (runtime.waterLifecycle ?? createWaterLifecycle({db,auth:getAuth()})).ensureAccount(userId);
+      } catch (error) {
+        const r=waterLifecycleError(error); return res.status(r.status).json(r.body);
+      }
+      try {return res.status(200).json(await createWaterGoals({db}).set(userId,rawBody));}
+      catch (error) {const r=goalErrorResponse(error); return res.status(r.status).json(r.body);}
+    }
     if (operation === 'increment_water' || operation === 'reconcile_water') {
+      try {validateWaterPayload(rawBody);} catch (error) {
+        const r=waterErrorResponse(error); return res.status(r.status).json(r.body);
+      }
+      if (WATER_V2_ENABLED) {
+        try {await createWaterLifecycle({db,auth:getAuth()}).ensureDay(userId,rawBody.healthDay);}
+        catch (error) {const r=waterLifecycleError(error); return res.status(r.status).json(r.body);}
+      }
       try {
         const result = await syncWater({ db, userId, body: rawBody,
           enabled: runtime.waterV2Enabled ?? WATER_V2_ENABLED });

@@ -11,6 +11,10 @@ class IssuanceError extends Error {
 }
 function fail(code) { throw new IssuanceError(code); }
 export function admissionError(error) {
+  if (error instanceof IssuanceError && error.code === 'WATER_ACCOUNT_DELETING') {
+    return { status: 503, code: 'ACCOUNT_DELETION_BLOCKED', retryable: true,
+      message: 'Não foi possível admitir a conta para hidratação.' };
+  }
   return { code: error instanceof IssuanceError ? error.code : 'WATER_ADMISSION_STORAGE_UNAVAILABLE',
     message: 'Não foi possível admitir a conta para hidratação.' };
 }
@@ -64,19 +68,21 @@ function coherentDay(healthDay, timestamp) {
 }
 
 // No public handler, environment activation, Firebase credentials or default DB.
-export async function issueWaterAdmission() { fail('WATER_V2_DISABLED'); }
+export async function issueWaterAdmission(options) {
+  if (!WATER_V2_ENABLED) fail('WATER_V2_DISABLED');
+  return createWaterAdmissionIssuer(options).issue();
+}
 
 // Trusted-code seam only; not an ingress or proof that an arbitrary payload is verified.
 // The future privileged layer must persist its immutable decision and original
 // sanitized identity, prove genuine V2-only account birth, and return them here.
 // Auth/App Check/own UID/rate limits are required before any future HTTP wiring.
-export function createWaterAdmissionIssuerTestHarness(options) {
+export function createWaterAdmissionIssuer(options) {
   if (!object(options) || !Object.keys(options).every(k => ['db', 'getTrustedAdmission', 'now'].includes(k)) ||
       typeof options.db?.collection !== 'function' || typeof options.db?.runTransaction !== 'function' ||
       typeof options.getTrustedAdmission !== 'function' || (options.now !== undefined && typeof options.now !== 'function')) {
     fail('WATER_ADMISSION_INVALID_CONFIGURATION');
   }
-  if (WATER_V2_ENABLED !== false) fail('WATER_V2_DISABLED');
   const { db, getTrustedAdmission, now = () => Timestamp.now() } = options;
   return Object.freeze({ async issue(...args) {
     if (args.length) fail('WATER_ADMISSION_UNAUTHORIZED');
@@ -87,17 +93,22 @@ export function createWaterAdmissionIssuerTestHarness(options) {
     const proof = root.collection('runtime').doc('water_admission');
     const deletion = root.collection('runtime').doc('account_deletion');
     const guard = db.collection('account_deletion_guards').doc(bound.uid);
+    const retired = db.collection('retired_auth_identities').doc(bound.uid);
     let candidateRunId;
     return db.runTransaction(async tx => {
-      const current = trustedContext(await getTrustedAdmission());
+      const current = trustedContext(await getTrustedAdmission(tx));
       if (!sameContext(bound, current)) fail('WATER_ADMISSION_UNAUTHORIZED');
       const clock = now(); if (!time(clock)) fail('WATER_ADMISSION_UNAUTHORIZED');
       const rootDoc = await tx.get(root);
       const guardDoc = await tx.get(guard);
+      const retiredDoc = await tx.get(retired);
       const eligibilityDoc = await tx.get(eligibility);
       const proofDoc = await tx.get(proof);
       const deletionDoc = await tx.get(deletion);
-      if (guardDoc.exists || deletionDoc.exists || (rootDoc.exists && Object.hasOwn(rootDoc.data(), '_serverAccountDeletion'))) {
+      // Deny-only records are authoritative regardless of contents, even on replay.
+      // Absence participates in this transaction's retry conflict set.
+      if (guardDoc.exists || retiredDoc.exists || deletionDoc.exists ||
+          (rootDoc.exists && Object.hasOwn(rootDoc.data(), '_serverAccountDeletion'))) {
         fail('WATER_ACCOUNT_DELETING');
       }
       if (rootDoc.exists || eligibilityDoc.exists || proofDoc.exists) {
@@ -133,4 +144,9 @@ export function createWaterAdmissionIssuerTestHarness(options) {
       return { uid: bound.uid, runId, initialHealthDay: bound.initialHealthDay, alreadyIssued: false };
     });
   } });
+}
+
+export function createWaterAdmissionIssuerTestHarness(options) {
+  if (WATER_V2_ENABLED !== false) fail('WATER_V2_DISABLED');
+  return createWaterAdmissionIssuer(options);
 }

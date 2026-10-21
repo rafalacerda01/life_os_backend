@@ -383,7 +383,7 @@ for (const partial of [false, true]) check(`real deleteAccount removes provision
     f.db.partialCleanup = true;
     await assert.rejects(deleteAccount({ db: f.db, auth, uid: UID }), /partial recursive cleanup/);
     assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS'); assert.equal(f.db.docs.has(R), true);
-    await rejected(f.call(), 'WATER_USER_NOT_FOUND');
+    await rejected(f.call(), 'WATER_ACCOUNT_DELETING');
   }
   const result = await deleteAccount({ db: f.db, auth, uid: UID });
   assert.equal(result.body.deleted, true); assert.equal(f.db.docs.get(G).state, 'COMPLETE');
@@ -398,7 +398,7 @@ check('actual concurrent deletion wins, provision retries without resurrecting d
   const pending = f.call('provision'); await hold.reached;
   await deleteAccount({ db: f.db, auth: deletionAuth(), uid: UID });
   const before = [...f.db.docs], count = f.db.writes.length; hold.release();
-  await rejected(pending, 'WATER_USER_NOT_FOUND'); unchanged(f.db, before, count);
+  await rejected(pending, 'WATER_ACCOUNT_DELETING'); unchanged(f.db, before, count);
   assert.equal(f.db.conflicts.length, 1); assert.equal(f.db.docs.has(A), false);
 });
 check('disabled production functions ignore request/env/options before touching Firestore', async t => {
@@ -610,4 +610,83 @@ check('F2 valid distinct issuedAt cannot bypass a deletion guard or V1 history',
     const before = [...f.db.docs]; await rejected(f.call(), kind === 'guard' ? 'WATER_ACCOUNT_DELETING' : 'WATER_PROVISION_NOT_ELIGIBLE');
     unchanged(f.db, before);
   }
+});
+
+// WATER-V2-ADMISSION-PROVISION-R1: every first/day/replay transaction observes retirement.
+const R1_RETIRED = 'retired_auth_identities/' + UID;
+const R1_DELETION = ROOT + '/runtime/account_deletion';
+for (const data of [null, {}, { state: 'DENY' }, { state: 'COMPLETE', retainUntil: Timestamp.fromMillis(1) }]) {
+  for (const mode of ['first', 'replay', 'day']) {
+    check('R1 retired identity blocks provisioning ' + mode + ' ' + JSON.stringify(data), async () => {
+      const f = fixture();
+      if (mode !== 'first') await f.call();
+      f.db.put(R1_RETIRED, data);
+      f.db.put(H('2026-10-12'), { date: CREATED, waterIntakeMl: 750, mood: 'preserved V1' });
+      f.db.put('users/other-owner/health_info/2026-10-12', { waterIntakeMl: 250 });
+      const before = [...f.db.docs], count = f.db.writes.length;
+      await assert.rejects(mode === 'day' ? f.next() : f.call(), error => {
+        assert.deepEqual(provisioningError(error), { status: 503, code: 'ACCOUNT_DELETION_BLOCKED',
+          retryable: true, message: 'Provisionamento de hidratação indisponível.' });
+        return true;
+      });
+      unchanged(f.db, before, count);
+    });
+  }
+}
+for (const mode of ['first', 'replay', 'day']) {
+  check('R1 retirement after absence read retries and refuses provisioning ' + mode, async () => {
+    const f = fixture();
+    if (mode !== 'first') await f.call();
+    const count = f.db.writes.length, attempts = f.db.attempts.length;
+    const stable = [...f.db.docs];
+    f.db.hooks.beforeCommit = r => { if (r.attempt === 1) f.db.put(R1_RETIRED, {}); };
+    await assert.rejects(mode === 'day' ? f.next() : f.call(),
+      error => provisioningError(error).code === 'ACCOUNT_DELETION_BLOCKED');
+    assert.equal(f.db.attempts.length - attempts, 2);
+    assert.deepEqual(f.db.conflicts.at(-1).changed, [R1_RETIRED]);
+    unchanged(f.db, [...stable, [R1_RETIRED, {}]], count);
+    assert.equal(f.db.docs.has(S(NEXT)), false);
+  });
+}
+for (const marker of [G, R1_RETIRED, R1_DELETION]) {
+  for (const rootPresent of [false, true]) {
+    check('R1 deletion marker ' + marker + ' preserves 503 with root present=' + rootPresent, async () => {
+      const f = fixture();
+      if (!rootPresent) f.db.put(ROOT, undefined);
+      f.db.put(marker, {});
+      const before = [...f.db.docs];
+      await assert.rejects(f.call(), error => {
+        assert.deepEqual(provisioningError(error), { status: 503, code: 'ACCOUNT_DELETION_BLOCKED',
+          retryable: true, message: 'Provisionamento de hidratação indisponível.' });
+        return true;
+      });
+      unchanged(f.db, before);
+    });
+  }
+}
+check('R1 failed retirement lookup propagates without provisioning writes or ACK', async () => {
+  const f = fixture(), before = [...f.db.docs];
+  const failure = new Error('synthetic unavailable');
+  f.db.hooks.onRead = ({path}) => { if (path === R1_RETIRED) throw failure; };
+  await assert.rejects(f.call(), error => {
+    assert.equal(error, failure);
+    assert.deepEqual(provisioningError(error), { code: 'WATER_PROVISION_STORAGE_UNAVAILABLE',
+      message: 'Provisionamento de hidratação indisponível.' });
+    return true;
+  });
+  unchanged(f.db, before);
+});
+check('R1 retirement of another UID preserves valid idempotent provisioning', async () => {
+  const f = fixture(), other = 'retired_auth_identities/other-owner';
+  f.db.put(other, { state: 'DENY' });
+  const first = await f.call(), before = [...f.db.docs];
+  assert.deepEqual(await f.call(), { ...first, alreadyProvisioned: true });
+  unchanged(f.db, before, 4);
+});
+check('R1 untrusted storage cannot forge provisioning deletion-blocked response', () => {
+  const error = Object.assign(new Error('synthetic private details'), {
+    code: 'ACCOUNT_DELETION_BLOCKED', status: 503, retryable: true,
+  });
+  assert.deepEqual(provisioningError(error), { code: 'WATER_PROVISION_STORAGE_UNAVAILABLE',
+    message: 'Provisionamento de hidratação indisponível.' });
 });

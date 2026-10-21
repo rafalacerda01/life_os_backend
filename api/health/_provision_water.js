@@ -12,6 +12,10 @@ class ProvisionError extends Error {
 }
 function fail(code) { throw new ProvisionError(code); }
 export function provisioningError(error) {
+  if (error instanceof ProvisionError && error.code === 'WATER_ACCOUNT_DELETING') {
+    return { status: 503, code: 'ACCOUNT_DELETION_BLOCKED', retryable: true,
+      message: 'Provisionamento de hidratação indisponível.' };
+  }
   return { code: error instanceof ProvisionError && CODES.has(error.code)
     ? error.code : 'WATER_PROVISION_STORAGE_UNAVAILABLE',
   message: 'Provisionamento de hidratação indisponível.' };
@@ -60,15 +64,21 @@ function activationValid(a) {
 
 // No HTTP handler, credentials, default Firestore connection or environment gate.
 // The production entries remain closed even when callers supply enabled/body options.
-export async function provisionWaterAccount() { fail('WATER_V2_DISABLED'); }
-export async function provisionWaterDay() { fail('WATER_V2_DISABLED'); }
+export async function provisionWaterAccount(options) {
+  if (!WATER_V2_ENABLED) fail('WATER_V2_DISABLED');
+  return createWaterProvisioner(options).initializeAccount();
+}
+export async function provisionWaterDay(options, day) {
+  if (!WATER_V2_ENABLED) fail('WATER_V2_DISABLED');
+  return createWaterProvisioner(options).initializeDay(day);
+}
 
 // Explicit trusted-code test seam, analogous to the sync helper's runtime seam.
 // NEVER wire this factory to a request or an environment variable. A future
 // production ingress requires a separately reviewed gate/auth/App Check policy.
 // uid/runId/clock belong to the server job, not to a client payload. The remote
 // admission is revalidated on every transaction attempt, including read-only retries.
-export function createWaterProvisioningTestHarness({ db, uid, runId, now = () => Timestamp.now() }) {
+export function createWaterProvisioner({ db, uid, runId, now = () => Timestamp.now() }) {
   if (!uidValid(uid) || !uuid(runId) || typeof now !== 'function' ||
       typeof db?.runTransaction !== 'function' || typeof db?.collection !== 'function') {
     fail('WATER_INVALID_PROVISION_INPUT');
@@ -79,6 +89,8 @@ export function createWaterProvisioningTestHarness({ db, uid, runId, now = () =>
   const manifestRef = protocol.doc('provisioning');
   const activationRef = protocol.doc('activation');
   const guardRef = db.collection('account_deletion_guards').doc(uid);
+  const retiredRef = db.collection('retired_auth_identities').doc(uid);
+  const deletionRef = user.collection('runtime').doc('account_deletion');
   const health = user.collection('health_info');
   const states = user.collection('water_state');
   const receipts = user.collection('water_increment_receipts');
@@ -95,12 +107,16 @@ export function createWaterProvisioningTestHarness({ db, uid, runId, now = () =>
     return db.runTransaction(async tx => {
       const root = await tx.get(user);
       const guard = await tx.get(guardRef);
+      const retired = await tx.get(retiredRef);
+      const deletion = await tx.get(deletionRef);
       const admissionDoc = await tx.get(admissionRef);
       const activationDoc = await tx.get(activationRef);
       const manifestDoc = await tx.get(manifestRef);
       const protocolDocs = await tx.get(protocol.limit(4));
+      // A deleted root never downgrades an authoritative deny to a 404 or ACK.
+      if (guard.exists || retired.exists || deletion.exists ||
+          (root.exists && Object.hasOwn(root.data(), '_serverAccountDeletion'))) fail('WATER_ACCOUNT_DELETING');
       if (!root.exists) fail('WATER_USER_NOT_FOUND');
-      if (guard.exists || Object.hasOwn(root.data(), '_serverAccountDeletion')) fail('WATER_ACCOUNT_DELETING');
       const admission = admissionDoc.data();
       const clock = now();
       if (!time(clock)) fail('WATER_INVALID_PROVISION_INPUT');
@@ -220,7 +236,11 @@ export function createWaterProvisioningTestHarness({ db, uid, runId, now = () =>
     });
   }
   // Gate is deliberately not a boolean/function supplied by a request.
-  if (WATER_V2_ENABLED !== false) fail('WATER_V2_DISABLED');
   return Object.freeze({ initializeAccount: () => initialize(undefined, true),
     initializeDay: healthDay => initialize(healthDay, false) });
+}
+
+export function createWaterProvisioningTestHarness(options) {
+  if (WATER_V2_ENABLED !== false) fail('WATER_V2_DISABLED');
+  return createWaterProvisioner(options);
 }

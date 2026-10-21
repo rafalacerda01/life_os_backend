@@ -307,3 +307,225 @@ check('issuer has no endpoint/default DB/credentials/env and dispatcher never im
   assert.doesNotMatch(source, /export default|process\.env|initializeApp|getFirestore|createAccountHandler/);
   assert.doesNotMatch(sync, /_issue_water_admission|issueWaterAdmission/);
 });
+
+// WATER-V2-ADMISSION-PROVISION-R1: production entries remain closed.
+const R1_RETIRED = 'retired_auth_identities/' + UID;
+for (const data of [null, {}, { state: 'DENY' }, { state: 'COMPLETE', retainUntil: Timestamp.fromMillis(1) }]) {
+  for (const replay of [false, true]) {
+    check('R1 retired identity blocks admission replay=' + replay + ' ' + JSON.stringify(data), async () => {
+      const f = fixture();
+      if (replay) await f.call();
+      f.db.put(R1_RETIRED, data);
+      f.db.put(ROOT + '/health_info/2026-10-12', { date: CREATED, waterIntakeMl: 750, mood: 'preserved V1' });
+      f.db.put('users/other-owner/health_info/2026-10-12', { waterIntakeMl: 250 });
+      const before = [...f.db.docs], count = f.db.writes.length;
+      await assert.rejects(f.call(), error => {
+        assert.deepEqual(admissionError(error), { status: 503, code: 'ACCOUNT_DELETION_BLOCKED',
+          retryable: true, message: 'Não foi possível admitir a conta para hidratação.' });
+        return true;
+      });
+      unchanged(f, before, count);
+    });
+  }
+}
+for (const replay of [false, true]) {
+  check('R1 retirement after absence read retries and refuses admission replay=' + replay, async () => {
+    const f = fixture();
+    if (replay) await f.call();
+    const count = f.db.writes.length, attempts = f.db.attempts.length;
+    f.db.hooks.beforeCommit = r => { if (r.attempt === 1) f.db.put(R1_RETIRED, {}); };
+    await assert.rejects(f.call(), error => admissionError(error).code === 'ACCOUNT_DELETION_BLOCKED');
+    assert.equal(f.db.attempts.length - attempts, 2);
+    assert.deepEqual(f.db.conflicts.at(-1).changed, [R1_RETIRED]);
+    assert.equal(f.db.writes.length, count);
+    assert.equal(f.db.docs.has(R1_RETIRED), true);
+    assert.equal(f.db.docs.has(ROOT), replay);
+    assert.equal(f.db.docs.has(E), replay);
+    assert.equal(f.db.docs.has(P), replay);
+  });
+}
+check('R1 failed retirement lookup propagates without creating profile, eligibility or ACK', async () => {
+  const f = fixture(), before = [...f.db.docs];
+  const failure = new Error('synthetic unavailable');
+  f.db.hooks.onRead = ({path}) => { if (path === R1_RETIRED) throw failure; };
+  await assert.rejects(f.call(), error => {
+    assert.equal(error, failure);
+    assert.deepEqual(admissionError(error), { code: 'WATER_ADMISSION_STORAGE_UNAVAILABLE',
+      message: 'Não foi possível admitir a conta para hidratação.' });
+    return true;
+  });
+  unchanged(f, before);
+});
+check('R1 retirement of another UID does not block the admitted identity', async () => {
+  const f = fixture(), other = 'retired_auth_identities/other-owner';
+  f.db.put(other, { state: 'DENY' });
+  const first = await f.call();
+  assert.equal(first.alreadyIssued, false);
+  assert.deepEqual(f.db.docs.get(other), { state: 'DENY' });
+  assert.equal(f.db.writes.length, 3);
+});
+check('R1 untrusted storage cannot forge the public deletion-blocked response', () => {
+  const error = Object.assign(new Error('synthetic private details'), {
+    code: 'ACCOUNT_DELETION_BLOCKED', status: 503, retryable: true,
+  });
+  assert.deepEqual(admissionError(error), { code: 'WATER_ADMISSION_STORAGE_UNAVAILABLE',
+    message: 'Não foi possível admitir a conta para hidratação.' });
+});
+check('R1 closed birth evidence cannot activate the production admission entry', async () => {
+  const f = fixture(), before = [...f.db.docs];
+  for (const evidence of [undefined, {}, { status: 'RECORDED_COHORT_CLOSED', eligible: false }]) {
+    await rejected(issueWaterAdmission({ db: f.db, identity: authority().identity,
+      decision: authority().decision, birthEvidence: evidence, enabled: true }), 'WATER_V2_DISABLED');
+  }
+  unchanged(f, before);
+  assert.equal(f.db.attempts.length, 0);
+});
+
+
+// Full lifecycle: synthetic managed receipt -> admission -> provisioning -> goals.
+const {createWaterLifecycle,waterLifecycleError}=await import('../api/health/_water_lifecycle.js');
+const {createWaterGoals,goalErrorResponse}=await import('../api/health/_water_goal.js');
+const {syncWater}=await import('../api/health/_sync_water.js');
+const policy=(await import('../api/health/_water_policy.cjs')).default;
+const birthPath='account_birth_decisions/'+UID;
+const approved=()=>({...policy.WATER_COHORT,projectId:'demo-life-os',state:'OPEN',
+  cutoverMillis:CREATED.toMillis()-1000,administrativePolicyVerified:true,writerFencesVerified:true});
+const bootstrapBody={operation:'bootstrap_water',version:2,timeZoneOffsetMinutes:0};
+function fullFixture() {
+  const db=new FakeFirestore(); db.projectId='demo-life-os';
+  const cohort=approved();
+  const record={version:1,uid:UID,projectId:db.projectId,tenantId:null,
+    authCreatedAt:CREATED,sourceType:'FIREBASE_AUTH_CREATE',sourceEventId:'synthetic-managed-event',
+    eventAt:CREATED,cohort:{version:1,id:cohort.id,policy:cohort.policy,state:'CLOSED',
+      cutoverAt:Timestamp.fromMillis(cohort.cutoverMillis)},decisionId:DECISION,
+    originalIdentity:authority().identity,recordedAt:CLOCK,status:'RECORDED_COHORT_CLOSED'};
+  db.put(birthPath,record);
+  const auth={getUser:async uid=>({uid,tenantId:null,metadata:{creationTime:CREATED.toDate().toUTCString()}})};
+  const life=createWaterLifecycle({db,auth,cohort,enabled:true,now:()=>CLOCK});
+  const goals=createWaterGoals({db,cohort,enabled:true});
+  return {db,auth,cohort,record,life,goals,boot:()=>life.bootstrap(UID,bootstrapBody)};
+}
+check('full local lifecycle creates server profile, admission and zero projection; replay writes nothing',async()=>{
+  const f=fullFixture(),first=await f.boot(),before=[...f.db.docs],writes=f.db.writes.length;
+  assert.equal(first.state,'READY'); assert.equal(first.waterIntakeMl,0);
+  assert.equal(first.goalMl,3000); assert.equal(first.goalRevision,0);
+  assert.equal(first.initialHealthDay,'2026-10-12'); // UTC-14 boundary, safe travel anchor
+  assert.equal(f.db.docs.get(ROOT).isPremium,false);
+  assert.ok(f.db.created.get(ROOT).isEqual(f.db.created.get(E)));
+  assert.deepEqual(await f.boot(),first); unchanged(f,before,writes);
+});
+for (const key of ['state','administrativePolicyVerified','writerFencesVerified','projectId','cutoverMillis']) {
+  check('closed/uncertified server cohort rejects '+key+' despite a managed receipt',async()=>{
+    const f=fullFixture(),cohort={...f.cohort,[key]:key==='state'?'CLOSED':key==='projectId'?'life-os-27b92':null};
+    await assert.rejects(createWaterLifecycle({db:f.db,auth:f.auth,cohort,enabled:true,now:()=>CLOCK}).bootstrap(UID,bootstrapBody),
+      e=>waterLifecycleError(e).body.code==='WATER_COHORT_CLOSED');
+    assert.equal(f.db.writes.length,0);
+  });
+}
+check('deployment flag stays false and backend/Functions policies are byte identical',async()=>{
+  assert.equal(WATER_V2_ENABLED,false); assert.equal(policy.WATER_COHORT.state,'CLOSED');
+  assert.equal(await readFile(new URL('../api/health/_water_policy.cjs',import.meta.url),'utf8'),
+    await readFile(new URL('../../functions/water_policy.cjs',import.meta.url),'utf8'));
+  const f=fullFixture();
+  await assert.rejects(createWaterLifecycle({db:f.db,auth:f.auth,cohort:f.cohort}).bootstrap(UID,bootstrapBody),
+    e=>waterLifecycleError(e).body.code==='WATER_V2_DISABLED');
+  assert.equal(f.db.writes.length,0);
+});
+for (const extra of [{uid:UID},{eligible:true},{cohort:'OPEN'},{timeZoneOffsetMinutes:841},{version:1}]) {
+  check('bootstrap refuses client authority/payload '+JSON.stringify(extra),async()=>{
+    const f=fullFixture();
+    await assert.rejects(f.life.bootstrap(UID,{...bootstrapBody,...extra}),e=>waterLifecycleError(e).status===400);
+    assert.equal(f.db.writes.length,0);
+  });
+}
+check('missing or delayed managed event never falls back to metadata or creates a client-compatible root',async()=>{
+  const f=fullFixture(); f.db.put(birthPath,undefined);
+  await rejected(f.boot(),'WATER_PROVISIONING_PENDING'); assert.equal(f.db.writes.length,0);
+  f.db.put(birthPath,f.record); assert.equal((await f.boot()).state,'READY');
+});
+for (const patch of [{uid:'another'},{tenantId:'tenant'}, {sourceType:'CLIENT_SIGNUP'},
+  {originalIdentity:{...authority().identity,uid:'another'}},{extra:'unexpected'},
+  {authCreatedAt:Timestamp.fromMillis(CREATED.toMillis()-100000)},
+  {cohort:{version:1,id:'other',policy:'NEW_ACCOUNT_V2_ONLY',state:'CLOSED',cutoverAt:CREATED}}]) {
+  check('managed receipt identity/schema is mandatory '+JSON.stringify(patch),async()=>{
+    const f=fullFixture(); f.db.put(birthPath,{...f.record,...patch});
+    await rejected(f.boot(),'WATER_NOT_ELIGIBLE'); assert.equal(f.db.writes.length,0);
+  });
+}
+check('live Auth mismatch is denied; metadata remains only a consistency check',async()=>{
+  const f=fullFixture(); f.auth.getUser=async()=>({uid:'another',metadata:{creationTime:CREATED.toDate().toUTCString()}});
+  await rejected(f.boot(),'WATER_NOT_ELIGIBLE'); assert.equal(f.db.writes.length,0);
+});
+check('old profile is legacy, recent uncertain profile never retrofits into V2',async()=>{
+  const f=fullFixture(); f.db.put(ROOT,profile); f.db.put(birthPath,undefined);
+  assert.equal((await f.boot()).state,'NOT_ELIGIBLE');
+  f.auth.getUser=async()=>({uid:UID,metadata:{creationTime:new Date(CREATED.toMillis()-100000).toUTCString()}});
+  assert.equal((await f.boot()).state,'LEGACY'); assert.equal(f.db.writes.length,0);
+});
+for(const deny of [G,'retired_auth_identities/'+UID,ROOT+'/runtime/account_deletion']) {
+  check('full lifecycle denies deletion before and after provisioning: '+deny,async()=>{
+    const f=fullFixture(); f.db.put(deny,{});
+    await assert.rejects(f.boot(),e=>waterLifecycleError(e).body.code==='ACCOUNT_DELETION_BLOCKED');
+    assert.equal(f.db.writes.length,0); f.db.put(deny,undefined);
+    const first=await f.boot(); f.db.put(deny,{state:'DENY'});
+    const before=[...f.db.docs],writes=f.db.writes.length;
+    await assert.rejects(f.goals.set(UID,{operation:'set_water_goal',version:2,mutationId:OTHER,originEpoch:first.epoch,goalMl:2000}),
+      e=>goalErrorResponse(e).body.code==='ACCOUNT_DELETION_BLOCKED');
+    await assert.rejects(f.boot(),e=>waterLifecycleError(e).body.code==='ACCOUNT_DELETION_BLOCKED');
+    unchanged(f,before,writes);
+  });
+}
+check('retirement racing admission is re-read by the Firestore retry, without profile creation',async()=>{
+  const f=fullFixture(); f.db.hooks.beforeCommit=r=>{
+    if(r.pending.some(w=>w.ref.path===E)) f.db.put('retired_auth_identities/'+UID,{state:'DENY'});
+  };
+  await assert.rejects(f.boot(),e=>waterLifecycleError(e).body.code==='ACCOUNT_DELETION_BLOCKED');
+  assert.equal(f.db.writes.length,0); assert.equal(f.db.docs.has(ROOT),false);
+});
+check('V1 writer winning before admission preserves its water and refuses V2',async()=>{
+  const f=fullFixture(); f.db.put(ROOT,profile); f.db.put(ROOT+'/health_info/'+DAY,{date:CREATED,waterIntakeMl:750});
+  assert.equal((await f.boot()).state,'NOT_ELIGIBLE'); assert.equal(f.db.writes.length,0);
+  assert.equal(f.db.docs.get(ROOT+'/health_info/'+DAY).waterIntakeMl,750);
+});
+check('partial provisioning after admission can retry, but corrupted partial activation is never reset',async()=>{
+  const f=fullFixture(); let once=true;
+  f.db.hooks.beforeCommit=r=>{if(once&&r.pending.some(w=>w.ref.path.endsWith('/activation'))) {once=false;throw Error('temporary');}};
+  await assert.rejects(f.boot()); assert.ok(f.db.docs.has(E)); assert.equal(f.db.docs.has(ROOT+'/water_protocol/activation'),false);
+  f.db.hooks={}; const result=await f.boot(); assert.equal(result.state,'READY');
+  f.db.put(ROOT+'/water_protocol/provisioning',undefined); const before=[...f.db.docs],writes=f.db.writes.length;
+  await assert.rejects(f.boot()); unchanged(f,before,writes);
+});
+check('concurrent initial login calls converge on one admission and epoch',async()=>{
+  const f=fullFixture(),[a,b]=await Promise.all([f.boot(),f.boot()]);
+  assert.equal(a.epoch,b.epoch); assert.equal(f.db.writes.filter(w=>w.ref.path===E).length,1);
+});
+check('timezone westward change provisions an earlier civil day in the same epoch',async()=>{
+  const f=fullFixture(),a=await f.boot(),b=await f.life.bootstrap(UID,{...bootstrapBody,timeZoneOffsetMinutes:-840});
+  assert.equal(b.healthDay,'2026-10-12'); assert.equal(b.epoch,a.epoch); assert.equal(b.waterIntakeMl,0);
+});
+check('goal mutations are durable, concurrent, idempotent, and old receipt replay returns current state',async()=>{
+  const f=fullFixture(),snapshot=await f.boot();
+  const goal=(id,value)=>({operation:'set_water_goal',version:2,mutationId:id,originEpoch:snapshot.epoch,goalMl:value});
+  const a=await f.goals.set(UID,goal(DECISION,2000));
+  assert.equal(a.goalRevision,1);
+  const b=await f.goals.set(UID,goal(OTHER,2500)),before=[...f.db.docs],writes=f.db.writes.length;
+  const replay=await f.goals.set(UID,goal(DECISION,2000));
+  assert.equal(replay.goalMl,2500); assert.equal(replay.goalRevision,2); assert.equal(replay.appliedRevision,1);
+  unchanged(f,before,writes);
+  await assert.rejects(f.goals.set(UID,goal(DECISION,3000)),e=>goalErrorResponse(e).body.code==='WATER_MUTATION_CONFLICT');
+  assert.equal((await f.boot()).goalMl,b.goalMl);
+  assert.equal(f.db.docs.get(ROOT+'/health_info/'+DAY).waterIntakeMl,0);
+});
+check('lost goal reply retries the same receipt without overwriting another device',async()=>{
+  const f=fullFixture(),s=await f.boot(),body={operation:'set_water_goal',version:2,mutationId:DECISION,originEpoch:s.epoch,goalMl:2250};
+  f.db.hooks.afterCommit=r=>{if(r.pending.some(w=>w.ref.path.includes('water_goal_receipts'))) throw Error('lost response');};
+  await assert.rejects(f.goals.set(UID,body)); f.db.hooks={};
+  assert.equal((await f.goals.set(UID,body)).goalRevision,1);
+  assert.equal((await f.goals.read(UID)).goalMl,2250);
+});
+check('raw storage errors cannot forge lifecycle/goal public codes or leak details',()=>{
+  const forged=Object.assign(Error('fake private details'),{code:'WATER_COHORT_CLOSED',status:200});
+  assert.equal(waterLifecycleError(forged).body.code,'WATER_PROVISIONING_PENDING');
+  assert.equal(goalErrorResponse(forged).status,503);
+  assert.equal(JSON.stringify(waterLifecycleError(forged)).includes('private'),false);
+});

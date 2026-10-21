@@ -12,6 +12,8 @@ import { createWaterProvisioningTestHarness, provisionWaterAccount, provisionWat
 import { deleteAccount } from '../../api/account/delete.js';
 import cleanup from '../../api/account/_circle_cleanup.cjs';
 import { syncWater, WATER_V2_ENABLED } from '../../api/health/_sync_water.js';
+import {createWaterLifecycle} from '../../api/health/_water_lifecycle.js';
+import {createWaterGoals} from '../../api/health/_water_goal.js';
 
 const PROJECT = 'demo-life-os';
 const host = process.env.FIRESTORE_EMULATOR_HOST;
@@ -292,11 +294,65 @@ test('F2 real Admin SDK / local emulator provisioning', { timeout: 180000 }, asy
   });
   await t.test('provision-first then actual deleteAccount recursively removes real demo Water descendants', async () => {
     const f = await activate(); await increment(f); await harness(f).initializeDay(nextDay(f.day));
-    const deletes = [], result = await deleteAccount({ db, uid: f.uid, auth: { deleteUser: async uid => deletes.push(uid) } });
+    const deletes = [];
+    let authPresent=true;
+    const auth={
+      getUser:async uid=>{
+        if(!authPresent) throw Object.assign(new Error('synthetic absence'),{code:'auth/user-not-found'});
+        return {uid,tenantId:null};
+      },
+      deleteUser:async uid=>{deletes.push(uid);authPresent=false;},
+    };
+    const result = await deleteAccount({ db, uid: f.uid, auth });
     assert.equal(result.body.deleted, true); assert.deepEqual(deletes, [f.uid]);
     const docs = await db.getAll(f.root, f.E, f.A, f.M, f.S, f.H, refs(f.uid, nextDay(f.day)).S);
     assert.ok(docs.every(d => !d.exists)); assert.equal((await f.R.get()).size, 0); assert.equal((await f.G.get()).data().state, 'COMPLETE');
-    await assert.rejects(harness(f).initializeAccount(), e => e.code === 'WATER_USER_NOT_FOUND');
+    await assert.rejects(harness(f).initializeAccount(), e => e.code === 'WATER_ACCOUNT_DELETING');
+  });
+
+  await t.test('full managed receipt lifecycle uses real createTimes, concurrent login, day and goal receipts',async()=>{
+    guard();
+    const uid='water-full-local-'+randomUUID(),born=Timestamp.fromMillis(Math.floor(Date.now()/1000)*1000);
+    const cohort={version:1,id:'local-full',projectId:PROJECT,policy:'NEW_ACCOUNT_V2_ONLY',state:'OPEN',
+      cutoverMillis:born.toMillis()-1000,administrativePolicyVerified:true,writerFencesVerified:true};
+    const ledger=db.collection('account_birth_decisions').doc(uid);
+    await ledger.create({version:1,uid,projectId:PROJECT,tenantId:null,authCreatedAt:born,
+      sourceType:'FIREBASE_AUTH_CREATE',sourceEventId:'emulator-managed-fixture',eventAt:born,
+      cohort:{version:1,id:cohort.id,policy:cohort.policy,state:'CLOSED',cutoverAt:Timestamp.fromMillis(cohort.cutoverMillis)},
+      decisionId:randomUUID(),originalIdentity:{uid,email:'synthetic@example.invalid',displayName:'Synthetic',photoUrl:null},
+      recordedAt:FieldValue.serverTimestamp(),status:'RECORDED_COHORT_CLOSED'});
+    let present=true;
+    const auth={
+      getUser:async queried=>{
+        assert.equal(queried,uid);
+        if(!present) throw Object.assign(new Error('synthetic absence'),{code:'auth/user-not-found'});
+        return {uid,metadata:{creationTime:born.toDate().toUTCString()}};
+      },
+      deleteUser:async queried=>{assert.equal(queried,uid);present=false;},
+    };
+    const life=createWaterLifecycle({db,auth,cohort,enabled:true,now:()=>Timestamp.fromMillis(Date.now()+10000)});
+    const body={operation:'bootstrap_water',version:2,timeZoneOffsetMinutes:0};
+    const [a,b]=await Promise.all([life.bootstrap(uid,body),life.bootstrap(uid,body)]);
+    assert.equal(a.epoch,b.epoch);assert.equal(a.state,'READY');assert.equal(a.waterIntakeMl,0);
+    const root=db.collection('users').doc(uid),e=await root.collection('water_protocol').doc('eligibility').get();
+    const profile=await root.get(),proof=await root.collection('runtime').doc('water_admission').get();
+    assert.ok(profile.createTime.isEqual(e.createTime) && e.createTime.isEqual(proof.createTime));
+    const r=refs(uid,a.healthDay),mutationId=randomUUID();
+    await increment({uid,...r},a.healthDay,mutationId);
+    const current=await life.bootstrap(uid,body);
+    assert.equal(current.waterIntakeMl,250);assert.equal(current.revision,1);
+    const goals=createWaterGoals({db,cohort,enabled:true}),goal={operation:'set_water_goal',version:2,mutationId:randomUUID(),originEpoch:a.epoch,goalMl:2250};
+    const [one,two]=await Promise.all([goals.set(uid,goal),goals.set(uid,goal)]);
+    assert.equal(one.goalRevision,1);assert.equal(two.goalRevision,1);
+    assert.equal((await life.bootstrap(uid,body)).goalMl,2250);
+    const removed=await deleteAccount({db,uid,auth});
+    assert.equal(removed.body.deleted,true);
+    assert.equal((await root.get()).exists,false);
+    assert.equal((await ledger.get()).exists,false);
+    assert.equal((await root.collection('health_settings').doc('water_v2').get()).exists,false);
+    assert.equal((await root.collection('water_goal_receipts').get()).empty,true);
+    await assert.rejects(life.bootstrap(uid,body),error=>error.code==='ACCOUNT_DELETION_BLOCKED');
+    evidence.fullLifecycle={uid,atomicCreateTimes:true,oneEpoch:true,idempotentGoal:true,retirementBlocks:true};
   });
   await t.test('independent UID and all its state/Health metadata remain unchanged', async () => {
     assert.deepEqual(await completeSnapshot(other), otherBefore);
