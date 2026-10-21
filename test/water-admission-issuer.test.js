@@ -391,7 +391,7 @@ const birthPath='account_birth_decisions/'+UID;
 const approved=()=>({...policy.WATER_COHORT,projectId:'demo-life-os',state:'OPEN',
   cutoverMillis:CREATED.toMillis()-1000,administrativePolicyVerified:true,writerFencesVerified:true});
 const bootstrapBody={operation:'bootstrap_water',version:2,timeZoneOffsetMinutes:0};
-function fullFixture() {
+function fullFixture({now=()=>CLOCK}={}) {
   const db=new FakeFirestore(); db.projectId='demo-life-os';
   const cohort=approved();
   const record={version:1,uid:UID,projectId:db.projectId,tenantId:null,
@@ -401,7 +401,7 @@ function fullFixture() {
     originalIdentity:authority().identity,recordedAt:CLOCK,status:'RECORDED_COHORT_CLOSED'};
   db.put(birthPath,record);
   const auth={getUser:async uid=>({uid,tenantId:null,metadata:{creationTime:CREATED.toDate().toUTCString()}})};
-  const life=createWaterLifecycle({db,auth,cohort,enabled:true,now:()=>CLOCK});
+  const life=createWaterLifecycle({db,auth,cohort,enabled:true,now});
   const goals=createWaterGoals({db,cohort,enabled:true});
   return {db,auth,cohort,record,life,goals,boot:()=>life.bootstrap(UID,bootstrapBody)};
 }
@@ -498,6 +498,47 @@ check('partial provisioning after admission can retry, but corrupted partial act
 check('concurrent initial login calls converge on one admission and epoch',async()=>{
   const f=fullFixture(),[a,b]=await Promise.all([f.boot(),f.boot()]);
   assert.equal(a.epoch,b.epoch); assert.equal(f.db.writes.filter(w=>w.ref.path===E).length,1);
+});
+check('server clock refresh accepts admission committed after bootstrap began',async()=>{
+  let clock=CLOCK;
+  const f=fullFixture({now:()=>clock});
+  f.db.hooks.afterCommit=({pending})=>{
+    if(!pending.some(w=>w.ref.path===E))return;
+    const committed=Timestamp.fromMillis(CLOCK.toMillis()+1);
+    f.db.put(E,{...f.db.docs.get(E),issuedAt:committed});
+    for(const p of [ROOT,E,P])f.db.created.set(p,committed);
+    clock=Timestamp.fromMillis(CLOCK.toMillis()+1000);
+  };
+  const first=await f.boot();
+  assert.equal(first.state,'READY');
+  assert.equal(first.waterIntakeMl,0);
+  const before=[...f.db.docs],writes=f.db.writes.length;
+  assert.equal((await f.boot()).epoch,first.epoch);
+  unchanged(f,before,writes);
+});
+check('server clock refresh lets an older bootstrap observe the later winner without rewrites',async()=>{
+  let clock=CLOCK,paused=false;
+  const f=fullFixture({now:()=>clock}),wait=gate();
+  f.db.hooks.onRead=async({label,path})=>{
+    if(label==='older-bootstrap'&&path===birthPath&&!paused){paused=true;await wait.hold();}
+  };
+  const older=context.run('older-bootstrap',f.boot);
+  await wait.reached;
+  try {
+    clock=Timestamp.fromMillis(CLOCK.toMillis()+1000);
+    const winner=await context.run('later-bootstrap',f.boot);
+    await f.goals.set(UID,{operation:'set_water_goal',version:2,mutationId:OTHER,
+      originEpoch:winner.epoch,goalMl:2250});
+    const before=[...f.db.docs],writes=f.db.writes.length;
+    wait.release();
+    const resumed=await older;
+    assert.equal(resumed.state,'READY');
+    assert.equal(resumed.epoch,winner.epoch);
+    assert.equal(resumed.goalMl,2250);
+    assert.equal(resumed.goalRevision,1);
+    assert.equal(f.db.writes.filter(w=>w.ref.path===E).length,1);
+    unchanged(f,before,writes);
+  } finally {wait.release();await older.catch(()=>{});}
 });
 check('timezone westward change provisions an earlier civil day in the same epoch',async()=>{
   const f=fullFixture(),a=await f.boot(),b=await f.life.bootstrap(UID,{...bootstrapBody,timeZoneOffsetMinutes:-840});

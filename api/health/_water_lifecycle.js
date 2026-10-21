@@ -75,7 +75,9 @@ export function createWaterLifecycle({db, auth, cohort = policy.WATER_COHORT,
       return {identity:r.originalIdentity, decision:{uid, decisionId:r.decisionId,
         policy:configured.policy, legacyWritersExcluded:true, initialHealthDay}};
     };
-    return createWaterAdmissionIssuer({db, getTrustedAdmission:read, now:() => clock}).issue();
+    // Read authoritative time again for each step/transaction retry. A concurrent
+    // winner may commit after the bootstrap clock used to select the civil day.
+    return createWaterAdmissionIssuer({db, getTrustedAdmission:read, now}).issue();
   }
   return Object.freeze({
     async bootstrap(uid, body) {
@@ -108,7 +110,7 @@ export function createWaterLifecycle({db, auth, cohort = policy.WATER_COHORT,
       }
       // Earliest civil date at admission anchors offline travel across UTC-14..+14.
       const admitted = await admission(uid,clock,dayAt(clock.toMillis(),-840));
-      const provisioner = createWaterProvisioner({db,uid,runId:admitted.runId,now:() => clock});
+      const provisioner = createWaterProvisioner({db,uid,runId:admitted.runId,now});
       const first = await provisioner.initializeAccount();
       const snapshot = day === first.healthDay ? first : await provisioner.initializeDay(day);
       const goals=await createWaterGoals({db,cohort:configured,enabled}).read(uid);
@@ -119,12 +121,12 @@ export function createWaterLifecycle({db, auth, cohort = policy.WATER_COHORT,
     async ensureAccount(uid) {
       identity(uid); open();
       const clock=now(),admitted=await admission(uid,clock);
-      return createWaterProvisioner({db,uid,runId:admitted.runId,now:()=>clock}).initializeAccount();
+      return createWaterProvisioner({db,uid,runId:admitted.runId,now}).initializeAccount();
     },
     async ensureDay(uid, day) {
       identity(uid); open();
       const clock=now(), admitted=await admission(uid,clock);
-      const p=createWaterProvisioner({db,uid,runId:admitted.runId,now:() => clock});
+      const p=createWaterProvisioner({db,uid,runId:admitted.runId,now});
       await p.initializeAccount();
       return p.initializeDay(day);
     },
