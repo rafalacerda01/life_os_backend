@@ -230,7 +230,9 @@ export async function applyStudyReview({
     const currentReviewQueue = readNonNegativeInteger(
       studyInfoData,
       'reviewQueue',
+      { required: true },
     );
+    if (!Number.isSafeInteger(currentReviewQueue)) throw stateInvalid();
     const currentProgress = readProgress(studyInfoData);
     const currentLastStudyDate = readOptionalStrictDate(
       studyInfoData,

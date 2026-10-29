@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import deletionControl from '../../account/_deletion_control.cjs';
 import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 
 import {
@@ -49,7 +50,7 @@ function refs(db, uid) {
   const user = db.collection('users').doc(uid);
   const billing = user.collection('billing').doc('google_play');
   return {
-    user, billing,
+    user, billing, db,
     marker: user.collection('runtime').doc('account_deletion'),
     account: db.collection('billing_google_accounts').doc(sha256(uid)),
     token: (hash) => billing.collection('tokens').doc(hash),
@@ -78,6 +79,11 @@ function revisionOf(data) {
 }
 
 async function readLiveState(transaction, r, uid, allowMissingAccount = false) {
+  try {
+    await deletionControl.assertNormalWriterTransaction(transaction, r.db, uid);
+  } catch (_) {
+    throw new BillingHttpError(503, 'ACCOUNT_DELETION_BLOCKED', 'Conta indisponível para sincronização.');
+  }
   const [user, billing, account, marker] = await Promise.all([
     transaction.get(r.user), transaction.get(r.billing),
     transaction.get(r.account), transaction.get(r.marker),
@@ -154,6 +160,70 @@ export async function resolveOwnership({ db, purchaseToken, payload }) {
   const user = await db.collection('users').doc(data.uid).get();
   if (!user.exists) return null;
   return data.uid;
+}
+
+// Read-only disposition of a server-bound push. This grants no writer/cleanup
+// capability; every later domain write still repeats readLiveState in its tx.
+export async function classifyRtdnPurchase({ db, purchaseToken, payload, uid: originalUid = null }) {
+  try {
+    if (!validPurchaseToken(purchaseToken)) throw reconciliationRetry();
+    return await db.runTransaction(async transaction => {
+      const read = async ref => {
+        const snapshot = await transaction.get(ref);
+        if (!snapshot || ![true, false].includes(snapshot.exists) || typeof snapshot.data !== 'function') {
+          throw reconciliationRetry();
+        }
+        const value = snapshot.data();
+        if (snapshot.exists ? value === null || typeof value !== 'object' || Array.isArray(value)
+          : value !== undefined) throw reconciliationRetry();
+        return snapshot;
+      };
+      const tokenHash = sha256(purchaseToken);
+      const ownership = await ownershipHashes(read, db, tokenHash, payload);
+      if (ownership.predecessor && !ownership.predecessorIndexed && !ownership.accountHash) throw dependencyPending();
+      if (originalUid !== null) {
+        deletionControl.validateBinding({ projectId: db.projectId, databaseId: db.databaseId, uid: originalUid });
+        if (ownership.accountHash !== null && ownership.accountHash !== sha256(originalUid)) throw reconciliationRetry();
+      }
+      const accountHash = ownership.accountHash ?? (originalUid === null ? null : sha256(originalUid));
+      if (accountHash === null) return Object.freeze({ status: 'UNOWNED', uid: null });
+      const account = await read(db.collection('billing_google_accounts').doc(accountHash));
+      let uid = originalUid;
+      if (account.exists) {
+        const data = validateAccount(account.data(), accountHash);
+        if (uid !== null && data.uid !== uid) throw reconciliationRetry();
+        uid = data.uid;
+      }
+      if (uid === null) {
+        // A dangling token index is corruption, not proof of account deletion.
+        const index = await read(db.collection('billing_google_tokens').doc(tokenHash));
+        if (index.exists || ownership.predecessorIndexed) throw reconciliationRetry();
+        return Object.freeze({ status: 'UNOWNED', uid: null });
+      }
+      const binding = deletionControl.validateBinding({ projectId: db.projectId, databaseId: db.databaseId, uid });
+      const r = refs(db, uid), guard = db.collection('account_deletion_guards').doc(uid);
+      const [reservation, parent, operation, user, marker] = await Promise.all([
+        read(db.collection('retired_auth_identities').doc(uid)), read(guard),
+        read(guard.collection('control').doc('operation')), read(r.user), read(r.marker),
+      ]);
+      const state = snapshot => snapshot.exists ? { state: 'PRESENT', value: snapshot.data() } : { state: 'ABSENT' };
+      const classification = deletionControl.classify(binding, {
+        reservation: state(reservation), guard: state(parent), operation: state(operation), birth: { state: 'ABSENT' },
+      });
+      if (['IN_PROGRESS', 'COMPLETE', 'REVIEW_REQUIRED'].includes(classification.status)) {
+        return Object.freeze({ status: 'RETIRED', uid });
+      }
+      if (classification.status !== 'ABSENT') throw reconciliationRetry();
+      if (account.exists && account.data().state === 'DELETING') return Object.freeze({ status: 'DELETING', uid });
+      if (!account.exists || !user.exists || marker.exists || user.data()._serverAccountDeletion !== undefined) {
+        throw reconciliationRetry();
+      }
+      return Object.freeze({ status: 'ACTIVE', uid });
+    });
+  } catch (_) {
+    // No 409/shape error or storage exception is a terminal push disposition.
+    throw reconciliationRetry('BILLING_RTDN_STATE_INDETERMINATE');
+  }
 }
 
 function storedLineage(data) {
@@ -401,13 +471,15 @@ export async function reconcileGooglePlayPurchase({ db, uid, purchaseToken, nowM
   if (entitlement.isPremium && entitlement.acknowledgementState === 'ACKNOWLEDGEMENT_STATE_PENDING') {
     try {
       // Revalidate the fence before every new external effect.
-      await db.runTransaction(async (transaction) => {
+      const recheckAcknowledgement = () => db.runTransaction(async (transaction) => {
         const state = await readLiveState(transaction, refs(db, uid), uid);
         if (revisionOf(state.billing) !== reservation.revision) throw reconciliationRetry();
       });
+      await recheckAcknowledgement();
       try {
         await (runtime.acknowledgeGooglePlaySubscription ?? acknowledgeGooglePlaySubscription)(purchaseToken);
       } catch (_) {
+        await recheckAcknowledgement();
         const confirmed = parseGooglePlaySubscription(await queryGoogle(purchaseToken, runtime), nowMillis);
         if (confirmed.acknowledgementState !== 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED') throw reconciliationRetry();
       }
@@ -418,7 +490,8 @@ export async function reconcileGooglePlayPurchase({ db, uid, purchaseToken, nowM
         if (revisionOf(state.billing) !== reservation.revision || !token.exists) throw reconciliationRetry();
         transaction.update(r.token(tokenHash), { acknowledgementState: 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED' });
       });
-    } catch (_) {
+    } catch (error) {
+      if (error instanceof BillingHttpError && error.code === 'ACCOUNT_DELETION_BLOCKED') throw error;
       throw reconciliationRetry('BILLING_ACKNOWLEDGEMENT_FAILED');
     }
   }

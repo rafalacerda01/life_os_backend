@@ -1,3 +1,4 @@
+import deletionControl from '../account/_deletion_control.cjs';
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
@@ -179,6 +180,14 @@ function extractBearerToken(req) {
 }
 
 function sendError(res, error, fallbackCode) {
+  if (error instanceof deletionControl.DeletionControlError &&
+      error.code === 'ACCOUNT_DELETION_BLOCKED') {
+    return res.status(503).json({
+      error: 'Conta indisponível para sincronização.',
+      code: 'ACCOUNT_DELETION_BLOCKED',
+      retryable: true,
+    });
+  }
   if (error instanceof ActivityHttpError) {
     return res.status(error.statusCode).json({
       error: error.message,
@@ -246,13 +255,14 @@ export function createActivityHandler(operation, fallbackCode, execute) {
         );
       }
 
+      const accountUid = decodedToken.uid;
       const checkRateLimit = runtime.checkRateLimit ?? checkDistributedRateLimit;
       let rateLimitAllowed;
       try {
         rateLimitAllowed = await checkRateLimit({
           db: firestore,
           scope: RATE_LIMIT_SCOPES[operation],
-          uid: decodedToken.uid,
+          uid: accountUid,
           limit: RATE_LIMITS[operation],
           windowMs: RATE_LIMIT_WINDOW_MS,
         });
@@ -274,8 +284,8 @@ export function createActivityHandler(operation, fallbackCode, execute) {
 
       const result = await execute({
         body: req.body,
-        db: firestore,
-        uid: decodedToken.uid,
+        db: deletionControl.withNormalWriterTransactions(firestore, accountUid),
+        uid: accountUid,
       });
       return res.status(result.statusCode ?? 200).json(result.body);
     } catch (error) {

@@ -29,6 +29,7 @@ class Ref {
 }
 
 class Db {
+  projectId = 'demo-life-os-p1'; databaseId = '(default)';
   constructor() { this.store = new Map(); this.writes = []; this.fail = false; }
   collection(name) { return new Ref(this, name); }
   seed(path, data) { this.store.set(path, data); }
@@ -701,5 +702,47 @@ for (const revision of [null, -1, '1', Number.MAX_SAFE_INTEGER]) {
     const f = fixture();
     f.db.seed(BILLING, { reconciliationRevision: revision });
     await assertNoCommercialChange(f, () => f.verify());
+  });
+}
+
+const retirementPath = `retired_auth_identities/${UID}`;
+test('R6C2B A reconciliation: all three absent controls precede every domain mutation', async () => {
+  const f = fixture(), run = f.db.runTransaction.bind(f.db), transactions = [];
+  f.responses.set(A, payload({ ack: 'ACKNOWLEDGEMENT_STATE_PENDING' }));
+  f.runtime.acknowledgeGooglePlaySubscription = async () => {};
+  f.db.runTransaction = cb => run(async tx => {
+    const reads = [], writes = []; transactions.push({ reads, writes });
+    return cb({ ...tx, get: ref => { reads.push(ref.path); return tx.get(ref); },
+      set: (ref, data) => { writes.push(ref.path); return tx.set(ref, data); },
+      update: (ref, data) => { writes.push(ref.path); return tx.update(ref, data); } });
+  });
+  await f.verify(); assert.equal(transactions.length, 4);
+  for (const tx of transactions) assert.deepEqual(tx.reads.slice(0, 3), [
+    `account_deletion_guards/${UID}`, retirementPath, `account_deletion_guards/${UID}/control/operation`,
+  ]);
+  assert.ok(transactions[0].writes.includes(BILLING));
+  assert.ok(transactions[1].writes.includes(USER));
+  assert.equal(transactions[2].writes.length, 0);
+  assert.deepEqual(transactions[3].writes, [tokenPath(A)]);
+});
+for (const phase of ['before commit', 'before ACK', 'during ACK', 'failed ACK']) {
+  test(`R6C2B A reconciliation: retirement ${phase} preserves typed denial`, async () => {
+    const f = fixture(); let ack = 0, retiredState;
+    f.responses.set(A, payload({ ack: 'ACKNOWLEDGEMENT_STATE_PENDING' }));
+    const retireNow = () => { f.db.seed(retirementPath, { version: 2, state: 'RESERVED', deletionId: '12345678-1234-4234-8234-123456789abc', origin: 'PRE_AUTH' }); retiredState = new Map(f.db.store); };
+    if (phase === 'before commit') f.runtime.getGooglePlaySubscription = async () => { retireNow(); return payload({ ack: 'ACKNOWLEDGEMENT_STATE_PENDING' }); };
+    if (phase === 'before ACK') {
+      const run = f.db.runTransaction.bind(f.db); let count = 0;
+      f.db.runTransaction = async cb => { const value = await run(cb); if (++count === 2) retireNow(); return value; };
+    }
+    f.runtime.acknowledgeGooglePlaySubscription = async () => {
+      ack++; retireNow(); if (phase === 'failed ACK') throw Error('private-ambiguous-ack');
+    };
+    await assert.rejects(f.verify(), { statusCode: 503, code: 'ACCOUNT_DELETION_BLOCKED' });
+    assert.equal(ack, ['during ACK', 'failed ACK'].includes(phase) ? 1 : 0);
+    assert.deepEqual(f.db.store, retiredState);
+    if (phase === 'before commit') assert.equal(f.db.data(USER).isPremium, undefined);
+    else assert.equal(f.db.data(tokenPath(A)).acknowledgementState, 'ACKNOWLEDGEMENT_STATE_PENDING');
+    assert.equal(f.calls.length, phase === 'before commit' ? 0 : 1, 'no new Google reread after known retirement');
   });
 }

@@ -1293,3 +1293,42 @@ test('billing handler never requires recent auth_time', async () => {
   assert.equal(res.statusCode, 200);
   assert.equal(db.data(`users/${UID}`).isPremium, true);
 });
+
+// R6C2B: domain denial must retain the existing verify JSON and trusted UID.
+for (const [name, controlPath] of [
+  ['retired', `retired_auth_identities/${UID}`],
+  ['guard', `account_deletion_guards/${UID}`],
+  ['durable receipt without parent', `account_deletion_guards/${UID}/control/operation`],
+]) {
+  test(`R6C2B A verify: present ${name} denies all domain writes`, async () => {
+    const f = fixture(); f.db.seed(controlPath, { version: 999, private: 'synthetic-private-control' });
+    const before = new Map(f.db.store), res = responseStub();
+    await verifyHandler(request(), res, f.runtime);
+    assert.equal(res.statusCode, 503);
+    assert.deepEqual(res.body, { error: 'Conta indisponível para sincronização.', code: 'ACCOUNT_DELETION_BLOCKED' });
+    assert.deepEqual(f.db.store, before); assert.deepEqual(f.db.committedWrites, []);
+    assert.deepEqual(f.calls.google, []); assert.deepEqual(f.calls.acknowledge, []);
+    assert.deepEqual(f.calls.auth, [{ token: 'firebase-id-token', checkRevoked: true }]);
+  });
+  test(`R6C2B A verify: unavailable ${name} is sanitized 503, never absence`, async () => {
+    const f = fixture(), run = f.db.runTransaction.bind(f.db), res = responseStub();
+    f.db.runTransaction = cb => run(tx => cb({ ...tx, get: ref => {
+      if (ref.path === controlPath) throw new Error('private-firestore-unavailable');
+      return tx.get(ref);
+    }, set: tx.set.bind(tx), update: tx.update.bind(tx) }));
+    const before = new Map(f.db.store);
+    await verifyHandler(request(), res, f.runtime);
+    assert.equal(res.statusCode, 503); assert.equal(res.body.code, 'ACCOUNT_DELETION_BLOCKED');
+    assert.equal(Object.hasOwn(res.body, 'retryable'), false);
+    assert.deepEqual(f.db.store, before); assert.deepEqual(f.db.committedWrites, []);
+    assert.deepEqual(f.calls.google, []); assert.doesNotMatch(JSON.stringify(res.body), /private-firestore|stack/);
+  });
+}
+test('R6C2B A verify: mutating decoded token after verification cannot select another UID', async () => {
+  const f = fixture(), decoded = { uid: UID }, res = responseStub();
+  f.runtime.verifyIdToken = async () => decoded;
+  f.runtime.checkRateLimit = async () => { decoded.uid = 'other-user'; return true; };
+  await verifyHandler(request(), res, f.runtime);
+  assert.equal(res.statusCode, 200); assert.equal(f.db.data(`users/${UID}`).isPremium, true);
+  assert.equal([...f.db.store.keys()].some(p => p.includes('other-user')), false);
+});

@@ -44,6 +44,8 @@ function gate() {
 // and catches query phantoms. Real Admin Firestore normally uses pessimistic locks.
 class FakeFirestore {
   projectId = "demo-life-os";
+  databaseId = "(default)";
+  doc(path) { return this.ref(path); }
   docs = new Map(); versions = new Map(); created = new Map();
   attempts = []; conflicts = []; writes = []; hooks = {}; recursiveDeletes = [];
   query(path, group = false, filters = [], limit = Infinity) {
@@ -375,31 +377,112 @@ function deletionAuth(calls = []) {
     async deleteUser(uid) {assert.equal(uid, UID); calls.push(uid); present = false;},
   };
 }
-for (const partial of [false, true]) check(`real deleteAccount removes provisioned account tree; partial retry=${partial}`, async () => {
+for (const partial of [false, true]) check(`real deleteAccount removes provisioned account tree; partial retry=${partial}`, async t => {
   const f = fixture(); await f.call(); await f.next(); await increment(f);
-  f.db.put('users/other-account/health_info/2026-10-13', { date: CREATED, waterIntakeMl: 750 });
+  const foreignPath = 'users/other-account/health_info/2026-10-13';
+  const foreignData = { date: CREATED, waterIntakeMl: 750 };
+  f.db.put(foreignPath, foreignData);
   const calls = [], auth = deletionAuth(calls);
+  const operationPath = `${G}/control/operation`, reservationPath = `retired_auth_identities/${UID}`;
+  let original, reservation, admissions = 0;
+  const deletionStart = f.db.writes.length;
+  f.db.hooks.afterCommit = record => {
+    if (!record.pending.some(w => w.type === 'create' && w.ref.path === operationPath)) return;
+    admissions++;
+    assert.equal(calls.length, 0, 'admission commits before Auth deletion');
+    assert.deepEqual(record.pending.map(w => [w.type, w.ref.path]).sort(),
+      [['create', G], ['create', reservationPath], ['create', operationPath]].sort());
+    original = copy(f.db.docs.get(operationPath));
+    reservation = copy(f.db.docs.get(reservationPath));
+    assert.equal(original.state, 'IN_PROGRESS'); assert.equal(original.completedAt, null);
+    assert.equal(original.projectId, 'demo-life-os'); assert.equal(original.databaseId, '(default)');
+    assert.equal(original.uid, UID); assert.equal(original.origin, 'PRE_AUTH');
+    assert.equal(original.scope.policyVersion, 'ACCOUNT_DELETE_SCOPE_V1');
+    assert.equal(original.scope.privateRoot, ROOT);
+    assert.equal(f.db.docs.get(G).deletionId, original.deletionId);
+    assert.deepEqual(reservation, {version: 2, state: 'RESERVED', deletionId: original.deletionId, origin: 'PRE_AUTH'});
+  };
   if (partial) {
     f.db.partialCleanup = true;
-    await assert.rejects(deleteAccount({ db: f.db, auth, uid: UID }), /partial recursive cleanup/);
+    await assert.rejects(deleteAccount({ db: f.db, auth, uid: UID }), error => {
+      assert.equal(error.name, 'AccountHttpError');
+      assert.equal(error.statusCode, 503);
+      assert.equal(error.code, 'ACCOUNT_DELETION_BLOCKED');
+      assert.equal(error.retryable, true);
+      assert.equal(error.message, 'A exclusao da conta permanece pendente. Tente novamente mais tarde.');
+      assert.doesNotMatch(error.message + JSON.stringify(error), /partial recursive cleanup|synthetic absent|users\//);
+      return true;
+    });
     assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS'); assert.equal(f.db.docs.has(R), true);
+    assert.equal(f.db.partialCleanup, false, 'the original recursive fault was actually injected');
+    assert.deepEqual(f.db.recursiveDeletes, [ROOT]); assert.equal(f.db.docs.has(ROOT), false);
+    assert.deepEqual(calls, [UID]);
+    await assert.rejects(auth.getUser(UID), error => error.code === 'auth/user-not-found');
+    assert.deepEqual(f.db.docs.get(operationPath), original);
+    assert.deepEqual(f.db.docs.get(reservationPath), reservation);
+    assert.equal(f.db.docs.get(G).retainUntil, null);
+    const before = [...f.db.docs], count = f.db.writes.length;
     await rejected(f.call(), 'WATER_ACCOUNT_DELETING');
+    unchanged(f.db, before, count);
+    assert.deepEqual(f.db.docs.get(foreignPath), foreignData);
   }
   const result = await deleteAccount({ db: f.db, auth, uid: UID });
   assert.equal(result.body.deleted, true); assert.equal(f.db.docs.get(G).state, 'COMPLETE');
   assert.equal([...f.db.docs.keys()].some(p => p === ROOT || p.startsWith(`${ROOT}/`)), false);
   assert.equal(f.db.docs.get('users/other-account/health_info/2026-10-13').waterIntakeMl, 750);
-  assert.deepEqual(calls, Array(partial ? 2 : 1).fill(UID));
+  assert.deepEqual(calls, [UID]);
+  assert.equal(admissions, 1, 'retry must not reserve a new operation');
+  for (const path of [G, operationPath, reservationPath]) {
+    assert.equal(f.db.writes.filter(w => w.type === 'create' && w.ref.path === path).length, 1);
+  }
+  assert.deepEqual(f.db.recursiveDeletes, Array(partial ? 2 : 1).fill(ROOT));
+  const receipt = f.db.docs.get(operationPath);
+  assert.ok(receipt.completedAt instanceof Timestamp);
+  assert.deepEqual(receipt, {...original, state: 'COMPLETE', completedAt: receipt.completedAt});
+  assert.equal(f.db.docs.get(G).deletionId, original.deletionId);
+  assert.deepEqual(f.db.docs.get(reservationPath), reservation);
+  assert.deepEqual(f.db.docs.get(foreignPath), foreignData);
+  assert.equal(f.db.writes.slice(deletionStart).some(w => w.type === 'create' && w.ref.path === ROOT), false);
+  t.diagnostic(JSON.stringify({partial, admissions, authDeletes: calls.length,
+    recursiveDeletes: f.db.recursiveDeletes.length, sameOperation: true, terminal: receipt.state}));
 });
-check('actual concurrent deletion wins, provision retries without resurrecting descendants', async () => {
-  const f = fixture(), hold = gate(); f.db.hooks.beforeCommit = async r => {
+check('actual concurrent deletion wins, provision retries without resurrecting descendants', async t => {
+  const f = fixture(), hold = gate();
+  t.after(hold.release);
+  const foreignPath = 'users/other-account/health_info/2026-10-13';
+  const foreignData = { date: CREATED, waterIntakeMl: 750 };
+  f.db.put(foreignPath, foreignData);
+  f.db.hooks.beforeCommit = async r => {
     if (r.label === 'provision' && r.attempt === 1) await hold.hold();
   };
   const pending = f.call('provision'); await hold.reached;
-  await deleteAccount({ db: f.db, auth: deletionAuth(), uid: UID });
+  assert.equal(f.db.docs.has(A), false);
+  const first = f.db.attempts.find(r => r.label === 'provision');
+  assert.equal(first.attempt, 1);
+  assert.deepEqual(first.pending.map(w => w.ref.path).sort(), [A, M, S(DAY), H(DAY)].sort());
+  const calls = [], operationPath = `${G}/control/operation`, reservationPath = `retired_auth_identities/${UID}`;
+  const result = await deleteAccount({ db: f.db, auth: deletionAuth(calls), uid: UID });
+  assert.equal(result.body.deleted, true);
+  assert.equal(f.db.docs.get(G).state, 'COMPLETE');
+  assert.equal(f.db.docs.get(operationPath).state, 'COMPLETE');
+  const original = copy(f.db.docs.get(operationPath)), reservation = copy(f.db.docs.get(reservationPath));
   const before = [...f.db.docs], count = f.db.writes.length; hold.release();
   await rejected(pending, 'WATER_ACCOUNT_DELETING'); unchanged(f.db, before, count);
   assert.equal(f.db.conflicts.length, 1); assert.equal(f.db.docs.has(A), false);
+  assert.equal(f.db.conflicts[0].label, 'provision');
+  assert.ok(f.db.conflicts[0].changed.includes(G));
+  const attempts = f.db.attempts.filter(r => r.label === 'provision');
+  assert.deepEqual(attempts.map(r => r.attempt), [1, 2]);
+  assert.equal(attempts[1].pending.length, 0);
+  assert.ok(attempts[1].reads.has(G));
+  assert.equal([...f.db.docs.keys()].some(p => p === ROOT || p.startsWith(`${ROOT}/`)), false);
+  assert.deepEqual(f.db.docs.get(operationPath), original);
+  assert.deepEqual(f.db.docs.get(reservationPath), reservation);
+  assert.equal(f.db.writes.filter(w => w.type === 'create' && w.ref.path === operationPath).length, 1);
+  assert.deepEqual(calls, [UID]); assert.deepEqual(f.db.recursiveDeletes, [ROOT]);
+  assert.deepEqual(f.db.docs.get(foreignPath), foreignData);
+  t.diagnostic(JSON.stringify({pausedWrites: first.pending.length, provisionAttempts: attempts.length,
+    conflicts: f.db.conflicts.length, postDeletionWrites: f.db.writes.length - count, terminal: original.state}));
 });
 check('disabled production functions ignore request/env/options before touching Firestore', async t => {
   assert.equal(WATER_V2_ENABLED, false);

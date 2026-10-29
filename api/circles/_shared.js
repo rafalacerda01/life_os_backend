@@ -1,3 +1,4 @@
+import deletionControl from '../account/_deletion_control.cjs';
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
@@ -178,6 +179,10 @@ function getFirebaseServices() {
 }
 
 function sendError(res, error, operation = 'delete') {
+  if (error instanceof deletionControl.DeletionControlError && error.code === 'ACCOUNT_DELETION_BLOCKED') {
+    return res.status(503).json({error: 'Conta indisponível para sincronização.',
+      code: 'ACCOUNT_DELETION_BLOCKED', retryable: true});
+  }
   if (error instanceof CircleHttpError) {
     return res.status(error.statusCode).json({
       error: error.message,
@@ -284,7 +289,7 @@ export function createCircleDeleteHandler(
 
       const result = await execute({
         body,
-        db: services.db,
+        db: deletionControl.withNormalWriterTransactions(services.db, uid),
         uid,
         nowMillis,
       });

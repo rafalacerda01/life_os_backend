@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
 import { getApps, initializeApp } from 'firebase-admin/app';
 import { getFirestore, Timestamp } from 'firebase-admin/firestore';
+import deletionControl from '../api/account/_deletion_control.cjs';
 
 if (!getApps().length) initializeApp({ projectId: 'sync-tombstones-test' });
 const { syncHandler } = await import('../api/sync.js');
@@ -12,6 +13,8 @@ const UID = 'tombstone-user';
 const USER = `users/${UID}`;
 const GUARD = `account_deletion_guards/${UID}`;
 const RETIRED = `retired_auth_identities/${UID}`;
+const RECEIPT = `${GUARD}/control/operation`;
+const DELETION_ID = '12345678-1234-4234-8234-123456789abc';
 const ID = 'entity-1';
 const DATE = '2026-01-01T12:00:00.000Z';
 const operations = [
@@ -60,6 +63,8 @@ function fixture(t, config, count = 0) {
   const writes = [];
   const attempts = [];
   const conflicts = [];
+  const commits = [];
+  const identities = [];
   const hooks = {};
   // Synthetic storage costs are test metadata, never fields read by production.
   // Deletes charge the snapshot's document AND affected index entries; other
@@ -84,11 +89,12 @@ function fixture(t, config, count = 0) {
       const reads = new Map();
       const queryReads = new Map();
       const pending = [];
-      const attemptRecord = { label, attempt, reads, queryReads, querySnapshots: [], pending };
+      const attemptRecord = { label, attempt, testName: t.name, reads, queryReads, querySnapshots: [], pending, io: [], applied: false };
       attempts.push(attemptRecord);
       const result = await callback({
         async get(ref) {
           assert.equal(pending.length, 0, 'Firestore requires all reads before writes');
+          attemptRecord.io.push({ type: 'read', path: ref.path });
           let value;
           if (ref.query) {
             queryReads.set(ref.path, startCollectionVersions.get(ref.path) ?? 0);
@@ -105,9 +111,10 @@ function fixture(t, config, count = 0) {
           await hooks.afterRead?.({ label, attempt, ref, snapshot: value });
           return value;
         },
-        set: (ref, data, options) => pending.push({ type: 'set', path: ref.path, data, options }),
-        update: (ref, data) => pending.push({ type: 'update', path: ref.path, data }),
-        delete: ref => pending.push({ type: 'delete', path: ref.path }),
+        create: (ref, data) => { attemptRecord.io.push({ type: 'write', path: ref.path }); pending.push({ type: 'create', path: ref.path, data }); },
+        set: (ref, data, options) => { attemptRecord.io.push({ type: 'write', path: ref.path }); pending.push({ type: 'set', path: ref.path, data, options }); },
+        update: (ref, data) => { attemptRecord.io.push({ type: 'write', path: ref.path }); pending.push({ type: 'update', path: ref.path, data }); },
+        delete: ref => { attemptRecord.io.push({ type: 'write', path: ref.path }); pending.push({ type: 'delete', path: ref.path }); },
       });
       await hooks.beforeCommit?.({ label, attempt, record: attemptRecord });
       const changed = [...reads].filter(([path, version]) => (versions.get(path) ?? 0) !== version)
@@ -135,6 +142,11 @@ function fixture(t, config, count = 0) {
           code: 3, details: 'Transaction too big. Decrease transaction size.',
         });
       }
+      // Validate preconditions before applying any write, including R5 creates.
+      for (const write of pending) {
+        if (write.type === 'create') assert.equal(docs.has(write.path), false, 'create cannot overwrite');
+        if (write.type === 'update') assert.equal(docs.has(write.path), true, 'update cannot recreate');
+      }
       // No await during commit: all writes become visible atomically.
       for (const write of pending) {
         writes.push(write);
@@ -142,7 +154,7 @@ function fixture(t, config, count = 0) {
         else {
           if (write.type === 'update') assert.ok(docs.has(write.path));
           const data = Object.fromEntries(Object.entries(write.data).map(([key, value]) =>
-            [key, value?.constructor?.name === 'ServerTimestampTransform' ? new Date(DATE) : value]));
+            [key, value?.constructor?.name === 'ServerTimestampTransform' ? (write.path.includes('/study_card_create_receipts/') ? Timestamp.fromDate(new Date(DATE)) : new Date(DATE)) : value]));
           docs.set(write.path, write.type === 'update' || write.options?.merge
             ? { ...docs.get(write.path), ...data } : data);
         }
@@ -150,6 +162,8 @@ function fixture(t, config, count = 0) {
         const parent = write.path.slice(0, write.path.lastIndexOf('/'));
         collectionVersions.set(parent, (collectionVersions.get(parent) ?? 0) + 1);
       }
+      attemptRecord.applied = true;
+      commits.push(attemptRecord);
       attemptRecord.result = result;
       await hooks.afterCommit?.(attemptRecord);
       return result;
@@ -162,7 +176,7 @@ function fixture(t, config, count = 0) {
     else docs.set(path, data);
     versions.set(path, (versions.get(path) ?? 0) + 1);
   }
-  async function invoke(action = 'create', label = action, body = {}, { exactBody = false } = {}) {
+  async function invoke(action = 'create', label = action, body = {}, { exactBody = false, uid = UID } = {}) {
     const res = { statusCode: 200, setHeader() {},
       status(code) { this.statusCode = code; return this; },
       json(value) { this.body = value; return this; } };
@@ -175,16 +189,19 @@ function fixture(t, config, count = 0) {
       verifyAppCheckToken: async () => ({ appId: 'test-app' }),
       verifyIdToken: async (_, checkRevoked) => {
         assert.equal(checkRevoked, true);
-        return { uid: UID };
+        identities.push({ label, uid });
+        return { uid };
       },
       checkRateLimit: async parameters => {
-        assert.equal(parameters.uid, UID);
+        assert.equal(parameters.uid, uid);
         return true;
       },
     }));
     return res;
   }
-  return { docs, writes, attempts, conflicts, hooks, storageBytes, rejectedSizes, target, marker, invoke, put,
+  const db = { projectId: firestore.projectId, databaseId: '(default)', doc: document, collection,
+    runTransaction: callback => firestore.runTransaction(callback) };
+  return { db, docs, writes, attempts, conflicts, commits, identities, hooks, storageBytes, rejectedSizes, target, marker, invoke, put,
     count: () => docs.get(USER)[config.counter] };
 }
 
@@ -386,24 +403,53 @@ for (const [label, guard] of [
   });
 }
 
+// Historical title retained; R5 supersedes its former permission expectation.
 test('deletion guard: expired valid COMPLETE preserves normal sync and its metadata', async t => {
-  const f = fixture(t, operations[0]);
+  const f = fixture(t, operations[0], 1);
   const guard = deletionGuard({ state: 'COMPLETE', retainUntil: Timestamp.fromMillis(2) });
   f.put(GUARD, guard);
-  success(await f.invoke(), operations[0], 'create');
+  f.put(f.target, operations[0].payload);
+  f.put(f.marker, { entityType: 'tasks', entityId: ID, schemaVersion: 1, deletedAt: new Date(DATE) });
+  const before = new Map(f.docs);
+  assertDeletionBlocked(await f.invoke());
+  assertDeletionBlocked(await f.invoke('delete'));
   assert.deepEqual(f.docs.get(GUARD), guard);
   assert.ok(f.writes.every(write => write.path !== GUARD));
+  assert.deepEqual(f.docs, before, 'private data, tombstone and every control remain unchanged');
+  assert.equal(f.writes.length, 0);
+  assert.equal(f.docs.has(RETIRED), false, 'no reservation or deletionId is fabricated');
+  assert.equal(f.docs.has(RECEIPT), false, 'no receipt is fabricated');
+  assert.equal(f.attempts.length, 2);
+  for (const attempt of f.attempts) {
+    assert.deepEqual([...attempt.reads.keys()], [GUARD]);
+    assert.equal(attempt.pending.length, 0);
+    assert.equal(attempt.applied, false);
+  }
+  t.diagnostic(JSON.stringify({historicalEvidence: 'expired-complete-denied', actions: 2,
+    reads: f.attempts.map(a => [...a.reads.keys()]), writes: f.writes.length, controlsUnchanged: true}));
 });
 
+// Scenario A: retain the original hook; the expired guard denies before it.
 test('deletion guard: expired COMPLETE changed to active before commit blocks the retry', async t => {
   const f = fixture(t, operations[0]);
   f.put(GUARD, deletionGuard({ state: 'COMPLETE', retainUntil: Timestamp.fromMillis(2) }));
+  const before = new Map(f.docs);
+  let hookReached = 0;
   f.hooks.beforeCommit = ({ attempt }) => {
+    hookReached++;
     if (attempt === 1) f.put(GUARD, deletionGuard());
   };
   assertDeletionBlocked(await f.invoke());
-  assert.equal(f.conflicts.length, 1);
+  assert.equal(hookReached, 0, 'R5 refuses before the former injection point');
+  assert.equal(f.conflicts.length, 0, 'no commit attempt is reached for an already retired account');
   assert.equal(f.writes.length, 0);
+  assert.deepEqual(f.docs, before);
+  assert.equal(f.attempts.length, 1);
+  assert.deepEqual([...f.attempts[0].reads.keys()], [GUARD]);
+  assert.equal(f.attempts[0].pending.length, 0);
+  assert.equal(f.attempts[0].applied, false);
+  t.diagnostic(JSON.stringify({historicalEvidence: 'original-hook-preserved', hookReached,
+    attempts: f.attempts.length, writes: f.writes.length, conflicts: f.conflicts.length}));
 });
 
 test('deletion guard: read failure is sanitized, retryable and never confirms writes', async t => {
@@ -523,7 +569,8 @@ for (const config of operations) {
     assert.equal(f.docs.has(f.target), true);
     assert.equal(f.count(), 1);
     assert.equal(f.docs.has(f.marker), false);
-    assert.deepEqual([...f.attempts[0].reads.keys()], [GUARD, RETIRED, USER, f.target, f.marker]);
+    assert.deepEqual([...f.attempts[0].reads.keys()], [GUARD, RETIRED, RECEIPT, USER, f.target, f.marker]);
+    assertControlReadsBeforeWrites(f.attempts[0]);
     assert.equal(f.writes.length, 2);
   });
 
@@ -740,7 +787,8 @@ function assertSubjectCleanup(f, expectedSubjects = 2, expectedReviewQueue = 7, 
   assert.equal(new Set(cardDeletes.map(write => write.path)).size, cardDeletes.length,
     'no card is deleted or counted twice');
   for (const attempt of f.attempts.filter(attempt => attempt.queryReads.size)) {
-    assert.deepEqual([...attempt.reads.keys()], [GUARD, RETIRED, USER, STUDY]);
+    assert.deepEqual([...attempt.reads.keys()], [GUARD, RETIRED, RECEIPT, USER, STUDY]);
+    assertControlReadsBeforeWrites(attempt);
     const limit = attempt.querySnapshots[0].ref.limitCount;
     if (adaptive) assert.ok(Number.isInteger(limit) && limit >= 1 && limit <= CHUNK_SIZE);
     else assert.equal(limit, CHUNK_SIZE);
@@ -828,7 +876,8 @@ for (const size of [0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 450, 451, 1001]) {
     assert.equal(f.chunks().length, Math.ceil(size / CHUNK_SIZE));
     assert.equal(f.chunks().reduce((total, chunk) => total + chunk.result.deleted, 0), size);
     const seal = f.attempts[0];
-    assert.deepEqual([...seal.reads.keys()], [GUARD, RETIRED, USER, f.target, f.marker]);
+    assert.deepEqual([...seal.reads.keys()], [GUARD, RETIRED, RECEIPT, USER, f.target, f.marker]);
+    assertControlReadsBeforeWrites(seal);
     assert.equal(seal.queryReads.size, 0, 'phase 1 does not read study_info or query cards');
     assert.equal(seal.pending.length, 3);
     assert.equal(f.attempts.at(-1).result.deleted, 0);
@@ -982,9 +1031,18 @@ test('subject chunks: late subject CREATE stays blocked even during interrupted 
 });
 
 for (const initial of [1, -1, 'invalid', undefined]) {
-  test(`subject chunks: reviewQueue ${String(initial)} retains normalization and floor zero`, async t => {
+  test(`subject chunks: reviewQueue ${String(initial)} keeps valid floor or fails closed (F01)`, async t => {
     const f = subjectFixture(t, 201);
     f.docs.set(STUDY, { reviewQueue: initial, unrelated: 'preserved' });
+    if (!Number.isInteger(initial) || initial < 0) {
+      assertReviewQueueUnavailable(await f.invoke('delete'));
+      assert.equal(f.remaining(), 201);
+      assert.deepEqual(f.docs.get(STUDY), { reviewQueue: initial, unrelated: 'preserved' });
+      assert.equal(f.chunks().length, 0);
+      assert.ok(f.writes.every(write => write.path !== STUDY && !write.path.startsWith(CARDS + '/')));
+      deleted(f, subjectConfig, 2);
+      return;
+    }
     success(await f.invoke('delete'), subjectConfig, 'delete');
     assertSubjectCleanup(f, 2, 0);
   });
@@ -1266,10 +1324,20 @@ for (const markerExists of [false, true]) {
 }
 
 for (const initial of [1, -1, 'invalid', undefined]) {
-  test(`H1: adaptive cleanup preserves reviewQueue normalization for ${String(initial)}`, async t => {
+  test(`H1: adaptive cleanup keeps valid reviewQueue or fails closed for ${String(initial)} (F01)`, async t => {
     const f = subjectFixture(t, 451);
     f.docs.set(STUDY, { reviewQueue: initial, unrelated: 'preserved' });
     largeCards(f);
+    if (!Number.isInteger(initial) || initial < 0) {
+      assertReviewQueueUnavailable(await f.invoke('delete'));
+      assert.equal(f.remaining(), 451);
+      assert.deepEqual(f.docs.get(STUDY), { reviewQueue: initial, unrelated: 'preserved' });
+      assert.equal(f.rejectedSizes.length, 0, 'invalid counter is rejected before buffering any chunk');
+      assert.equal(f.chunks().length, 0);
+      assert.ok(f.writes.every(write => write.path !== STUDY && !write.path.startsWith(CARDS + '/')));
+      assertSingleSeal(f);
+      return;
+    }
     success(await f.invoke('delete'), subjectConfig, 'delete');
     assertSubjectCleanup(f, 2, 0, true);
     assertSingleSeal(f);
@@ -1293,3 +1361,413 @@ test('H1: phase 1 size error propagates without reducing chunks or sealing parti
   assert.equal(f.remaining(), 200);
   assert.equal(f.reviewQueue(), 207);
 });
+
+// Exact read sets above remain exact. This additional trace proves the control
+// reads precede every buffered business write in the very same transaction.
+function assertControlReadsBeforeWrites(attempt) {
+  assert.deepEqual([...attempt.reads.keys()].slice(0, 3), [GUARD, RETIRED, RECEIPT]);
+  assert.deepEqual(attempt.io.slice(0, 3), [GUARD, RETIRED, RECEIPT].map(path => ({ type: 'read', path })));
+  assert.deepEqual(attempt.io.filter(row => row.type === 'read').map(row => row.path),
+    [...attempt.reads.keys(), ...attempt.queryReads.keys()], 'no hidden duplicate or additional reads');
+  assert.deepEqual(attempt.io.filter(row => row.type === 'write').map(row => row.path),
+    attempt.pending.map(row => row.path), 'every business write belongs to this transaction');
+  const firstWrite = attempt.io.findIndex(row => row.type === 'write');
+  assert.ok(firstWrite === -1 || firstWrite >= 3);
+  assert.equal(attempt.io.some((row, i) => row.type === 'read' && firstWrite !== -1 && i > firstWrite), false);
+  console.log(JSON.stringify({ historicalEvidence: 'exact-read-set', test: attempt.testName,
+    label: attempt.label, attempt: attempt.attempt, reads: [...attempt.reads.keys()],
+    controlReadsBeforeWrites: true, pendingWrites: attempt.pending.length }));
+}
+
+async function admitRealRetirement(f) {
+  const binding = { projectId: f.db.projectId, databaseId: f.db.databaseId, uid: UID };
+  const calls = { subject: 0, auth: [], uuid: 0 };
+  const controller = deletionControl.createController({ db: f.db, binding,
+    clock: () => Timestamp.fromDate(new Date(DATE)),
+    uuid: () => { calls.uuid++; return DELETION_ID; },
+    ports: {
+      getAuthenticatedSubject: async () => { calls.subject++; return binding; },
+      getAuthUser: async uid => { calls.auth.push(uid); return { uid }; },
+    } });
+  const admission = await requestContext.run('retirement', () => controller.admitBackend());
+  assert.equal(admission.status, 'ADMITTED');
+  assert.equal(admission.destructiveAuthority, false);
+  assert.deepEqual(calls, { subject: 1, auth: [UID], uuid: 1 });
+  assert.equal(f.docs.get(RETIRED).origin, 'PRE_AUTH');
+  assert.equal(f.docs.get(RECEIPT).state, 'IN_PROGRESS');
+  assert.equal(f.docs.get(RECEIPT).scope.privateRoot, USER);
+  assert.equal(f.docs.get(RECEIPT).uid, UID);
+  for (const path of [RETIRED, GUARD, RECEIPT]) assert.equal(f.docs.get(path).deletionId, DELETION_ID);
+  assert.deepEqual(f.commits.filter(row => row.label === 'retirement' && row.pending.length)
+    .map(row => row.pending.map(w => w.path)), [[RETIRED, GUARD, RECEIPT]]);
+  return { controller, admission };
+}
+
+for (const config of operations) {
+  for (const action of ['create', 'delete']) {
+    test(`R6C1 ${config.entity} ${action}: real R5 retirement commits before writer and retry denies`, { timeout: 5000 }, async t => {
+      const f = fixture(t, config, action === 'delete' ? 1 : 0);
+      if (action === 'delete') f.put(f.target, config.payload);
+      const otherUid = 'unrelated-active-user';
+      const otherRoot = `users/${otherUid}`;
+      const otherTarget = `${otherRoot}/${config.collection}/${ID}`;
+      f.put(otherRoot, { [config.counter]: 0 });
+      const otherBefore = f.docs.get(otherRoot);
+      const oldMarker = `${USER}/sync_tombstones/${config.collection}__unrelated`;
+      f.put(oldMarker, { schemaVersion: 1, entityType: config.collection, entityId: 'unrelated', deletedAt: new Date(DATE) });
+      const originalMarker = f.docs.get(oldMarker);
+      const before = new Map(f.docs);
+      const held = gate();
+      t.after(held.release);
+      let injectionReached = 0;
+      f.hooks.beforeCommit = async ({ label, attempt, record }) => {
+        if (label === 'writer' && attempt === 1) {
+          injectionReached++;
+          assertControlReadsBeforeWrites(record);
+          assert.ok(record.pending.length > 0, 'real Sync business writes are buffered');
+          assert.equal(record.applied, false);
+          await held.hold();
+        }
+      };
+      // Client body cannot select the account to fence or mutate.
+      const execution = f.invoke(action, 'writer', { uid: otherUid, userId: otherUid });
+      await Promise.race([held.reached, execution.then(() => assert.fail('writer did not reach the real commit hook'))]);
+      assert.equal(injectionReached, 1);
+      assert.deepEqual(f.docs, before, 'paused writer has not applied any data');
+      await admitRealRetirement(f);
+      const barrier = new Map(f.docs);
+      held.release();
+      assertDeletionBlocked(await execution);
+      assert.deepEqual(f.docs, barrier, 'no writer mutation follows the retirement commit');
+      const attempts = f.attempts.filter(row => row.label === 'writer');
+      assert.equal(attempts.length, 2);
+      assert.deepEqual([...attempts[0].reads.keys()], [GUARD, RETIRED, RECEIPT, USER, f.target, f.marker]);
+      assert.deepEqual([...attempts[1].reads.keys()], [GUARD]);
+      assert.equal(attempts[1].pending.length, 0);
+      assert.ok(attempts.every(row => row.applied === false));
+      assert.deepEqual(f.conflicts, [{ label: 'writer', attempt: 1, paths: [GUARD, RETIRED, RECEIPT] }]);
+      assert.equal(f.commits.some(row => row.label === 'writer'), false);
+      assert.equal(f.writes.length, 3, 'only the three real R5 controls were committed');
+      assert.deepEqual(f.identities, [{ label: 'writer', uid: UID }]);
+      assert.equal(f.docs.get(oldMarker), originalMarker, 'no silent loss of existing tombstones');
+      assert.deepEqual(f.docs.get(otherRoot), otherBefore);
+      success(await f.invoke('create', 'other-user', {}, { uid: otherUid }), config, 'create');
+      assert.equal(f.docs.get(otherRoot)[config.counter], 1);
+      assert.equal(f.docs.has(otherTarget), true);
+      for (const [path, data] of barrier) if (path !== otherRoot) assert.deepEqual(f.docs.get(path), data);
+      for (const row of f.commits.filter(row => row.label === 'other-user')) {
+        assert.deepEqual([...row.reads.keys()], [
+          `account_deletion_guards/${otherUid}`, `retired_auth_identities/${otherUid}`,
+          `account_deletion_guards/${otherUid}/control/operation`, otherRoot, otherTarget,
+          `${otherRoot}/sync_tombstones/${config.collection}__${ID}`,
+        ]);
+        assert.deepEqual(row.pending.map(w => w.path), [otherTarget, otherRoot]);
+      }
+      assert.deepEqual(f.identities, [{ label: 'writer', uid: UID }, { label: 'other-user', uid: otherUid }]);
+      t.diagnostic(JSON.stringify({ historicalEvidence: 'real-retirement-wins', entity: config.entity, action,
+        injectionReached, conflicts: f.conflicts, writerAttempts: attempts.map(a => ({
+          uid: UID, attempt: a.attempt, reads: [...a.reads.keys()], pending: a.pending.map(w => w.path), applied: a.applied })),
+        barrierWrites: [RETIRED, GUARD, RECEIPT], deletionId: DELETION_ID,
+        writerCommits: 0, otherUserSuccess: true, tombstonePreserved: true }));
+    });
+
+    test(`R6C1 ${config.entity} ${action}: writer serialized before R5 retirement stays in the original scope`, async t => {
+      const f = fixture(t, config, action === 'delete' ? 1 : 0);
+      if (action === 'delete') f.put(f.target, config.payload);
+      success(await f.invoke(action, 'writer-before'), config, action);
+      const business = new Map(f.docs);
+      const businessCommits = f.commits.filter(row => row.label === 'writer-before');
+      assert.ok(businessCommits.some(row => row.pending.length > 0));
+      for (const row of businessCommits) assertControlReadsBeforeWrites(row);
+      if (action === 'create') {
+        assert.equal(f.docs.has(f.target), true);
+        assert.equal(f.count(), 1);
+      } else deleted(f, config);
+      const marker = f.docs.get(f.marker);
+      const admitted = await admitRealRetirement(f);
+      for (const [path, data] of business) assert.deepEqual(f.docs.get(path), data);
+      const originalReceipt = f.docs.get(RECEIPT);
+      assert.equal(originalReceipt.scope.privateRoot, USER);
+      assert.equal(originalReceipt.scope.policyVersion, 'ACCOUNT_DELETE_SCOPE_V1');
+      const barrier = new Map(f.docs);
+      const writes = f.writes.length;
+      assertDeletionBlocked(await f.invoke(action, 'writer-after'));
+      assert.deepEqual(f.docs, barrier);
+      assert.equal(f.writes.length, writes);
+      assert.equal(f.docs.get(f.marker), marker);
+      const resumed = await requestContext.run('retirement-resume', () => admitted.controller.admitBackend());
+      assert.equal(resumed.status, 'RESUMED');
+      assert.equal(f.docs.get(RECEIPT), originalReceipt, 'resume retains the same operation and scope');
+      assert.deepEqual(f.docs, barrier);
+      assert.equal(f.writes.length, writes);
+      t.diagnostic(JSON.stringify({ historicalEvidence: 'writer-before-retirement', entity: config.entity, action,
+        businessCommits: businessCommits.length, privateRoot: originalReceipt.scope.privateRoot,
+        deletionId: originalReceipt.deletionId, noPostBarrierWrites: true, scopePreserved: true }));
+    });
+  }
+}
+
+test('R6C1 expired COMPLETE: another authenticated UID remains independent', async t => {
+  const config = operations[0], f = fixture(t, config);
+  f.put(GUARD, deletionGuard({ state: 'COMPLETE', retainUntil: Timestamp.fromMillis(2) }));
+  const before = new Map(f.docs);
+  assertDeletionBlocked(await f.invoke());
+  const other = 'expired-guard-other-user', root = `users/${other}`;
+  f.put(root, { tasksCount: 0 });
+  success(await f.invoke('create', 'other', {}, { uid: other }), config, 'create');
+  assert.equal(f.docs.get(root).tasksCount, 1);
+  assert.equal(f.docs.has(`${root}/tasks/${ID}`), true);
+  for (const [path, data] of before) assert.deepEqual(f.docs.get(path), data);
+  assert.equal(f.docs.has(f.target), false);
+  assert.equal(f.docs.has(RETIRED), false);
+  assert.equal(f.docs.has(RECEIPT), false);
+  assert.deepEqual(f.writes.map(w => w.path), [`${root}/tasks/${ID}`, root]);
+});
+
+// R6C4-A: reuse the existing Subject deletion MVCC model and actual Sync route.
+const cardCreatePayload = (cardId='created-card') => ({operation:'create_review_card',version:1,cardId,subjectId:ID,
+  question:'Synthetic question',answer:'Synthetic answer',createdAt:'2026-10-28T12:34:56.123456Z'});
+function cardFixture(t){const f=fixture(t,operations.find(c=>c.entity==='subject'),1);
+  f.put(f.target,{title:'Subject',cardsToReview:0});f.put(USER+'/study_info/main',{reviewQueue:0});return f;}
+const newReceiptPath=USER+'/study_card_create_receipts/created-card';
+function createdCard(response,outcome='APPLIED'){assert.equal(response.statusCode,200);assert.equal(response.body.operation,'create_review_card');assert.equal(response.body.outcome,outcome);assert.equal(response.body.effectsCommitted,true);}
+test('R6C4-A Subject deletion removes card/counter effects but retains immutable creation receipt for replay',async t=>{
+  const f=cardFixture(t);createdCard(await f.invoke('create','card-create',cardCreatePayload(),{exactBody:true}));
+  const receiptBefore=f.docs.get(newReceiptPath);assert.ok(receiptBefore.appliedAt instanceof Timestamp);
+  assert.equal((await f.invoke('delete','subject-delete')).statusCode,200);
+  assert.equal(f.docs.has(USER+'/review_queue/created-card'),false);assert.equal(f.docs.has(f.target),false);
+  assert.equal(f.docs.get(USER+'/study_info/main').reviewQueue,0);assert.deepEqual(f.docs.get(newReceiptPath),receiptBefore);
+  const count=f.writes.length;createdCard(await f.invoke('create','card-replay',cardCreatePayload(),{exactBody:true}),'REPLAYED');assert.equal(f.writes.length,count);
+  f.put(f.target,{title:'Reappeared',cardsToReview:0});const before=new Map(f.docs);
+  const blocked=await f.invoke('create','new-card-after-delete',cardCreatePayload('created-card-2'),{exactBody:true});
+  assert.equal(blocked.statusCode,409);assert.equal(blocked.body.code,'REVIEW_CREATE_SUBJECT_TOMBSTONED');assert.deepEqual(f.docs,before);
+});
+test('R6C4-A Subject delete wins while card creation is pending; retry cannot resurrect or mint receipt',async t=>{
+  const f=cardFixture(t),hold=gate();t.after(hold.release);let paused=false;
+  f.hooks.beforeCommit=async({label,record})=>{if(!paused&&label==='card-create'&&record.pending.length){paused=true;assert.equal(record.pending.length,4);await hold.hold();}};
+  const creation=f.invoke('create','card-create',cardCreatePayload(),{exactBody:true});
+  await Promise.race([hold.reached,creation.then(()=>assert.fail('creation did not pause'))]);
+  assert.equal((await f.invoke('delete','subject-delete')).statusCode,200);const before=new Map(f.docs);hold.release();
+  const response=await creation;assert.equal(response.statusCode,409);assert.equal(response.body.code,'REVIEW_CREATE_SUBJECT_TOMBSTONED');assert.deepEqual(f.docs,before);
+  assert.equal(f.docs.has(newReceiptPath),false);assert.equal(f.commits.some(tx=>tx.label==='card-create'),false);assert.ok(f.conflicts.some(tx=>tx.label==='card-create'));
+});
+test('R6C4-A card create wins while Subject delete is pending; delete retries and accounts for the committed card',async t=>{
+  const f=cardFixture(t),hold=gate();t.after(hold.release);let paused=false;
+  f.hooks.beforeCommit=async({label,record})=>{if(!paused&&label==='subject-delete'&&record.pending.some(w=>w.path===f.marker)){paused=true;await hold.hold();}};
+  const deletion=f.invoke('delete','subject-delete');await Promise.race([hold.reached,deletion.then(()=>assert.fail('deletion did not pause'))]);
+  createdCard(await f.invoke('create','card-create',cardCreatePayload(),{exactBody:true}));const receipt=f.docs.get(newReceiptPath);hold.release();
+  assert.equal((await deletion).statusCode,200);assert.ok(f.conflicts.some(tx=>tx.label==='subject-delete'));
+  assert.equal(f.docs.get(USER+'/study_info/main').reviewQueue,0);assert.equal(f.docs.has(USER+'/review_queue/created-card'),false);assert.deepEqual(f.docs.get(newReceiptPath),receipt);
+  createdCard(await f.invoke('create','card-replay',cardCreatePayload(),{exactBody:true}),'REPLAYED');
+});
+
+function assertReviewQueueUnavailable(response) {
+  assert.equal(response.statusCode, 409);
+  assert.deepEqual(response.body, { code: 'STUDY_REVIEW_QUEUE_STATE_INVALID',
+    error: 'O contador remoto da fila de revisão está indisponível.' });
+  assert.equal(response.body.success, undefined, 'unknown counter never produces a final ACK');
+  assert.equal(JSON.stringify(response.body).includes('private-state'), false);
+}
+
+for (const [name, info] of [
+  ['document missing', undefined], ['partial document', { progress: .2 }],
+  ...[null, false, 'private-state', '3', -1, NaN, Infinity, 1.5, 2 ** 53, 2 ** 54, {}, []]
+    .map(value => ['malformed ' + String(value), { reviewQueue: value, unrelated: 'preserved' }]),
+]) {
+  test('F01 subject: ' + name + ' blocks every unapplied chunk and repeat without false ACK', async t => {
+    const f = subjectFixture(t, 201);
+    f.put(STUDY, info);
+    const other = 'users/other-uid/study_info/main';
+    f.put(other, { reviewQueue: 81, privateDetail: 'other-user' });
+    const otherBefore = f.docs.get(other);
+    assertReviewQueueUnavailable(await f.invoke('delete', 'first'));
+    deleted(f, subjectConfig, 2); // Existing independent phase 1 remains committed.
+    assert.equal(f.remaining(), 201);
+    assert.deepEqual(f.docs.get(STUDY), info);
+    assert.equal(f.docs.has(STUDY), info !== undefined);
+    assert.equal(f.chunks().length, 0);
+    assert.ok(f.attempts.filter(a => a.queryReads.size).every(a => a.pending.length === 0));
+    assert.ok(f.writes.every(w => w.path !== STUDY && !w.path.startsWith(CARDS + '/')));
+    const sealed = new Map(f.docs), writes = f.writes.length;
+    assertReviewQueueUnavailable(await f.invoke('delete', 'repeat'));
+    assert.deepEqual(f.docs, sealed);
+    assert.equal(f.writes.length, writes);
+    assert.equal(f.docs.get(other), otherBefore);
+    assert.equal(f.identities.every(i => i.uid === UID), true);
+  });
+}
+
+test('F01 subject: counter corruption before commit conflicts and discards the buffered chunk', async t => {
+  const f = subjectFixture(t, 201);
+  let raced = false;
+  f.hooks.beforeCommit = ({ record }) => {
+    if (!raced && record.queryReads.size) {
+      raced = true;
+      f.put(STUDY, { privateDetail: 'private-state' });
+    }
+  };
+  assertReviewQueueUnavailable(await f.invoke('delete'));
+  assert.equal(f.remaining(), 201);
+  assert.deepEqual(f.docs.get(STUDY), { privateDetail: 'private-state' });
+  assert.ok(f.conflicts.some(c => c.paths.includes(STUDY)));
+  assert.equal(f.chunks().length, 0);
+  assert.ok(f.writes.every(w => w.path !== STUDY && !w.path.startsWith(CARDS + '/')));
+  deleted(f, subjectConfig, 2);
+});
+
+for (const loseResponse of [false, true]) {
+  test('F01 subject: missing counter after confirmed chunk preserves progress (timeout=' + loseResponse + ')', async t => {
+    const f = subjectFixture(t, 451);
+    let confirmed = false;
+    f.hooks.afterCommit = record => {
+      if (!confirmed && record.result?.deleted > 0) {
+        confirmed = true;
+        assert.equal(record.result.reviewQueue, 258);
+        f.put(STUDY, undefined);
+        if (loseResponse) throw Object.assign(new Error('private-state response timeout'), { code: 4 });
+      }
+    };
+    const response = await f.invoke('delete', 'first');
+    if (loseResponse) {
+      failure(response);
+      assert.equal(JSON.stringify(response.body).includes('private-state'), false);
+    } else assertReviewQueueUnavailable(response);
+    assert.equal(confirmed, true);
+    deleted(f, subjectConfig, 2);
+    assert.equal(f.remaining(), 251);
+    assert.equal(f.docs.has(STUDY), false);
+    assert.equal(f.chunks().length, 1);
+    const before = new Map(f.docs), writes = f.writes.length;
+    const deletedCards = f.writes.filter(w => w.type === 'delete' && w.path.startsWith(CARDS + '/'));
+    assert.equal(deletedCards.length, 200);
+    f.hooks.afterCommit = undefined;
+    assertReviewQueueUnavailable(await f.invoke('delete', 'retry'));
+    assert.deepEqual(f.docs, before);
+    assert.equal(f.writes.length, writes);
+    assert.equal(f.docs.has(STUDY), false);
+    assert.equal(new Set(deletedCards.map(w => w.path)).size, 200);
+    assertSingleSeal(f);
+  });
+}
+
+test('F01 subject: completed cleanup with no remaining cards does not need or recreate counter', async t => {
+  const f = subjectFixture(t, 0, { subjectExists: false, markerExists: true });
+  f.put(STUDY, undefined);
+  const before = new Map(f.docs);
+  success(await f.invoke('delete'), subjectConfig, 'delete');
+  assert.deepEqual(f.docs, before);
+  assert.equal(f.writes.length, 0);
+  assert.equal(f.docs.has(STUDY), false);
+});
+
+test('F01 subject: pending cards and existing tombstone/creation receipt never authorize unknown counter', async t => {
+  const f = subjectFixture(t, 1, { subjectExists: false, markerExists: true });
+  f.put(STUDY, undefined);
+  const receiptPath = USER + '/study_card_create_receipts/card-0';
+  f.put(receiptPath, { schemaVersion: 1, appliedAt: Timestamp.fromDate(new Date(DATE)) });
+  const before = new Map(f.docs);
+  assertReviewQueueUnavailable(await f.invoke('delete'));
+  assert.deepEqual(f.docs, before);
+  assert.equal(f.writes.length, 0);
+  assert.equal(f.remaining(), 1);
+});
+
+
+for (const reviewQueue of [0, 1, Number.MAX_SAFE_INTEGER]) {
+  test('R1 subject: safe counter ' + reviewQueue + ' debits exactly across chunks and replay', async t => {
+    const f = subjectFixture(t, 201, { reviewQueue });
+    const other = 'users/other-uid/study_info/main';
+    f.put(other, { reviewQueue: 81 });
+    const receiptPath = USER + '/study_card_create_receipts/card-0';
+    const receipt = { schemaVersion: 1, appliedAt: Timestamp.fromDate(new Date(DATE)) };
+    f.put(receiptPath, receipt);
+    success(await f.invoke('delete'), subjectConfig, 'delete');
+    assertSubjectCleanup(f, 2, Math.max(0, reviewQueue - 201));
+    assert.equal(f.chunks().length, 2);
+    assert.deepEqual(f.chunks().map(c => c.result.reviewQueue),
+      [Math.max(0, reviewQueue - 200), Math.max(0, reviewQueue - 201)]);
+    const before = new Map(f.docs), writes = f.writes.length;
+    success(await f.invoke('delete', 'repeat'), subjectConfig, 'delete');
+    assert.deepEqual(f.docs, before);
+    assert.equal(f.writes.length, writes);
+    assert.equal(f.docs.get(receiptPath), receipt);
+    assert.deepEqual(f.docs.get(other), { reviewQueue: 81 });
+    assertSingleSeal(f);
+  });
+}
+
+for (const reviewQueue of [2 ** 53, 2 ** 54]) {
+  test('R1 subject: retry rejects unsafe counter ' + reviewQueue + ' without committing chunk', async t => {
+    const f = subjectFixture(t, 201);
+    let raced = false;
+    f.hooks.beforeCommit = ({ record }) => {
+      if (!raced && record.queryReads.size) {
+        raced = true;
+        f.put(STUDY, { reviewQueue, unrelated: 'preserved' });
+      }
+    };
+    assertReviewQueueUnavailable(await f.invoke('delete'));
+    assert.equal(f.remaining(), 201);
+    assert.equal(f.reviewQueue(), reviewQueue);
+    assert.ok(f.conflicts.some(c => c.paths.includes(STUDY)));
+    assert.equal(f.chunks().length, 0);
+    assert.ok(f.writes.every(w => w.path !== STUDY && !w.path.startsWith(CARDS + '/')));
+    assert.equal(f.attempts.at(-1).pending.length, 0);
+    assertSingleSeal(f);
+  });
+
+  for (const loseResponse of [false, true]) {
+    test('R1 subject: unsafe counter ' + reviewQueue + ' preserves confirmed chunk (timeout=' + loseResponse + ')', async t => {
+      const f = subjectFixture(t, 451);
+      const receiptPath = USER + '/study_card_create_receipts/card-0';
+      const receipt = { schemaVersion: 1, appliedAt: Timestamp.fromDate(new Date(DATE)) };
+      f.put(receiptPath, receipt);
+      let confirmed = false;
+      f.hooks.afterCommit = record => {
+        if (!confirmed && record.result?.deleted > 0) {
+          confirmed = true;
+          assert.equal(record.result.reviewQueue, 258);
+          f.put(STUDY, { reviewQueue, unrelated: 'preserved' });
+          if (loseResponse) throw Object.assign(new Error('private-state timeout'), { code: 4 });
+        }
+      };
+      const response = await f.invoke('delete', 'first');
+      if (loseResponse) failure(response);
+      else assertReviewQueueUnavailable(response);
+      assert.equal(confirmed, true);
+      assert.equal(f.remaining(), 251);
+      assert.equal(f.chunks().length, 1);
+      assert.equal(f.reviewQueue(), reviewQueue);
+      deleted(f, subjectConfig, 2);
+      const before = new Map(f.docs), writes = f.writes.length;
+      f.hooks.afterCommit = undefined;
+      assertReviewQueueUnavailable(await f.invoke('delete', 'repeat'));
+      assert.deepEqual(f.docs, before);
+      assert.equal(f.writes.length, writes);
+      assert.equal(f.docs.get(receiptPath), receipt);
+      assert.equal(f.writes.filter(w => w.type === 'delete' && w.path.startsWith(CARDS + '/')).length, 200);
+      assert.ok(f.attempts.filter(a => a.queryReads.size && !a.applied).every(a => a.pending.length === 0));
+      assertSingleSeal(f);
+    });
+  }
+
+  for (const subjectExists of [false, true]) {
+    test('R1 subject: empty chunk with unsafe counter ' + reviewQueue + ' preserves seal (subject=' + subjectExists + ')', async t => {
+      const f = subjectFixture(t, 0, { reviewQueue, subjectExists, markerExists: !subjectExists });
+      const info = f.docs.get(STUDY);
+      const marker = f.docs.get(f.marker);
+      success(await f.invoke('delete'), subjectConfig, 'delete');
+      deleted(f, subjectConfig, subjectExists ? 2 : 3);
+      assert.equal(f.docs.get(STUDY), info);
+      assert.equal(f.chunks().length, 0);
+      assert.ok(f.attempts.filter(a => a.queryReads.size).every(a => a.pending.length === 0));
+      assert.ok(f.writes.every(w => w.path !== STUDY && !w.path.startsWith(CARDS + '/')));
+      if (subjectExists) assertSingleSeal(f);
+      else { assert.equal(f.writes.length, 0); assert.equal(f.docs.get(f.marker), marker); }
+      const before = new Map(f.docs), writes = f.writes.length;
+      success(await f.invoke('delete', 'repeat'), subjectConfig, 'delete');
+      assert.deepEqual(f.docs, before);
+      assert.equal(f.writes.length, writes);
+    });
+  }
+}

@@ -30,6 +30,7 @@ class Ref {
 }
 
 class Db {
+  projectId = 'demo-life-os-p1'; databaseId = '(default)';
   constructor() { this.store = new Map(); this.writes = []; this.fail = false; }
   collection(name) { if (this.fail) throw new Error('private-firestore-error'); return new Ref(this, name); }
   seed(path, data) { this.store.set(path, data); }
@@ -401,7 +402,10 @@ test('conflicting Google ownership ACKs fail-closed without entitlement', async 
   f.runtime.getGooglePlaySubscription = async () => ({ ...google(), externalAccountIdentifiers: {
     obfuscatedExternalAccountId: sha256('other-user'),
   } });
-  assert.equal((await invoke(f)).statusCode, 204);
+  // R6C2B: contradictory trusted ownership is indeterminate, not terminal.
+  const res = await invoke(f);
+  assert.equal(res.statusCode, 503);
+  assert.deepEqual(res.body, { code: 'RTDN_RECONCILIATION_RETRY' });
   assert.equal(f.db.data(USER).isPremium, undefined);
   assert.ok(f.db.writes.every((write) => write.path === BILLING && Object.keys(write.data).length === 1));
 });
@@ -464,4 +468,92 @@ test('only POST is accepted without app CORS', async () => {
     assert.deepEqual(res.headers, {});
   }
   assert.equal(f.calls.oidc.length, 0);
+});
+
+function seedR5Retirement(f, { origin = 'PRE_AUTH', state = 'IN_PROGRESS', receiptOnly = false } = {}) {
+  const deletionId = '12345678-1234-4234-8234-123456789abc';
+  const startedAt = Timestamp.fromMillis(NOW - 1000);
+  const operation = { version: 1, projectId: 'demo-life-os-p1', databaseId: '(default)', uid: UID,
+    deletionId, origin, sourceEventId: origin === 'AUTH_EVENT' ? 'synthetic-event' : null, state,
+    scope: state === 'REVIEW_REQUIRED' ? null : { policyVersion: 'ACCOUNT_DELETE_SCOPE_V1', privateRoot: USER,
+      guardStartedAt: startedAt, billingAccountHash: sha256(UID), birthDecisionId: null, birthDigest: null },
+    completedAt: state === 'COMPLETE' ? Timestamp.fromMillis(NOW) : null };
+  if (!receiptOnly) {
+    f.db.seed(`retired_auth_identities/${UID}`, { version: 2, state: 'RESERVED', origin, deletionId });
+    if (state !== 'REVIEW_REQUIRED') f.db.seed(`account_deletion_guards/${UID}`, { version: 1, deletionId, startedAt,
+      state, retainUntil: state === 'COMPLETE' ? Timestamp.fromMillis(NOW + 1_000) : null });
+  }
+  f.db.seed(`account_deletion_guards/${UID}/control/operation`, operation);
+}
+for (const options of [{}, { origin: 'AUTH_EVENT' }, { state: 'COMPLETE', receiptOnly: true },
+  { state: 'REVIEW_REQUIRED', origin: 'LEGACY_REVIEW' }]) {
+  test(`R6C2B B RTDN: proven R5 retirement ${JSON.stringify(options)} is write-free 204`, async () => {
+    const f = fixture(); seedR5Retirement(f, options); const before = new Map(f.db.store);
+    assert.equal((await invoke(f)).statusCode, 204);
+    assert.deepEqual(f.db.store, before); assert.deepEqual(f.db.writes, []); assert.deepEqual(f.calls.google, []);
+  });
+}
+for (const controlPath of [`retired_auth_identities/${UID}`, `account_deletion_guards/${UID}`,
+  `account_deletion_guards/${UID}/control/operation`]) {
+  test(`R6C2B B RTDN: malformed ${controlPath.split('/')[0]} requires 503`, async () => {
+    const f = fixture(); f.db.seed(controlPath, { version: 999 }); const before = new Map(f.db.store);
+    const res = await invoke(f); assert.equal(res.statusCode, 503); assert.deepEqual(res.body, { code: 'RTDN_RECONCILIATION_RETRY' });
+    assert.deepEqual(f.db.store, before); assert.deepEqual(f.db.writes, []); assert.deepEqual(f.calls.google, []);
+  });
+  test(`R6C2B B RTDN: unreadable ${controlPath.split('/')[0]} cannot become terminal ACK`, async () => {
+    const f = fixture(), run = f.db.runTransaction.bind(f.db), before = new Map(f.db.store);
+    f.db.runTransaction = cb => run(tx => cb({ ...tx, get: ref => {
+      if (ref.path === controlPath) throw Error('private-control-unavailable'); return tx.get(ref);
+    } }));
+    assert.equal((await invoke(f)).statusCode, 503); assert.deepEqual(f.db.store, before);
+    assert.deepEqual(f.db.writes, []); assert.deepEqual(f.calls.google, []);
+  });
+}
+for (const corrupt of ['missing active root', 'dangling index', 'invalid account', 'guard only', 'reservation only', 'ambiguous snapshot']) {
+  test(`R6C2B B RTDN: ${corrupt} is indeterminate, not retirement`, async () => {
+    const f = fixture();
+    if (corrupt === 'missing active root') f.db.store.delete(USER);
+    if (corrupt === 'dangling index') f.db.store.delete(ACCOUNT);
+    if (corrupt === 'invalid account') f.db.seed(ACCOUNT, { uid: UID, state: 'UNKNOWN' });
+    if (corrupt === 'guard only') f.db.seed(`account_deletion_guards/${UID}`, { version: 1, state: 'COMPLETE',
+      deletionId: '12345678-1234-4234-8234-123456789abc', startedAt: Timestamp.fromMillis(1), retainUntil: Timestamp.fromMillis(2) });
+    if (corrupt === 'reservation only') f.db.seed(`retired_auth_identities/${UID}`, { version: 2, state: 'RESERVED',
+      deletionId: '12345678-1234-4234-8234-123456789abc', origin: 'PRE_AUTH' });
+    if (corrupt === 'ambiguous snapshot') {
+      const run = f.db.runTransaction.bind(f.db);
+      f.db.runTransaction = cb => run(tx => cb({ ...tx, get: ref => ref.path === ACCOUNT
+        ? { exists: 'unknown', data: () => undefined } : tx.get(ref) }));
+    }
+    const before = new Map(f.db.store);
+    assert.equal((await invoke(f)).statusCode, 503); assert.deepEqual(f.db.store, before);
+    assert.deepEqual(f.db.writes, []); assert.deepEqual(f.calls.google, []);
+  });
+}
+for (const phase of ['GET', 'ACK', 'failed ACK']) {
+  test(`R6C2B B RTDN: retirement during ${phase} is reclassified without later writes`, async () => {
+    const f = fixture(); let atRetirement, acknowledgements = 0;
+    const retire = () => { seedR5Retirement(f); atRetirement = new Map(f.db.store); };
+    f.runtime.getGooglePlaySubscription = async token => {
+      f.calls.google.push(token); const result = google();
+      if (phase === 'GET') retire(); else result.acknowledgementState = 'ACKNOWLEDGEMENT_STATE_PENDING';
+      return result;
+    };
+    f.runtime.acknowledgeGooglePlaySubscription = async () => {
+      acknowledgements++; retire(); if (phase === 'failed ACK') throw Error('private-ambiguous-ack');
+    };
+    assert.equal((await invoke(f)).statusCode, 204); assert.deepEqual(f.db.store, atRetirement);
+    assert.equal(acknowledgements, phase === 'GET' ? 0 : 1);
+    assert.equal(f.calls.google.length, 1, 'known retirement prevents new Google reads/ACK persistence');
+    if (phase !== 'GET') assert.equal(f.db.data(`${BILLING}/tokens/${sha256(TOKEN)}`).acknowledgementState, 'ACKNOWLEDGEMENT_STATE_PENDING');
+  });
+}
+test('R6C2B B RTDN: a read failure after GET retirement remains 503, not catch-and-ACK', async () => {
+  const f = fixture(), run = f.db.runTransaction.bind(f.db); let fail = false;
+  f.runtime.getGooglePlaySubscription = async () => { seedR5Retirement(f); fail = true; return google(); };
+  f.db.runTransaction = cb => run(tx => cb({ ...tx, get: ref => {
+    if (fail && ref.path === `retired_auth_identities/${UID}`) throw Error('private-unavailable');
+    return tx.get(ref);
+  } }));
+  assert.equal((await invoke(f)).statusCode, 503);
+  assert.equal(f.db.data(USER).isPremium, undefined);
 });

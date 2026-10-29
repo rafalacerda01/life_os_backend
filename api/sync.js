@@ -6,7 +6,7 @@ import {
   FieldValue,
 } from 'firebase-admin/firestore';
 import { ActivityHttpError } from './activity/_shared.js';
-import circleCleanup from './account/_circle_cleanup.cjs';
+import deletionControl from './account/_deletion_control.cjs';
 import {
   syncHabitCompletionUpdate,
   syncHabitUpdate,
@@ -29,6 +29,7 @@ import {
   applyStudyReview,
   validateStudyReviewPayload,
 } from './study/_sync_review.js';
+import {createStudyCard, validateStudyCardCreatePayload, REVIEW_CARD_CREATE_ERRORS} from './study/_sync_card_create.js';
 // ============================================================================
 // LIFE OS - SYNC ENDPOINT
 // ============================================================================
@@ -55,30 +56,26 @@ if (!getApps().length) {
 
 const db = getFirestore();
 
-// The missing guard is also a transactional read: creation or replacement of
-// that document conflicts with this attempt. Revalidate on every SDK retry.
+// All three missing-control reads participate in the mutation's transaction.
+// The predicate is executed anew by Firestore for every callback retry.
 function runSyncTransaction(userId, callback, ...options) {
   return db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(circleCleanup.guardRef(db, userId));
-    if (snapshot.exists) {
-      let guard;
-      try {
-        guard = circleCleanup.validateGuard(snapshot.data());
-      } catch (_) {
-        throw syncDeletionBlocked();
-      }
-      // Match the existing retention barrier. Malformed/legacy guards fail
-      // closed; a valid expired COMPLETE is not permission to run a cleaner.
-      if (guard.state === 'IN_PROGRESS' || guard.retainUntil.toMillis() >= Date.now()) {
-        throw syncDeletionBlocked();
-      }
+    try {
+      await deletionControl.assertNormalWriterTransaction(transaction, db, userId);
+    } catch (error) {
+      if (error instanceof deletionControl.DeletionControlError) throw syncDeletionBlocked();
+      throw error;
     }
-    // Presence only denies sync; record contents never prove an Auth generation
-    // or authorize cleanup. Reading absence here also fences concurrent creation.
-    const retired = await transaction.get(db.collection('retired_auth_identities').doc(userId));
-    if (retired.exists) throw syncDeletionBlocked();
     return callback(transaction);
   }, ...options);
+}
+
+// Kept behind the existing unconditional legacy rejection. Even if that block
+// is reviewed in the future, its write cannot bypass the normal-writer fence.
+function persistLegacySyncPayload(userId, userRef, payloadToSave) {
+  return runSyncTransaction(userId, (transaction) => {
+    transaction.set(userRef, payloadToSave, { merge: true });
+  });
 }
 
 function syncDeletionBlocked() {
@@ -162,6 +159,7 @@ const MAX_HABIT_DATES = 5000;
 const MAX_HABIT_DATE_LENGTH = 20;
 
 const SAFE_SYNC_DOMAIN_ERRORS = Object.freeze({
+  ...REVIEW_CARD_CREATE_ERRORS,
   ACCOUNT_DELETION_BLOCKED: Object.freeze({
     statusCode: 503,
     messages: Object.freeze(['Conta indisponível para sincronização.']),
@@ -236,6 +234,12 @@ const SAFE_SYNC_DOMAIN_ERRORS = Object.freeze({
     statusCode: 409,
     messages: Object.freeze([
       'A matéria da revisão não foi encontrada.',
+    ]),
+  }),
+  STUDY_REVIEW_QUEUE_STATE_INVALID: Object.freeze({
+    statusCode: 409,
+    messages: Object.freeze([
+      'O contador remoto da fila de revisão está indisponível.',
     ]),
   }),
   STUDY_REVIEW_STATE_INVALID: Object.freeze({
@@ -2070,13 +2074,15 @@ async function deleteSubjectWithQuota({
 
         if (flashcardsSnapshot.size === 0) return { deleted: 0 };
 
-        const rawReviewQueue = studyInfoSnapshot.data()?.reviewQueue;
-        const currentReviewQueue =
-          typeof rawReviewQueue === 'number' &&
-          Number.isInteger(rawReviewQueue) &&
-          rawReviewQueue >= 0
-            ? rawReviewQueue
-            : 0;
+        // An empty chunk is already complete; an unapplied chunk requires a
+        // persisted counter. Never infer zero or replay a committed adjustment.
+        const currentReviewQueue = studyInfoSnapshot.data()?.reviewQueue;
+        if (!Number.isSafeInteger(currentReviewQueue) || currentReviewQueue < 0) {
+          const error = new Error('O contador remoto da fila de revisão está indisponível.');
+          error.statusCode = 409;
+          error.code = 'STUDY_REVIEW_QUEUE_STATE_INVALID';
+          throw error;
+        }
         const newReviewQueue = Math.max(0, currentReviewQueue - flashcardsSnapshot.size);
 
         for (const flashcardDoc of flashcardsSnapshot.docs) {
@@ -2887,6 +2893,21 @@ export async function syncHandler(req, res, runtime = {}) {
       runTransaction: (callback, ...options) =>
         runSyncTransaction(userId, callback, ...options),
     };
+    if (operation === 'create_review_card') {
+      const validation = validateStudyCardCreatePayload(rawBody);
+      if (!validation.valid) {
+        return res.status(validation.statusCode).json({error: validation.error, code: validation.code});
+      }
+      try {
+        return res.status(200).json(await createStudyCard({db: guardedDb, userId, body: rawBody}));
+      } catch (error) {
+        return sendSyncOperationError(res, error, {
+          logMessage: '[sync] Falha ao confirmar criação de flashcard.',
+          fallbackError: 'Não foi possível confirmar a criação do flashcard.',
+          fallbackCode: 'REVIEW_CREATE_UNCONFIRMED',
+        });
+      }
+    }
     if (operation === 'bootstrap_water') {
       try {
         const lifecycle = runtime.waterLifecycle ?? createWaterLifecycle({db, auth:getAuth()});
@@ -3584,12 +3605,7 @@ if (operation === 'delete_task') {
     }
 
     // Preserva o comportamento existente.
-    await userRef.set(
-      payloadToSave,
-      {
-        merge: true,
-      },
-    );
+    await persistLegacySyncPayload(userId, userRef, payloadToSave);
 
     // ------------------------------------------------------------------------
     // SUCCESS

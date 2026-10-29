@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { getApps, initializeApp } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
 import {
   applyStudyReview,
   validateStudyReviewPayload,
@@ -113,9 +114,11 @@ class Transaction {
       [...source.entries()].map(([path, value]) => [path, clone(value)]),
     );
     this.hasWritten = false;
+    this.reads = [];
     this.readAfterWrite = false;
   }
   async get(reference) {
+    this.reads.push(reference.path);
     if (this.hasWritten) this.readAfterWrite = true;
     if (reference instanceof Query) {
       const prefix = `${reference.path}/`;
@@ -179,16 +182,31 @@ class Firestore {
       Object.entries(initial).map(([path, value]) => [path, clone(value)]),
     );
     this.lastTransaction = null;
+    this.revision = 0;
+    this.attempts = [];
   }
   collection(name) {
     return new Collection(this, name);
   }
   async runTransaction(callback) {
-    const transaction = new Transaction(this.data);
-    this.lastTransaction = transaction;
-    const result = await callback(transaction);
-    this.data = transaction.data;
-    return result;
+    // Optimistic snapshot conflicts rerun the production callback. This local
+    // model does not claim to validate the real SDK/Firestore concurrency.
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const revision = this.revision;
+      const transaction = new Transaction(this.data);
+      this.lastTransaction = transaction;
+      this.attempts.push(transaction);
+      const result = await callback(transaction);
+      await this.beforeCommit?.(transaction);
+      if (revision !== this.revision) continue;
+      if (transaction.hasWritten) {
+        this.data = transaction.data;
+        this.revision++;
+      }
+      await this.afterCommit?.(transaction);
+      return result;
+    }
+    throw new Error('Test conflict retry budget exhausted');
   }
   read(path) {
     return clone(this.data.get(path));
@@ -739,15 +757,13 @@ test('lastReviewedDayOrdinal inválido falha fechado sem writes', async () => {
   }
 });
 
-test('study_info ausente usa defaults permitidos', async () => {
+test('study_info ausente falha fechado sem inicialização implícita (F01)', async () => {
   const db = database({ [paths.info]: undefined });
-  await apply(db);
-  assert.deepEqual(db.read(paths.info), {
-    reviewQueue: 0,
-    streak: 1,
-    lastStudyDate: occurredAt,
-    progress: .05,
-  });
+  const before = clone(Object.fromEntries(db.data));
+  await assert.rejects(apply(db), { code: 'STUDY_REVIEW_STATE_INVALID', statusCode: 409 });
+  assertNoWrites(db, before);
+  assert.equal(db.lastTransaction.hasWritten, false);
+  assert.equal(db.read(paths.info), undefined);
 });
 
 test('lastStudyDate ausente recebe occurredAt', async () => {
@@ -1076,3 +1092,167 @@ test('erros de domínio são sanitizados e allowlisted', async () => {
   });
   assert.equal(JSON.stringify(response.body).includes('private-state'), false);
 });
+
+// F01: absence is unknown, never a genesis/zero-counter proof.
+for (const value of [undefined, null, -1, 1.5, NaN, Infinity, 2 ** 53, 2 ** 54, '3', false, {}, []]) {
+  test('F01 review: invalid/missing counter ' + String(value) + ' has no effects', async () => {
+    const info = { progress: .2, unrelated: 'preserved' };
+    if (value !== undefined) info.reviewQueue = value;
+    const db = database({ [paths.info]: info, 'users/user-b/study_info/main': { reviewQueue: 71 } });
+    const before = clone(Object.fromEntries(db.data));
+    await assert.rejects(apply(db), {
+      code: 'STUDY_REVIEW_STATE_INVALID', statusCode: 409,
+      message: 'O estado remoto da revisão de estudo está inconsistente.',
+    });
+    assertNoWrites(db, before);
+    assert.equal(db.lastTransaction.hasWritten, false);
+    assert.equal(db.lastTransaction.readAfterWrite, false);
+  });
+}
+
+for (const reviewQueue of [0, 1, 3, 99, Number.MAX_SAFE_INTEGER]) {
+  test('F01 review: valid counter ' + reviewQueue + ' keeps the existing floor and fields', async () => {
+    const db = database({ [paths.info]: { reviewQueue, progress: .2, unrelated: 'preserved' } });
+    await apply(db);
+    assert.equal(db.read(paths.info).reviewQueue, Math.max(0, reviewQueue - 1));
+    assert.equal(db.read(paths.info).unrelated, 'preserved');
+    const before = clone(Object.fromEntries(db.data));
+    assert.equal((await apply(db)).alreadyApplied, true);
+    assertNoWrites(db, before);
+  });
+}
+
+test('F01 review: concurrent same-card reviews retry and debit exactly once', { timeout: 5000 }, async t => {
+  const db = database();
+  const held = Promise.withResolvers(), release = Promise.withResolvers();
+  t.after(release.resolve);
+  let first = true;
+  db.beforeCommit = async () => {
+    if (first) { first = false; held.resolve(); await release.promise; }
+  };
+  const pending = apply(db);
+  await held.promise;
+  assert.equal((await apply(db)).alreadyApplied, false);
+  release.resolve();
+  assert.equal((await pending).alreadyApplied, true);
+  assert.equal(db.read(paths.info).reviewQueue, 2);
+  assert.equal(db.read(paths.subject).cardsToReview, 1);
+  assert.equal(db.read(paths.info).progress, .25);
+  assert.equal([...db.data.keys()].filter(p => p.includes('/study_progress_events/')).length, 1);
+  assert.equal(db.attempts.length, 3);
+  assert.ok(db.attempts.every(a => !a.readAfterWrite));
+});
+
+test('F01 review: response timeout after commit does not repeat effects', async () => {
+  const db = database();
+  db.afterCommit = () => { throw new Error('synthetic response timeout'); };
+  await assert.rejects(apply(db), /synthetic response timeout/);
+  assert.equal(db.read(paths.info).reviewQueue, 2);
+  const before = clone(Object.fromEntries(db.data));
+  db.afterCommit = undefined;
+  assert.equal((await apply(db)).alreadyApplied, true);
+  assertNoWrites(db, before);
+});
+
+async function invokeRealReview(t, db) {
+  const sdk = getFirestore();
+  t.mock.method(sdk, 'collection', db.collection.bind(db));
+  t.mock.method(sdk, 'runTransaction', db.runTransaction.bind(db));
+  const res = responseStub();
+  await syncHandler(request(), res, runtime());
+  return res;
+}
+
+test('F01 review: real handler returns sanitized state failure without ACK', async t => {
+  const db = database({ [paths.info]: { progress: .2, privateDetail: 'private-state' } });
+  const before = clone(Object.fromEntries(db.data));
+  const res = await invokeRealReview(t, db);
+  assert.equal(res.statusCode, 409);
+  assert.deepEqual(res.body, { code: 'STUDY_REVIEW_STATE_INVALID',
+    error: 'O estado remoto da revisão de estudo está inconsistente.' });
+  assert.equal(res.body.success, undefined);
+  assert.equal(JSON.stringify(res.body).includes('private-state'), false);
+  assertNoWrites(db, before);
+});
+
+for (const marker of ['account_deletion_guards/user-a', 'retired_auth_identities/user-a',
+  'account_deletion_guards/user-a/control/operation']) {
+  test('F01 review: R5 denies real handler at ' + marker, async t => {
+    const db = database({ [marker]: { blocked: true } });
+    const before = clone(Object.fromEntries(db.data));
+    const res = await invokeRealReview(t, db);
+    assert.equal(res.statusCode, 503);
+    assert.deepEqual(res.body, { code: 'ACCOUNT_DELETION_BLOCKED',
+      error: 'Conta indisponível para sincronização.' });
+    assertNoWrites(db, before);
+    assert.equal(db.lastTransaction.hasWritten, false);
+  });
+}
+
+test('F01 review: R5 retirement appearing before commit conflicts then blocks replay', async t => {
+  const db = database();
+  const before = clone(Object.fromEntries(db.data));
+  let raced = false;
+  db.beforeCommit = transaction => {
+    assert.deepEqual(transaction.reads.slice(0, 3), ['account_deletion_guards/user-a',
+      'retired_auth_identities/user-a', 'account_deletion_guards/user-a/control/operation']);
+    if (!raced) {
+      raced = true;
+      db.data.set('retired_auth_identities/user-a', { blocked: true });
+      db.revision++;
+    }
+  };
+  const res = await invokeRealReview(t, db);
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.body.code, 'ACCOUNT_DELETION_BLOCKED');
+  assert.equal(res.body.success, undefined);
+  before['retired_auth_identities/user-a'] = { blocked: true };
+  assertNoWrites(db, before);
+  assert.equal(db.attempts.length, 2);
+  assert.equal(db.attempts[1].hasWritten, false);
+});
+
+
+for (const reviewQueue of [2 ** 53, 2 ** 54]) {
+  for (const replay of [false, true]) {
+    test('R1 review: unsafe counter ' + reviewQueue + ' never ACKs (replay=' + replay + ')', async t => {
+      const db = database({ [paths.info]: { reviewQueue, progress: .2 },
+        'users/user-b/study_info/main': { reviewQueue: 71 } });
+      if (replay) db.data.set(paths.card, { subjectId: 'subject-1', lastReviewed: occurredAt,
+        lastReviewedDayOrdinal: canonicalLocalDayOrdinal(occurredAt, -180) });
+      const before = clone(Object.fromEntries(db.data));
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const res = await invokeRealReview(t, db);
+        assert.equal(res.statusCode, 409);
+        assert.deepEqual(res.body, { code: 'STUDY_REVIEW_STATE_INVALID',
+          error: 'O estado remoto da revisão de estudo está inconsistente.' });
+        assert.equal(res.body.success, undefined);
+        assertNoWrites(db, before);
+        assert.equal(db.lastTransaction.hasWritten, false);
+        assert.equal(db.lastTransaction.readAfterWrite, false);
+      }
+    });
+  }
+
+  test('R1 review: retry rejects unsafe counter ' + reviewQueue + ' before new effects', async t => {
+    const db = database();
+    let raced = false;
+    db.beforeCommit = () => {
+      if (!raced) {
+        raced = true;
+        db.data.set(paths.info, { reviewQueue, progress: .2 });
+        db.revision++;
+      }
+    };
+    const before = clone(Object.fromEntries(db.data));
+    before[paths.info] = { reviewQueue, progress: .2 };
+    const res = await invokeRealReview(t, db);
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.body.code, 'STUDY_REVIEW_STATE_INVALID');
+    assert.equal(res.body.success, undefined);
+    assertNoWrites(db, before);
+    assert.equal(db.attempts.length, 2);
+    assert.equal(db.attempts[1].hasWritten, false);
+    assert.ok(db.attempts.every(a => !a.readAfterWrite));
+  });
+}
