@@ -1,9 +1,9 @@
-// CLOSED ledger validation and canonical digest mirror Functions C1-R3.
-import {createHash} from "node:crypto";
+// R5 backend adapter. Legacy metadata checks only refuse conflicts.
+import {createHash, randomUUID} from "node:crypto";
 import {Timestamp} from "firebase-admin/firestore";
 import circles from "./_circle_cleanup.cjs";
 
-const RETENTION_MS = 65 * 60 * 1000;
+import control from "./_deletion_control.cjs";
 const KEYS = ["version", "uid", "projectId", "tenantId", "authCreatedAt",
   "sourceType", "sourceEventId", "eventAt", "cohort", "decisionId",
   "originalIdentity", "recordedAt", "status"];
@@ -134,43 +134,73 @@ function validate(record, bound) {
     !bound.created.at.isEqual(record.authCreatedAt))) fail();
 }
 
-/**
- * Canonical digest in memory only; never logs/persists identity or its digest.
- * @param {*} value Typed record.
- * @return {*} Stable data.
- */
-function canonical(value) {
-  if (value instanceof Timestamp) return [value.seconds, value.nanoseconds];
-  if (value && typeof value === "object") {
-    return Object.keys(value).sort().map((key) => [key, canonical(value[key])]);
-  }
+// Process-local capabilities. Neither HTTP JSON nor a copied object can resume.
+const admissions = new WeakMap();
+
+function session(db, auth, admission) {
+  const value = admission && admissions.get(admission);
+  if (!value || value.db !== db || value.auth !== auth ||
+      db.projectId !== value.operation.projectId ||
+      db.databaseId !== value.operation.databaseId) fail();
   return value;
 }
 
-/**
- * @param {Object} tx Transaction, before writes.
- * @param {Object} db Trusted Admin storage.
- * @param {Object} bound Managed deletion.
- * @return {Promise<Object>} Original ledger digest and root presence.
- */
-async function inspect(tx, db, bound) {
-  const root = await tx.get(db.collection("users").doc(bound.uid));
-  const ledger = await tx.get(db.collection("account_birth_decisions")
-      .doc(bound.uid));
-  // Quarantine a later root, including a possible stale-client write.
-  // A late write alone does not prove another Auth generation.
-  if (root.exists && root.createTime !== undefined &&
-    (!time(root.createTime) || after(root.createTime, bound.rootCutoff || bound.deletedAt))) fail();
-  if (!ledger.exists) return {digest: null, rootExists: root.exists};
-  const record = ledger.data(); validate(record, bound);
-  return {digest: createHash("sha256").update(JSON.stringify(canonical(record)))
-      .digest("hex"), rootExists: root.exists};
+function unavailable() {
+  const error = new Error("Account deletion remains pending.");
+  error.code = "ACCOUNT_DELETION_BLOCKED";
+  error.retryable = true;
+  throw error;
 }
 
+async function controlled(work) {
+  try { return await work(); } catch (error) {
+    if (error instanceof control.DeletionControlError) {
+      if (["READ_UNAVAILABLE", "COMMIT_OUTCOME_UNKNOWN", "AUTH_UNAVAILABLE",
+        "BOUNDARY_UNAVAILABLE"].includes(error.code)) unavailable();
+      if (error.code === "CIRCLE_ADMIN_ACTION_REQUIRED") {
+        const admin = new Error("Circle administration required.");
+        admin.code = "CIRCLE_ADMIN_ACTION_REQUIRED";
+        throw admin;
+      }
+      if (error.code === "COMPLETE") {
+        const terminal = new Error("Account cleanup is terminal.");
+        terminal.code = "ACCOUNT_CLEANUP_COMPLETE";
+        throw terminal;
+      }
+      fail();
+    }
+    throw error;
+  }
+}
 
-// Every range below belongs to the final transaction. A concurrent preparation
-// either commits before this snapshot (and is observed), or retries against
-// COMPLETE and loses its write authority.
+// An absence here is only an observation. It never admits a new operation.
+async function lookup(auth, accountUid) {
+  let user;
+  try { user = await auth.getUser(accountUid); } catch (error) {
+    if (error?.code === "auth/user-not-found") return null;
+    unavailable();
+  }
+  if (!user || user.uid !== accountUid || user.disabled === true ||
+      (user.tenantId !== undefined && user.tenantId !== null)) fail();
+  metadata(user.metadata?.creationTime); // Invalid metadata is a conflict.
+  return user;
+}
+
+function checkRoot(root, operation) {
+  if (root.exists && root.createTime !== undefined &&
+      (!time(root.createTime) ||
+        after(root.createTime, operation.scope.guardStartedAt))) fail();
+}
+
+function checkUser(user, operation) {
+  const created = user ? metadata(user.metadata?.creationTime) : null;
+  if (created && (created.coarse ?
+    created.at.seconds > operation.scope.guardStartedAt.seconds :
+    after(created.at, operation.scope.guardStartedAt))) fail();
+  return created;
+}
+
+// Real terminal queries: no constant attestation can substitute for these reads.
 async function assertTerminal(tx, db, accountUid) {
   const hash = createHash("sha256").update(accountUid, "utf8").digest("hex");
   const billing = await tx.get(db.collection("billing_google_accounts").doc(hash));
@@ -183,112 +213,141 @@ async function assertTerminal(tx, db, accountUid) {
   if (billing.exists || tokens.docs.length || runtime.docs.length) fail();
 }
 
-// Internal server seam. The HTTP wrapper must already have verified ID Token
-// (including revocation), App Check, own UID, recent auth and rate limit.
-// No client payload is accepted here as an alternative authority.
+// Server-only seam called by the existing verified HTTP wrapper. No endpoint
+// accepts a UID, operation ID, scope or attestation from the request body.
 export async function prepare({db, auth, uid: accountUid, preflight}) {
-  if (!uid(accountUid) || typeof db?.projectId !== "string" ||
-      typeof auth?.getUser !== "function" || typeof preflight !== "function") fail();
-  const deletedAt = Timestamp.now();
-  let user;
-  let absent = false;
-  try { user = await auth.getUser(accountUid); } catch (error) {
-    if (error?.code !== "auth/user-not-found") throw error;
-    absent = true;
-  }
-  if (!absent && !user) fail();
-  if (user && (user.uid !== accountUid || user.disabled === true ||
-      (user.tenantId !== undefined && user.tenantId !== null))) fail();
-  const created = user ? metadata(user.metadata?.creationTime) : null;
-  if (created && after(created.at, deletedAt)) fail();
-  const initial = Object.freeze({uid: accountUid, projectId: db.projectId,
-    deletedAt, created});
-  const guard = await circles.beginGuard(db, accountUid, async tx => {
-    // Auth absent may only continue an existing, server-owned deletion. A new
-    // HTTP request after Auth removal still fails revocation in the wrapper.
-    if (!user) fail();
-    await inspect(tx, db, initial);
-    await preflight(tx);
-  });
-  if (user && (guard.state === "COMPLETE" || (created &&
-      (created.coarse ? created.at.seconds > guard.startedAt.seconds :
-        after(created.at, guard.startedAt))))) fail();
-  // Quarantine a root created after the original deletion barrier. This is
-  // conservative conflict detection, not proof of an Auth generation.
-  const bound = Object.freeze({...initial, rootCutoff: guard.startedAt});
-  const observation = await db.runTransaction(async (tx) => {
-    await circles.requireGuard(tx, db, bound.uid, guard);
-    const remaining = await inspect(tx, db, bound);
-    const snapshot = await tx.get(circles.guardRef(db, bound.uid));
-    const current = circles.validateGuard(snapshot.data());
-    // Preserve the existing, identity-validated root/ledger recovery only.
-    // An attempt admitted before COMPLETE cannot reopen a peer's finish.
-    if (guard.state === "COMPLETE" && current.state === "COMPLETE" &&
-        (remaining.digest !== null || remaining.rootExists)) {
-      tx.update(snapshot.ref, {state: "IN_PROGRESS", retainUntil: null});
-      return {digest: remaining.digest,
-        guard: {...current, state: "IN_PROGRESS", retainUntil: null}};
+  return controlled(async () => {
+    const binding = control.validateBinding({projectId: db?.projectId,
+      databaseId: db?.databaseId, uid: accountUid});
+    if (typeof auth?.getUser !== "function" ||
+        typeof preflight !== "function") fail();
+    // The unchanged bootstrap supplies Auth and Firestore from the default App.
+    // Check explicit public App project configuration when supplied as well.
+    if (auth.app?.options.projectId !== undefined &&
+        auth.app.options.projectId !== binding.projectId) fail();
+    let lastUser = await lookup(auth, accountUid);
+    let sawAbsent = lastUser === null;
+    let controller;
+    let admitted;
+    const ports = {
+      getAuthenticatedSubject: async () => binding,
+      getAuthUser: async () => {
+        lastUser = await lookup(auth, accountUid);
+        if (!lastUser) {
+          sawAbsent = true;
+          throw Object.assign(new Error("Auth absent."),
+              {code: "auth/user-not-found"});
+        }
+        if (sawAbsent) fail();
+        return lastUser;
+      },
+      admissionTransaction: async (tx, operation) => {
+        const root = await tx.get(db.collection("users").doc(accountUid));
+        const ledger = await tx.get(db.collection("account_birth_decisions")
+            .doc(accountUid));
+        checkRoot(root, operation);
+        const created = checkUser(lastUser, operation);
+        if (ledger.exists) validate(ledger.data(), {
+          ...binding, created, deletedAt: operation.scope.guardStartedAt,
+        });
+        await preflight(tx);
+      },
+      authorizeCleanup: async () => {
+        const current = await controller.continueOperation(admitted.handle);
+        if (current.status !== "IN_PROGRESS") fail();
+        const original = controller.originalOperation(admitted.handle);
+        return {projectId: db.projectId, databaseId: db.databaseId,
+          uid: original.uid, deletionId: original.deletionId};
+      },
+      terminalInventory: async (context) => {
+        await circles.assertUserTreeEmpty(db, accountUid);
+        await db.runTransaction(tx => assertTerminal(tx, db, accountUid));
+        return {...context, privateTreeEmpty: true, externalResourcesEmpty: true};
+      },
+      terminalTransaction: async (tx, context) => {
+        await assertTerminal(tx, db, accountUid);
+        return {...context, privateTreeEmpty: true, externalResourcesEmpty: true};
+      },
+    };
+    controller = control.createController({db, binding,
+      clock: () => Timestamp.now(), uuid: randomUUID, ports});
+    admitted = await controller.admitBackend();
+    if (!admitted.handle) fail();
+    const operation = controller.originalOperation(admitted.handle);
+    if (operation.origin !== "PRE_AUTH") fail();
+    checkUser(lastUser, operation);
+    if (admitted.status === "COMPLETE") {
+      // A concurrent original executor may have completed after the first
+      // lookup. Recheck Auth instead of rejecting on that stale observation.
+      lastUser = await lookup(auth, accountUid);
+      if (lastUser) fail();
+      sawAbsent = true;
     }
-    return {digest: remaining.digest, guard: current};
+    const value = {db, auth, controller, handle: admitted.handle, operation,
+      sawAbsent};
+    const guard = circles.bindOperation(db, accountUid, controller,
+        admitted.handle, async ref => {
+          await verifyStep(db, auth, admission);
+          if (ref?.path === operation.scope.privateRoot) {
+            await beforeRootRemoval(db, auth, admission);
+          }
+        });
+    const admission = Object.freeze({bound: Object.freeze({...binding}), guard});
+    value.guard = guard;
+    admissions.set(admission, value);
+    if (admitted.status !== "COMPLETE") await verifySnapshot(db, admission);
+    return admission;
   });
-  // A presence observation only, never an Auth generation or cleanup authority.
-  // The endpoint uses it solely to avoid retroactive PRE_AUTH deny records.
-  return Object.freeze({bound, guard: observation.guard, digest: observation.digest,
-    authPresent: !absent});
 }
 
-async function requireAuthAbsent(auth, accountUid) {
-  let absent = false;
-  try { await auth.getUser(accountUid); } catch (error) {
-    if (error?.code !== "auth/user-not-found") throw error;
-    absent = true;
-  }
-  if (!absent) fail();
+export function originalOperation(db, auth, admission) {
+  return session(db, auth, admission).operation;
 }
 
-// Recheck the exact admitted snapshot before irreversible effects. Normal
-// writers are fenced by the guard; explicit privileged conflicts fail closed.
+export function cleanupDatabase(db, auth, admission) {
+  const value = session(db, auth, admission);
+  return circles.withActiveGuard(db, value.operation.uid, value.guard);
+}
+
 export async function verifySnapshot(db, admission) {
-  const {bound, guard, digest} = admission;
-  if (db.projectId !== bound.projectId || !uid(bound.uid)) fail();
-  await db.runTransaction(async tx => {
-    await circles.requireGuard(tx, db, bound.uid, guard);
-    const remaining = await inspect(tx, db, bound);
-    if (remaining.digest !== null && remaining.digest !== digest) fail();
-  });
+  const value = admission && admissions.get(admission);
+  if (!value || value.db !== db) fail();
+  return controlled(() => db.runTransaction(async tx => {
+    await value.controller.assertOperationTransaction(tx, value.handle);
+    const root = await tx.get(db.collection("users").doc(value.operation.uid));
+    checkRoot(root, value.operation);
+  }));
+}
+
+export async function verifyStep(db, auth, admission) {
+  const value = session(db, auth, admission);
+  const user = await lookup(auth, value.operation.uid);
+  if (value.sawAbsent && user) fail();
+  if (!user) value.sawAbsent = true;
+  checkUser(user, value.operation);
+  await verifySnapshot(db, admission);
+  return user !== null;
 }
 
 export async function beforeRootRemoval(db, auth, admission) {
-  await requireAuthAbsent(auth, admission.bound.uid);
-  await verifySnapshot(db, admission);
+  if (await verifyStep(db, auth, admission)) fail();
 }
 
 export async function finish(db, auth, admission) {
-  const {bound, guard, digest} = admission;
-  if (db.projectId !== bound.projectId || !uid(bound.uid)) fail();
-  await requireAuthAbsent(auth, bound.uid);
-  await circles.assertUserTreeEmpty(db, bound.uid);
-  await db.runTransaction(async tx => {
-    await circles.requireGuard(tx, db, bound.uid, guard);
-    const guardRef = db.collection("account_deletion_guards").doc(bound.uid);
-    const currentGuard = await tx.get(guardRef);
-    const root = await tx.get(db.collection("users").doc(bound.uid));
-    const ledgerRef = db.collection("account_birth_decisions").doc(bound.uid);
-    const ledger = await tx.get(ledgerRef);
-    if (root.exists || (currentGuard.data().state === "COMPLETE" && ledger.exists)) fail();
-    if (ledger.exists) {
-      validate(ledger.data(), bound);
-      const current = createHash("sha256").update(
-        JSON.stringify(canonical(ledger.data()))).digest("hex");
-      if (current !== digest) fail();
+  const value = session(db, auth, admission);
+  return controlled(async () => {
+    const current = await value.controller.continueOperation(value.handle);
+    if (current.status === "COMPLETE") {
+      return value.controller.verifyTerminal(value.handle);
     }
-    // The other legitimate cleaner may already have removed this snapshot.
-    // Missing at admission + present now cannot authorize a new record.
-    await assertTerminal(tx, db, bound.uid);
-    if (ledger.exists) tx.delete(ledgerRef);
-    if (currentGuard.data().state !== "COMPLETE") {
-      tx.update(guardRef, {state: "COMPLETE",
-        retainUntil: Timestamp.fromMillis(Date.now() + RETENTION_MS)});
-    }
+    if (current.status !== "IN_PROGRESS") fail();
+    const cleanup = await value.controller.authorizeCleanup(value.handle);
+    return value.controller.finalizeWithOriginalLedger(cleanup);
   });
+}
+
+export async function currentState(db, auth, admission) {
+  const value = session(db, auth, admission);
+  return controlled(async () =>
+    (await value.controller.continueOperation(value.handle)).status);
 }

@@ -1,5 +1,6 @@
 "use strict";
 
+const control = require("./_deletion_control.cjs");
 const {randomUUID} = require("node:crypto");
 const {Timestamp, FieldPath} = require("firebase-admin/firestore");
 
@@ -49,10 +50,15 @@ function validateGuard(data) {
           data.retainUntil.toMillis() > data.startedAt.toMillis()))) conflict();
   return data;
 }
+// A bare legacy guard is deny-only, never a cleanup capability. This legacy
+// producer remains for existing internal fixtures; new deletion uses R5 admit.
 async function beginGuard(db, uid, preflight = async () => {}) {
   const ref = guardRef(db, uid);
+  const operationRef = ref.collection("control").doc("operation");
   return db.runTransaction(async (tx) => {
+    const operation = await tx.get(operationRef);
     const snapshot = await tx.get(ref);
+    if (operation.exists) conflict();
     if (snapshot.exists) return validateGuard(snapshot.data());
     await preflight(tx);
     const guard = {version: 1, state: "IN_PROGRESS", deletionId: randomUUID(),
@@ -61,42 +67,109 @@ async function beginGuard(db, uid, preflight = async () => {}) {
     return guard;
   });
 }
-async function requireGuard(tx, db, uid, guard) {
-  const snapshot = await tx.get(guardRef(db, uid));
-  if (!snapshot.exists || validateGuard(snapshot.data()).deletionId !== guard.deletionId) conflict();
+
+const guardBindings = new WeakMap();
+// Server-only adapter: the supplied handle is checked by its actual controller.
+function bindOperation(db, uid, controller, handle, beforeEffect) {
+  const operation = controller.originalOperation(handle);
+  if (operation.uid !== uid || operation.projectId !== db.projectId ||
+      operation.databaseId !== db.databaseId ||
+      typeof beforeEffect !== "function") conflict();
+  const guard = Object.freeze({version: 1, state: operation.state,
+    deletionId: operation.deletionId, startedAt: operation.scope.guardStartedAt,
+    retainUntil: operation.completedAt === null ? null :
+      Timestamp.fromMillis(operation.completedAt.toMillis() + 65 * 60 * 1000)});
+  guardBindings.set(guard, {db, uid, controller, handle, beforeEffect});
+  return guard;
 }
 
-// Read the CURRENT guard in the same transaction as every preparatory write.
-// Retried callbacks must acquire authority again; a captured guard is not enough.
-async function requireActiveGuard(tx, db, uid, guard) {
-  const snapshot = await tx.get(guardRef(db, uid));
-  if (!snapshot.exists) conflict();
-  const current = validateGuard(snapshot.data());
-  if (current.deletionId !== guard.deletionId) conflict();
-  if (current.state !== "IN_PROGRESS") conflict("ACCOUNT_CLEANUP_COMPLETE");
+function binding(db, uid, guard) {
+  const value = guard && guardBindings.get(guard);
+  if (!value || value.uid !== uid ||
+      (value.db !== db && value.wrapper !== db)) conflict();
+  return value;
 }
-// Internal cleanup capability only. Callbacks receive the original transaction,
-// so no nested transactions or callbacks replayed outside Firestore are needed.
-// Native references are used only for reads; mutations use this transaction seam.
+
+async function requireActiveGuard(tx, db, uid, guard) {
+  const value = binding(db, uid, guard);
+  try {
+    await value.controller.assertOperationTransaction(tx, value.handle);
+  } catch (error) {
+    if (error instanceof control.DeletionControlError) {
+      if (error.code === "COMPLETE") conflict("ACCOUNT_CLEANUP_COMPLETE");
+      conflict();
+    }
+    throw error;
+  }
+}
+async function requireGuard(tx, db, uid, guard) {
+  return requireActiveGuard(tx, db, uid, guard);
+}
+
+// Every preparation/deletion transaction is fenced by the original operation.
+// Existing ownership and durable Circle closure claims remain in the cleaners.
+async function requireRecursiveScope(tx, db, uid, ref) {
+  if (ref?.path === "users/" + uid) return;
+  const parts = typeof ref?.path === "string" ? ref.path.split("/") : [];
+  if (parts.length !== 2 || parts[0] !== "circles" ||
+      !storedPathSegment(parts[1])) conflict();
+  const circleId = parts[1];
+  const root = await tx.get(ref);
+  const closure = await tx.get(db.collection("circle_cleanup_guards").doc(circleId));
+  const marker = await tx.get(db.collection("circle_deletions").doc(circleId));
+  const user = await tx.get(db.collection("users").doc(uid));
+  if (!closure.exists ||
+      !exact(closure.data(), ["version", "state", "createdAt"]) ||
+      closure.data().version !== 1 || closure.data().state !== "SERVER_DELETING" ||
+      !time(closure.data().createdAt)) conflict();
+  if (marker.exists) {
+    const claim = validatePendingMarker(marker);
+    if (!claim.memberUids.includes(uid)) conflict();
+    if (root.exists && (root.data().adminId !== claim.initiatedBy ||
+        root.data().deletionState !== "SERVER_DELETING")) conflict();
+    if (root.exists) validateCircle(root.data());
+    return;
+  }
+  const claim = user.data()?._serverAccountDeletion;
+  if (root.exists || claim?.version !== 1 || claim.mode !== "SOLE_ADMIN_CIRCLE" ||
+      claim.circleId !== circleId || !time(claim.startedAt)) conflict();
+}
+
 function withActiveGuard(db, uid, guard) {
-  return Object.freeze({projectId: db.projectId,
+  const value = binding(db, uid, guard);
+  if (value.wrapper) return value.wrapper;
+  value.wrapper = Object.freeze({projectId: db.projectId,
+    databaseId: db.databaseId, doc: db.doc.bind(db),
     collection: db.collection.bind(db), collectionGroup: db.collectionGroup.bind(db),
     runTransaction: (callback, ...options) => db.runTransaction(async (tx) => {
       await requireActiveGuard(tx, db, uid, guard);
       return callback(tx);
     }, ...options),
-    // Existing batches contain only ownership-checked token deletes. They cannot
-    // recreate an obligation. Do not expose any preparatory batch write method.
+    // Convert delete-only batches to one fenced transaction. No native commit
+    // can cross COMPLETE after a detached read of the guard.
     batch: () => {
-      const batch = db.batch();
-      const writer = {delete: (ref) => {batch.delete(ref); return writer;},
-        commit: () => batch.commit()};
+      const refs = [];
+      const writer = {delete: ref => {refs.push(ref); return writer;},
+        commit: async () => {
+          await value.beforeEffect();
+          return db.runTransaction(async tx => {
+            await requireActiveGuard(tx, db, uid, guard);
+            for (const ref of refs) tx.delete(ref);
+          });
+        }};
       return writer;
     },
-    // Pure deletion follows an ownership/closure claim made under the fence.
-    // Durable circle reservations and the UID non-reuse contract still apply.
-    recursiveDelete: db.recursiveDelete.bind(db)});
+    recursiveDelete: async ref => {
+      await value.beforeEffect(ref);
+      await db.runTransaction(async tx => {
+        await requireActiveGuard(tx, db, uid, guard);
+        await requireRecursiveScope(tx, db, uid, ref);
+      });
+      return db.recursiveDelete(ref);
+    }});
+  return value.wrapper;
 }
+
 // listDocuments includes missing parent documents with existing descendants.
 // Querying only existing documents would miss an orphaned nested subcollection.
 // This inventory is outside the transaction. The only cleanup writer able to
@@ -364,6 +437,6 @@ async function verifyReferences(db, uid, tx) {
     if (doc.data()?.initiatedBy === uid || doc.data()?.memberUids?.includes(uid)) conflict();
   }, tx);
 }
-module.exports = {PAGE_SIZE, storedPathSegment, guardRef, validateGuard, beginGuard, requireGuard, requireActiveGuard, withActiveGuard,
+module.exports = {PAGE_SIZE, storedPathSegment, guardRef, validateGuard, beginGuard, bindOperation, requireGuard, requireActiveGuard, withActiveGuard,
   assertUserTreeEmpty, preflightOwned, cleanupOwned, cleanupPendingMarkers, cleanupMemberships,
   cleanupHistory, assertEmpty, verifyReferences};

@@ -389,33 +389,13 @@ async function ensureExternalCleanupMarker({ db, uid, userRef, guard }) {
   return cleanup;
 }
 
-// This runs only after normal deletion admission, through withActiveGuard.
-// PRE_AUTH names this controller's phase; it proves no Auth generation and
-// grants no deletion/recovery authority. Never adopt a legacy/foreign record.
-async function persistRetiredUidDeny(db, admission) {
-  const { bound, guard, authPresent } = admission;
-  const ref = db.collection('retired_auth_identities').doc(bound.uid);
-  const expected = { version: 2, state: 'RESERVED',
-    deletionId: guard.deletionId, origin: 'PRE_AUTH' };
-  await db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(ref);
-    if (snapshot.exists) {
-      const current = snapshot.data();
-      if (!hasExactKeys(current, Object.keys(expected)) ||
-          Object.keys(expected).some(key => current[key] !== expected[key])) throw stateConflict();
-      return;
-    }
-    // Preserve the existing legacy post-Auth continuation, without fabricating
-    // a PRE_AUTH record or using absence/presence of a marker as authority.
-    if (authPresent === true) transaction.create(ref, expected);
-  });
-}
+const INTERNAL_CONTINUATION = Symbol("original deletion continuation");
 
-export async function deleteAccount({ db, auth, uid }) {
+export async function deleteAccount({ db, auth, uid, [INTERNAL_CONTINUATION]: originalAdmission }) {
   const userRef = db.collection('users').doc(uid);
-  let admission;
+  let admission = originalAdmission;
   try {
-    admission = await birthCleanup.prepare({ db, auth, uid, preflight: async (transaction) => {
+    if (admission === undefined) admission = await birthCleanup.prepare({ db, auth, uid, preflight: async (transaction) => {
       const user = await transaction.get(userRef);
       const marker = await transaction.get(accountDeletionMarkerRef(userRef));
       if (marker.exists && validateExternalCleanupMarker(marker.data()).version === 2) throw stateConflict();
@@ -430,23 +410,32 @@ export async function deleteAccount({ db, auth, uid }) {
         await resolveCircleMembership({ db, uid, circleId, commit: false, transaction });
       }
     } });
-    const { guard } = admission;
-    if (guard.state === 'COMPLETE') {
+    const operation = birthCleanup.originalOperation(db, auth, admission);
+    if (operation.uid !== uid) throw stateConflict();
+    const {guard} = admission;
+    const current = await birthCleanup.currentState(db, auth, admission);
+    if (current === 'COMPLETE') {
       await birthCleanup.finish(db, auth, admission);
       return { body: { deleted: true, circleDeleted: false } };
     }
-    const cleanupDb = circleCleanup.withActiveGuard(db, uid, guard);
-    await persistRetiredUidDeny(cleanupDb, admission);
+    const cleanupDb = birthCleanup.cleanupDatabase(db, auth, admission);
+    await birthCleanup.verifyStep(db, auth, admission);
     await establishBillingDeletionBarrier({ db: cleanupDb, uid });
+    await birthCleanup.verifyStep(db, auth, admission);
     const cleanup = await ensureExternalCleanupMarker({ db: cleanupDb, uid, userRef, guard });
-    await birthCleanup.verifySnapshot(db, admission);
-    try {
-      await auth.deleteUser(uid);
-    } catch (error) {
-      if (error?.code !== 'auth/user-not-found') throw error;
+    // No generation guarantee is inferred from this lookup. Revalidate the
+    // original operation immediately before the existing Auth deletion point.
+    const authPresent = await birthCleanup.verifyStep(db, auth, admission);
+    if (authPresent) {
+      try {
+        await auth.deleteUser(uid);
+      } catch (error) {
+        if (error?.code !== 'auth/user-not-found') throw error;
+      }
     }
     await birthCleanup.beforeRootRemoval(db, auth, admission);
-    await db.recursiveDelete(userRef);
+    await cleanupDb.recursiveDelete(userRef);
+    await birthCleanup.verifyStep(db, auth, admission);
     await finishBillingDeletion({ db: cleanupDb, uid });
     await birthCleanup.finish(db, auth, admission);
     return { body: { deleted: true, circleDeleted: cleanup.circleDeleted } };
@@ -461,14 +450,26 @@ export async function deleteAccount({ db, auth, uid }) {
         error = terminalError;
       }
     }
-    if (!(error instanceof AccountHttpError) && error?.code === 'ACCOUNT_STATE_CONFLICT') {
-      throw stateConflict();
-    }
-    if (!(error instanceof AccountHttpError) && error?.code === 'CIRCLE_ADMIN_ACTION_REQUIRED') {
-      throw adminActionRequired();
-    }
-    throw error;
+    throw accountFailure(error);
   }
+}
+
+// Server-only continuation: a module-private Symbol carries the opaque original
+// admission. The HTTP wrapper cannot construct it from payload or query fields.
+export async function continueAccountDeletion({db, auth, admission}) {
+  const operation = birthCleanup.originalOperation(db, auth, admission);
+  return deleteAccount({db, auth, uid: operation.uid,
+    [INTERNAL_CONTINUATION]: admission});
+}
+
+function accountFailure(error) {
+  if (error instanceof AccountHttpError) return error;
+  if (error?.code === 'ACCOUNT_STATE_CONFLICT') return stateConflict();
+  if (error?.code === 'CIRCLE_ADMIN_ACTION_REQUIRED') return adminActionRequired();
+  const pending = new AccountHttpError(503, 'ACCOUNT_DELETION_BLOCKED',
+    'A exclusao da conta permanece pendente. Tente novamente mais tarde.');
+  pending.retryable = true;
+  return pending;
 }
 
 export default createAccountHandler(

@@ -14,6 +14,55 @@ import { deleteAccount } from '../api/account/delete.js';
 import { sha256 } from '../api/billing/google/_reconciliation.js';
 import { checkDistributedRateLimit } from '../api/_distributed_rate_limit.js';
 
+// Reconciled HTTP contract: rejection remains mandatory and fully typed.
+function assertPendingHttpError(error) {
+  assert.equal(error.name, 'AccountHttpError');
+  assert.equal(error.statusCode, 503);
+  assert.equal(error.code, 'ACCOUNT_DELETION_BLOCKED');
+  assert.equal(error.retryable, true);
+  assert.equal(error.message,
+    'A exclusao da conta permanece pendente. Tente novamente mais tarde.');
+  assert.doesNotMatch(JSON.stringify(error), /PRIVATE|synthetic|auth\/internal-error/);
+  return true;
+}
+
+// Validate the complete protocol transactions before excluding them from
+// historical page limits. No transaction with arbitrary extra writes is exempt.
+function assertProtocolTransactions(db) {
+  const g = 'account_deletion_guards/' + UID;
+  const r = 'retired_auth_identities/' + UID;
+  const o = g + '/control/operation';
+  const admitted = db.transactions.filter(tx => tx.writes.some(w => w.ref.path === g && w.type === 'create'));
+  assert.equal(admitted.length, 1);
+  const admission = admitted[0];
+  assert.equal(admission.writes.length, 3);
+  assert.deepEqual(admission.writes.map(w => w.ref.path).sort(), [g,r,o].sort());
+  assert.ok(admission.writes.every(w => w.type === 'create'));
+  const guard = admission.writes.find(w => w.ref.path === g).data;
+  const reserve = admission.writes.find(w => w.ref.path === r).data;
+  const operation = admission.writes.find(w => w.ref.path === o).data;
+  assert.deepEqual(Object.keys(guard).sort(), ['version','state','deletionId','startedAt','retainUntil'].sort());
+  assert.equal(guard.version, 1); assert.equal(guard.state, 'IN_PROGRESS');
+  assert.equal(guard.retainUntil, null); assert.ok(guard.startedAt instanceof Timestamp);
+  assert.match(guard.deletionId, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+  assert.deepEqual(reserve, {version:2,state:'RESERVED',deletionId:guard.deletionId,origin:'PRE_AUTH'});
+  assert.deepEqual(operation, {version:1,projectId:db.projectId,databaseId:'(default)',uid:UID,
+    deletionId:guard.deletionId,state:'IN_PROGRESS',origin:'PRE_AUTH',sourceEventId:null,
+    scope:{policyVersion:'ACCOUNT_DELETE_SCOPE_V1',privateRoot:'users/'+UID,
+      guardStartedAt:guard.startedAt,billingAccountHash:sha256(UID),birthDecisionId:null,birthDigest:null},completedAt:null});
+  const finished = db.transactions.filter(tx => tx.writes.some(w => w.ref.path === o && w.data?.state === 'COMPLETE'));
+  assert.equal(finished.length, 1);
+  assert.deepEqual(finished[0].writes.map(w => w.ref.path).sort(), [g,o].sort());
+  assert.ok(finished[0].writes.every(w => w.type === 'update'));
+  const receipt = db.data(o), terminalGuard = db.data(g);
+  assert.ok(receipt.completedAt instanceof Timestamp);
+  assert.deepEqual(receipt, {...operation,state:'COMPLETE',completedAt:receipt.completedAt});
+  assert.deepEqual(terminalGuard, {...guard,state:'COMPLETE',retainUntil:terminalGuard.retainUntil});
+  assert.equal(terminalGuard.retainUntil.toMillis(), receipt.completedAt.toMillis() + 65*60*1000);
+  assert.deepEqual(db.data(r), reserve);
+  return {admission,operation,receipt};
+}
+
 const UID = 'user-1';
 const CIRCLE_ID = 'circle-1';
 const ADMIN_UID = 'admin-1';
@@ -84,7 +133,9 @@ class FakeQuery {
   startAfter(snapshot) { this.cursor = snapshot.ref.path; return this; }
 
   get() {
-    return Promise.resolve(this.collectionRef.db.querySnapshot(this));
+    const snapshot = this.collectionRef.db.querySnapshot(this);
+    this.collectionRef.db.onQueryResult?.(this, snapshot);
+    return Promise.resolve(snapshot);
   }
 }
 
@@ -173,6 +224,7 @@ class FakeTransaction extends FakeWriter {
   async get(ref) {
     if (this.hasWritten) throw new Error('read after write');
     this.operations.push({ type: 'read', path: ref.path });
+    await this.db.beforeTransactionRead?.(this, ref);
     if (ref.kind === 'query' || ref.kind === 'collection') {
       return this.db.querySnapshot(ref);
     }
@@ -222,6 +274,7 @@ class FakeTransaction extends FakeWriter {
 class FakeFirestore {
   constructor() {
     this.projectId = "demo-life-os";
+    this.databaseId = "(default)";
     this.store = new Map();
     this.transactions = [];
     this.transactionCount = 0;
@@ -234,6 +287,8 @@ class FakeFirestore {
     this.setCalls = [];
     this.operationLog = [];
   }
+
+  doc(documentPath) { return new FakeDocumentReference(this, documentPath); }
 
   collection(name) {
     return new FakeCollectionReference(this, name);
@@ -1053,7 +1108,7 @@ test('sole-admin marker resumes after recursive Circle cleanup failure', async (
   db.failRecursiveDeleteOnce.set(path('circles', CIRCLE_ID), 1);
   const auth = new FakeAuth({});
 
-  await assert.rejects(deleteAccount({ db, auth, uid: UID }), /recursive delete/);
+  await assert.rejects(deleteAccount({ db, auth, uid: UID }), assertPendingHttpError);
   assert.equal(db.data(path('circles', CIRCLE_ID)), undefined);
   assert.ok(db.data(path('users', UID))._serverAccountDeletion);
   assert.deepEqual(auth.deleteCalls, []);
@@ -1126,9 +1181,13 @@ test('normal member cleanup removes Focus and Activity events but keeps another 
     undefined,
   );
   assert.ok(db.data(path(challengePath, 'processed_events', 'foreign')));
-  assert.ok(
-    db.transactions.every((transaction) => transaction.writes.length <= 2),
-  );
+  const {admission} = assertProtocolTransactions(db);
+  const historical = db.transactions.filter(tx => tx.writes.some(w =>
+    /\/(progress|processed_events)\//.test(w.ref.path)));
+  assert.ok(historical.length > 0);
+  assert.ok(historical.every(tx => tx.writes.length <= 2));
+  assert.ok(historical.every(tx => tx.writes.every(w => w.type === 'delete')));
+  assert.ok(db.transactions.filter(tx => tx !== admission).every(tx => tx.writes.length <= 2));
 });
 
 test('memberLimit 30 allows a normal member to delete the account', async () => {
@@ -1347,7 +1406,7 @@ test('Circle cleanup failure never deletes Firebase Auth', async () => {
   const circleAuth = new FakeAuth({});
   await assert.rejects(
     deleteAccount({ db: circleDb, auth: circleAuth, uid: UID }),
-    /batch cleanup/,
+    assertPendingHttpError,
   );
   assert.deepEqual(circleAuth.deleteCalls, []);
   assert.equal(circleDb.data(ACCOUNT_DELETION_MARKER_PATH), undefined);
@@ -1375,7 +1434,7 @@ test('transient Auth failure preserves user tree and external cleanup marker', a
 
   await assert.rejects(
     deleteAccount({ db, auth, uid: UID }),
-    (error) => error.code === 'auth/internal-error',
+    assertPendingHttpError,
   );
   assert.ok(db.data(path('users', UID)));
   assert.ok(db.data(path('users', UID, 'tasks', 'task-1')));
@@ -1401,7 +1460,7 @@ test('retry after transient Auth failure skips Circle cleanup and completes', as
 
   await assert.rejects(
     deleteAccount({ db, auth, uid: UID }),
-    (error) => error.code === 'auth/internal-error',
+    assertPendingHttpError,
   );
   const transactionsAfterCleanup = db.transactionCount;
   const batchesAfterCleanup = db.batchCommitCount;
@@ -1429,7 +1488,7 @@ test('retry rejects stale marker when membership was recreated', async () => {
 
   await assert.rejects(
     deleteAccount({ db, auth, uid: UID }),
-    (error) => error.code === 'auth/internal-error',
+    assertPendingHttpError,
   );
   const transactionsAfterFirstCleanup = db.transactionCount;
   db.seed(path('circles', CIRCLE_ID, 'members', UID), member('member'));
@@ -1455,7 +1514,7 @@ test('recursive user cleanup failure occurs after Auth deletion', async () => {
 
   await assert.rejects(
     deleteAccount({ db, auth, uid: UID }),
-    /recursive delete/,
+    assertPendingHttpError,
   );
 
   assert.equal(auth.deleted, true);
@@ -1515,18 +1574,37 @@ test('billing index cleanup conflict aborts before Auth and user deletion', asyn
   db.seed(path('users', UID), { activeCircleId: null });
   db.seed(path('billing_google_accounts', accountHash), { uid: UID, state: 'ACTIVE' });
   db.seed(indexPath, { accountHash });
-  // The retirement commit now precedes the existing Billing barrier transaction.
-  db.beforeTransactions.set(5, (firestore) => {
-    firestore.seed(indexPath, { accountHash: sha256('other-user') });
-  });
+  let pageCaptured = false, fired = 0;
+  db.onQueryResult = (query, snapshot) => {
+    if (query.path === 'billing_google_tokens' && snapshot.docs.some(doc => doc.ref.path === indexPath)) {
+      assert.equal(db.data(path('billing_google_accounts', accountHash)).state, 'DELETING');
+      pageCaptured = true;
+    }
+  };
+  db.beforeTransactionRead = (tx, ref) => {
+    if (ref.path !== indexPath || fired) return;
+    assert.equal(pageCaptured, true);
+    assert.equal(db.data(path('billing_google_accounts', accountHash)).state, 'DELETING');
+    assert.ok(tx.operations.some(op => op.path === path('billing_google_accounts', accountHash)));
+    assert.equal(db.data(GUARD_PATH + '/control/operation').state, 'IN_PROGRESS');
+    fired++;
+    db.seed(indexPath, {accountHash: sha256('other-user')});
+  };
   const auth = new FakeAuth({});
 
-  await assert.rejects(deleteAccount({ db, auth, uid: UID }));
+  await assert.rejects(deleteAccount({ db, auth, uid: UID }), assertPendingHttpError);
+  assert.equal(fired, 1); assert.equal(pageCaptured, true);
 
   assert.deepEqual(auth.deleteCalls, []);
   assert.deepEqual(db.recursiveDeletes, []);
   assert.ok(db.data(path('users', UID)));
   assert.ok(db.data(indexPath));
+  assert.deepEqual(db.data(indexPath), {accountHash:sha256('other-user')});
+  assert.deepEqual(db.data(path('users', UID)), {activeCircleId:null});
+  assert.deepEqual(db.data(path('billing_google_accounts', accountHash)), {uid:UID,state:'DELETING'});
+  assert.equal(db.data(GUARD_PATH).state, 'IN_PROGRESS');
+  assert.equal(db.data(GUARD_PATH + '/control/operation').state, 'IN_PROGRESS');
+  assert.equal(db.operationLog.some(w => w.type === 'delete' && w.path === indexPath), false);
 });
 
 test('foreign account index ownership conflict is never overwritten or deleted', async () => {
@@ -1550,13 +1628,32 @@ test('billing cleanup transport failure retains DELETING barrier without deletin
   const indexPath = path('billing_google_tokens', sha256('token-a'));
   db.seed(path('users', UID), { activeCircleId: null });
   db.seed(indexPath, { accountHash: sha256(UID) });
-  db.beforeTransactions.set(5, () => { throw new Error('private-billing-transport-error'); });
+  let pageCaptured = false, fired = 0;
+  db.onQueryResult = (query, snapshot) => {
+    if (query.path === 'billing_google_tokens' && snapshot.docs.some(doc => doc.ref.path === indexPath)) {
+      assert.equal(db.data(accountPath).state, 'DELETING'); pageCaptured = true;
+    }
+  };
+  db.beforeTransactionRead = (tx, ref) => {
+    if (ref.path !== indexPath || fired) return;
+    assert.equal(pageCaptured, true); assert.equal(db.data(accountPath).state, 'DELETING');
+    assert.ok(tx.operations.some(op => op.path === accountPath));
+    assert.equal(db.data(GUARD_PATH + '/control/operation').state, 'IN_PROGRESS');
+    fired++;
+    throw new Error('private-billing-transport-error');
+  };
   const auth = new FakeAuth({});
 
-  await assert.rejects(deleteAccount({ db, auth, uid: UID }));
+  await assert.rejects(deleteAccount({ db, auth, uid: UID }), assertPendingHttpError);
+  assert.equal(fired, 1); assert.equal(pageCaptured, true);
 
   assert.deepEqual(db.data(accountPath), { uid: UID, state: 'DELETING' });
   assert.ok(db.data(indexPath));
+  assert.deepEqual(db.data(indexPath), {accountHash:sha256(UID)});
+  assert.deepEqual(db.data(path('users', UID)), {activeCircleId:null});
+  assert.equal(db.data(GUARD_PATH).state, 'IN_PROGRESS');
+  assert.equal(db.data(GUARD_PATH + '/control/operation').state, 'IN_PROGRESS');
+  assert.equal(db.operationLog.some(w => w.type === 'delete' && w.path === indexPath), false);
   assert.deepEqual(auth.deleteCalls, []);
   assert.deepEqual(db.recursiveDeletes, []);
 });
@@ -1690,9 +1787,14 @@ test('global history in Circle A and current membership B are both cleaned', asy
   };
   await deleteAccount({db, auth, uid: UID});
   assert.deepEqual(db.data(`${old}/progress/other-user`), foreign);
-  const guardSet = db.operationLog.findIndex((entry) => entry.path === GUARD_PATH && entry.type === 'set');
+  assertProtocolTransactions(db);
+  const guardSet = db.operationLog.findIndex((entry) => entry.path === GUARD_PATH && entry.type === 'create');
   const historyDelete = db.operationLog.findIndex((entry) => entry.path === `${old}/progress/${UID}`);
   assert.ok(guardSet >= 0 && guardSet < historyDelete);
+  for (const p of ['retired_auth_identities/' + UID, GUARD_PATH + '/control/operation']) {
+    const index = db.operationLog.findIndex(entry => entry.path === p && entry.type === 'create');
+    assert.ok(index >= 0 && index < historyDelete);
+  }
   assert.equal(db.data(GUARD_PATH).state, 'COMPLETE');
 });
 
@@ -1729,7 +1831,9 @@ test('global progress events and ranking all converge across multiple bounded pa
     assert.equal(pages.length, 3);
     assert.ok(pages.every((tx) => tx.writes.length <= 200));
   }
-  assert.deepEqual([...db.store.keys()], [GUARD_PATH, `retired_auth_identities/${UID}`]);
+  assert.deepEqual([...db.store.keys()].sort(),
+    [GUARD_PATH, 'retired_auth_identities/' + UID, GUARD_PATH + '/control/operation'].sort());
+  assertProtocolTransactions(db);
 });
 
 for (const [name, documentPath, document] of [
@@ -1765,7 +1869,7 @@ test('retry after a partially committed global page keeps the same barrier ident
   }
   db.failHistoryAt = 2;
   const auth = new FakeAuth({});
-  await assert.rejects(deleteAccount({db, auth, uid: UID}), /history transport failure/);
+  await assert.rejects(deleteAccount({db, auth, uid: UID}), assertPendingHttpError);
   assert.equal([...db.store.keys()].filter((key) => key.includes('/processed_events/')).length, 217);
   assert.deepEqual(auth.deleteCalls, []);
   assert.equal(db.data(ACCOUNT_DELETION_MARKER_PATH), undefined);
@@ -1959,7 +2063,8 @@ test('historical sole-admin partial recursive deletion retains context until ret
     return recursiveDelete(ref);
   };
   const auth = new FakeAuth({});
-  await assert.rejects(deleteAccount({db, auth, uid: UID}), /partial recursive failure/);
+  await assert.rejects(deleteAccount({db, auth, uid: UID}), assertPendingHttpError);
+  assert.equal(failed, true);
   assert.equal(db.data(`circle_deletions/${CIRCLE_ID}`).initiatedBy, UID);
   assert.deepEqual(auth.deleteCalls, []);
   const result = await deleteAccount({db, auth, uid: UID});
