@@ -1,3 +1,9 @@
+import cleanupManifest from "../api/account/_cleanup_manifest.cjs";
+const realRemoveTree = cleanupManifest.removeTree;
+cleanupManifest.removeTree = options => {
+  options.db.fixtureTreeOptions = options;
+  return options.db.recursiveDelete(options.ref);
+};
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -61,16 +67,17 @@ class FakeFirestore {
     return { path, kind: 'doc', listCollections: async () => {
       const names = [...new Set([...this.docs.keys()].filter(p => p.startsWith(path + "/"))
         .map(p => p.slice(path.length + 1).split("/")[0]))];
-      return names.map(name => ({listDocuments: async () => [...new Set([...this.docs.keys()]
-        .filter(p => p.startsWith(path + "/" + name + "/"))
-        .map(p => p.slice(0, (path + "/" + name + "/").length) +
-          p.slice((path + "/" + name + "/").length).split("/")[0]))]}));
+      return names.map(name => ({path: path + "/" + name,
+        listDocuments: async () => [...new Set([...this.docs.keys()]
+          .filter(p => p.startsWith(path + "/" + name + "/"))
+          .map(p => path + "/" + name + "/" +
+            p.slice((path + "/" + name + "/").length).split("/")[0]))].map(p => this.ref(p))}));
     }, collection: name => this.collection(`${path}/${name}`),
       get: async () => this.snapshot(path, this.docs, this.created) };
   }
-  snapshot(path, docs, created) {
+  snapshot(path, docs, created, versions = this.versions) {
     return { ref: this.ref(path), id: path.split('/').at(-1), exists: docs.has(path),
-      createTime: created.get(path), data: () => copy(docs.get(path)) };
+      createTime: created.get(path), updateTime: docs.has(path) ? Timestamp.fromMillis(versions.get(path) || 0) : undefined, data: () => copy(docs.get(path)) };
   }
   querySnapshot(q, docs, created) {
     const found = [...docs.keys()].sort().filter(p =>
@@ -99,7 +106,7 @@ class FakeFirestore {
           const key = ref.kind === 'query' ? `${ref.group ? 'group' : 'query'}:${ref.path}` : ref.path;
           reads.set(key, versions.get(key) ?? 0);
           await this.hooks.onRead?.({ ...record, path: ref.path });
-          return ref.kind === 'query' ? this.querySnapshot(ref, docs, created) : this.snapshot(ref.path, docs, created);
+          return ref.kind === 'query' ? this.querySnapshot(ref, docs, created) : this.snapshot(ref.path, docs, created, versions);
         },
         create: (ref, data) => buffer('create', ref, data),
         set: (ref, data) => buffer('set', ref, data),
@@ -134,13 +141,11 @@ class FakeFirestore {
   async recursiveDelete(ref) {
     await this.hooks.beforeRecursive?.(ref);
     this.recursiveDeletes.push(ref.path);
-    const keys = [...this.docs.keys()].filter(p => p === ref.path || p.startsWith(`${ref.path}/`));
     if (this.partialCleanup) {
       this.partialCleanup = false;
-      this.put(ref.path, undefined);
-      throw new Error('partial recursive cleanup');
+      throw new Error("versioned transaction transport failure");
     }
-    for (const p of keys) this.put(p, undefined);
+    return realRemoveTree(this.fixtureTreeOptions);
   }
 }
 function ledger(owner = UID) {
@@ -298,12 +303,16 @@ test('changed deletionId refuses finalization', async () => {
   f.db.put(G, {...guarded(), deletionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'});
   await conflict(finish(f.db, f.auth, a)); assert.ok(f.db.docs.has(L));
 });
-test('Auth delete failure leaves guard, ledger and profile recoverable', async () => {
+test('Unknown Auth result preserves guard, ledger and profile without another dispatch', async () => {
   const f = fixture(); f.auth.hooks.beforeDelete = () => { throw new Error('synthetic Auth failure'); };
   await assert.rejects(f.call(), assertPendingHttpError);
   assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS'); assert.ok(f.db.docs.has(L)); assert.ok(f.db.docs.has(ROOT));
   const id = f.db.docs.get(G).deletionId; f.auth.hooks = {};
-  await f.call(); integral(f); assert.equal(f.db.docs.get(G).deletionId, id);
+  await assert.rejects(f.call(), assertPendingHttpError);
+  assert.ok(f.db.docs.has(ROOT)); assert.ok(f.db.docs.has(L));
+  assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS');
+  assert.equal(f.auth.present, true); assert.deepEqual(f.auth.deleteCalls, [UID]);
+  assert.equal(f.db.docs.get(G).deletionId, id);
 });
 test('partial recursive deletion after Auth removal remains recoverable by admitted server work', async () => {
   const f = fixture(); f.db.partialCleanup = true;
@@ -494,7 +503,8 @@ export async function runD2aRace(artifact, options = {}) {
   await authGate.reached;
   const id = f.db.docs.get(G).deletionId;
   const second = f.call('D2-A:second').then(value => ({value}), error => ({error}));
-  await staleGate.reached;
+  const secondEarlyResult = await second;
+  assert.ok(secondEarlyResult.error, 'sealed dispatch must refuse a second preparatory writer');
   authGate.release();
   await finalGate.reached;
   if (options.onDelete) await options.onDelete(f);
@@ -525,7 +535,7 @@ for (const artifact of ['billing', 'runtime']) {
         assert.equal(evidence.rootPresent, false);
         assert.equal(evidence.ledgerPresent, false);
         assert.deepEqual([...f.db.docs].filter(([p]) => p.endsWith(`/${OTHER}`)), f.beforeOther);
-        assert.ok(evidence.retries > 0, 'must reexecute the real transaction after a read conflict');
+        assert.equal(f.db.attempts.some(a => a.label === 'D2-A:second' && a.pending.some(w => w.type === 'set' && w.ref.path === (artifact === 'billing' ? 'billing_google_accounts/' + sha256(UID) : ROOT + '/runtime/account_deletion'))), false, 'no second preparatory mutation after original dispatch');
         assert.equal(evidence.lateWrites.length, 0, 'COMPLETE must fence every preparatory commit');
         assert.equal(evidence.billingPresent, false, 'integral success cannot leave Billing UID');
         assert.equal(evidence.runtimePresent, false, 'integral success cannot leave a runtime marker');
@@ -564,15 +574,17 @@ for (const [name, path, data] of [
   assert.deepEqual([...f.db.docs], before); assert.equal(f.db.writes.length, 0);
   assert.deepEqual(f.db.recursiveDeletes, []);
 });
-test('R2 IN_PROGRESS orphan descendants remain recoverable by recursive deletion', async () => {
+test('R2 IN_PROGRESS without original manifest requires review and preserves orphan descendants', async () => {
   const f = fixture({root: false, birth: false});
   await admit(f);
   const original = copy(f.db.docs.get(G + '/control/operation'));
   assert.equal(original.state, 'IN_PROGRESS');
   f.auth.present = false;
   f.db.put(ROOT + '/unknown/missing/nested/private', {pii: 'synthetic'});
-  assert.equal((await f.call()).body.deleted, true); integral(f);
-  assert.equal([...f.db.docs.keys()].some(p => p.startsWith(ROOT + '/')), false);
+  await assert.rejects(f.call(), assertPendingHttpError);
+  assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS');
+  assert.ok(f.db.docs.has(ROOT + '/unknown/missing/nested/private'));
+  assert.equal([...f.db.docs.keys()].some(p => p.startsWith(ROOT + '/')), true);
   assert.equal(f.db.docs.get(G + '/control/operation').deletionId, original.deletionId);
   assert.deepEqual(f.db.docs.get(G + '/control/operation').scope, original.scope);
   assert.deepEqual(f.auth.deleteCalls, []);
@@ -728,7 +740,7 @@ test('deny writer: lost persistence response keeps the marker and retry never ov
   assert.deepEqual(f.auth.deleteCalls, [UID]);
 });
 
-test('deny writer: later failure with live Auth preserves authenticated continuation and the original marker', async () => {
+test('deny writer: unknown Auth result keeps original marker and refuses false HTTP success', async () => {
   const f = fixture();
   f.auth.hooks.beforeDelete = () => {throw new Error('synthetic Auth transport failure');};
   await assert.rejects(f.call(), assertPendingHttpError);
@@ -736,7 +748,10 @@ test('deny writer: later failure with live Auth preserves authenticated continua
   assert.ok(marker); assert.equal(f.auth.present, true); assert.ok(f.db.docs.has(ROOT));
   assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS');
   f.auth.hooks = {};
-  assert.equal((await denyHttp(f)).statusCode, 200); integral(f);
+  assert.equal((await denyHttp(f)).statusCode, 503);
+  assert.ok(f.db.docs.has(ROOT)); assert.ok(f.db.docs.has(L));
+  assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS');
+  assert.deepEqual(f.auth.deleteCalls, [UID]);
   assert.deepEqual(f.db.docs.get(RETIRED), marker); assert.equal(denyCreates(f).length, 1);
 });
 
@@ -1018,13 +1033,16 @@ test('R6B1 retained internal capability continues partial cleanup without a logi
   assert.deepEqual(f.db.docs.get(r6b1OperationPath).scope, original.scope);
 });
 
-test('R6B1 live Auth failure keeps PRE_AUTH scope for authenticated retry', async () => {
+test('R6B1 unknown Auth result keeps PRE_AUTH scope without replaying the RPC', async () => {
   const f = fixture(); f.auth.hooks.beforeDelete = () => {throw new Error('PRIVATE-AUTH');};
   await assert.rejects(f.call(), r6b1Blocked);
   const original = copy(f.db.docs.get(r6b1OperationPath));
   assert.equal(original.state, 'IN_PROGRESS'); assert(f.db.docs.has(ROOT)); assert(f.db.docs.has(L));
   assert.equal(f.db.docs.get(r6b1RetiredPath).deletionId, original.deletionId);
-  f.auth.hooks = {}; await f.call(); integral(f);
+  f.auth.hooks = {}; await assert.rejects(f.call(), r6b1Blocked);
+  assert.ok(f.db.docs.has(ROOT)); assert.ok(f.db.docs.has(L));
+  assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS');
+  assert.deepEqual(f.auth.deleteCalls, [UID]);
   assert.equal(f.db.docs.get(r6b1OperationPath).deletionId, original.deletionId);
   assert.deepEqual(f.db.docs.get(r6b1OperationPath).scope, original.scope);
 });
@@ -1213,4 +1231,56 @@ test('R6B1 explicit cross-project Auth configuration is refused before admission
   const f = fixture(), before = [...f.db.docs];
   f.auth.app = {options: {projectId: 'demo-other-project'}};
   await conflict(f.call()); assert.deepEqual([...f.db.docs], before); r6b1NoEffects(f);
+});
+
+test('concurrent quarantine fences the final backend R5 commit', async () => {
+  const f = fixture(); let injected = 0;
+  const operationPath = G + '/control/operation';
+  f.db.hooks.beforeCommit = async ({pending: writes}) => {
+    if (!injected && writes.some(w => w.ref.path === operationPath && w.data?.state === 'COMPLETE')) {
+      injected++;
+      await cleanupManifest.quarantine(f.db.fixtureTreeOptions, 'SYNTHETIC_CONCURRENT_REVIEW');
+    }
+  };
+  await assert.rejects(f.call(), error => error.statusCode === 409 &&
+    error.code === 'ACCOUNT_STATE_CONFLICT');
+  assert.equal(injected, 1);
+  const operation = f.db.docs.get(operationPath);
+  assert.equal(operation.state, 'IN_PROGRESS');
+  assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS');
+  assert.ok(f.db.docs.has(L));
+  assert.equal(f.db.docs.get(cleanupManifest.refs(f.db, operation, ROOT).header.path).state, 'QUARANTINED');
+  assert.equal(f.db.writes.some(w => w.ref.path === operationPath && w.data?.state === 'COMPLETE'), false);
+  assert.deepEqual([...f.db.docs].filter(([p]) => p.endsWith('/' + OTHER)), f.beforeOther);
+  assert.deepEqual(f.auth.deleteCalls, [UID]);
+});
+
+
+test('Auth response lost after actual removal remains UNKNOWN without a second RPC', async () => {
+ const f=fixture();
+ f.auth.hooks.afterDelete=()=>{throw Error('synthetic lost Auth response');};
+ await assert.rejects(f.call(),assertPendingHttpError);
+ assert.equal(f.auth.present,false);assert.ok(f.db.docs.has(ROOT));assert.ok(f.db.docs.has(L));
+ const op=f.db.docs.get(G+'/control/operation');
+ const h=cleanupManifest.refs(f.db,op,ROOT).header.path;
+ assert.equal(f.db.docs.get(h).authOutcome,'UNKNOWN');
+ f.auth.hooks={};await assert.rejects(f.call(),assertPendingHttpError);
+ assert.deepEqual(f.auth.deleteCalls,[UID]);
+ assert.equal(f.db.docs.get(G).state,'IN_PROGRESS');
+ assert.deepEqual([...f.db.docs].filter(([p])=>p.endsWith('/'+OTHER)),f.beforeOther);
+});
+test('a replacement Billing account survives a stale private-deletion transaction', async () => {
+ const f=fixture();let injected=0;
+ const billing='billing_google_accounts/'+sha256(UID);
+ f.db.hooks.beforeCommit=({pending:writes})=>{
+  if(!injected&&writes.some(w=>w.type==='delete'&&w.ref.path===ROOT)){
+   injected++;f.db.put(billing,{uid:UID,state:'DELETING',syntheticReplacement:true});
+  }
+ };
+ await assert.rejects(f.call(),assertPendingHttpError);
+ assert.equal(injected,1);
+ assert.deepEqual(f.db.docs.get(billing),{uid:UID,state:'DELETING',syntheticReplacement:true});
+ assert.ok(f.db.docs.has(ROOT));assert.ok(f.db.docs.has(L));
+ assert.equal(f.db.docs.get(G).state,'IN_PROGRESS');
+ assert.deepEqual([...f.db.docs].filter(([p])=>p.endsWith('/'+OTHER)),f.beforeOther);
 });

@@ -282,7 +282,7 @@ async function finishSoleAdminRetry({ db, circleId }) {
       transaction.set(closureRef, {version: 1, state: 'SERVER_DELETING', createdAt: Timestamp.now()});
     }
   });
-  await db.recursiveDelete(circleRef);
+  await db.deleteTree(circleRef);
   return { circleDeleted: true, activeCircleId: circleId };
 }
 
@@ -419,22 +419,38 @@ export async function deleteAccount({ db, auth, uid, [INTERNAL_CONTINUATION]: or
       return { body: { deleted: true, circleDeleted: false } };
     }
     const cleanupDb = birthCleanup.cleanupDatabase(db, auth, admission);
-    await birthCleanup.verifyStep(db, auth, admission);
-    await establishBillingDeletionBarrier({ db: cleanupDb, uid });
-    await birthCleanup.verifyStep(db, auth, admission);
-    const cleanup = await ensureExternalCleanupMarker({ db: cleanupDb, uid, userRef, guard });
-    // No generation guarantee is inferred from this lookup. Revalidate the
-    // original operation immediately before the existing Auth deletion point.
-    const authPresent = await birthCleanup.verifyStep(db, auth, admission);
-    if (authPresent) {
+    let prepared = await circleCleanup.treeState(db, uid, guard, userRef, true);
+    let cleanup;
+    if (prepared === null) {
+      if (!(await birthCleanup.verifyStep(db, auth, admission))) {
+        // Never capture a replacement tree from a post-Auth continuation.
+        await circleCleanup.captureTree(db, uid, guard, userRef);
+        throw stateConflict();
+      }
+      await establishBillingDeletionBarrier({ db: cleanupDb, uid });
+      await birthCleanup.verifyStep(db, auth, admission);
+      cleanup = await ensureExternalCleanupMarker({ db: cleanupDb, uid, userRef, guard });
+      prepared = await circleCleanup.captureTree(db, uid, guard, userRef, cleanup.circleDeleted);
+    } else {
+      cleanup = {circleDeleted: prepared.circleDeleted};
+    }
+    if (prepared.authOutcome === 'NOT_REQUESTED') {
+      if (!(await birthCleanup.verifyStep(db, auth, admission))) throw stateConflict();
+      await circleCleanup.setAuthOutcome(db, uid, guard, userRef, 'NOT_REQUESTED', 'DISPATCHED');
       try {
         await auth.deleteUser(uid);
       } catch (error) {
-        if (error?.code !== 'auth/user-not-found') throw error;
+        if (error?.code !== 'auth/user-not-found') {
+          await circleCleanup.setAuthOutcome(db, uid, guard, userRef, 'DISPATCHED', 'UNKNOWN');
+          throw error;
+        }
       }
+      await circleCleanup.setAuthOutcome(db, uid, guard, userRef, 'DISPATCHED', 'CONFIRMED');
+    } else if (prepared.authOutcome !== 'CONFIRMED') {
+      throw stateConflict();
     }
     await birthCleanup.beforeRootRemoval(db, auth, admission);
-    await cleanupDb.recursiveDelete(userRef);
+    await cleanupDb.deleteTree(userRef);
     await birthCleanup.verifyStep(db, auth, admission);
     await finishBillingDeletion({ db: cleanupDb, uid });
     await birthCleanup.finish(db, auth, admission);

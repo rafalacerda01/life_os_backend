@@ -4,6 +4,7 @@ const control = require("./_deletion_control.cjs");
 const {randomUUID} = require("node:crypto");
 const {Timestamp, FieldPath} = require("firebase-admin/firestore");
 
+const manifest = require("./_cleanup_manifest.cjs");
 const PAGE_SIZE = 200;
 const GUARD_COLLECTION = "account_deletion_guards";
 const ANONYMOUS_AUTHOR = "";
@@ -70,7 +71,7 @@ async function beginGuard(db, uid, preflight = async () => {}) {
 
 const guardBindings = new WeakMap();
 // Server-only adapter: the supplied handle is checked by its actual controller.
-function bindOperation(db, uid, controller, handle, beforeEffect) {
+function bindOperation(db, uid, controller, handle, beforeEffect, authorizeCapture = async () => false) {
   const operation = controller.originalOperation(handle);
   if (operation.uid !== uid || operation.projectId !== db.projectId ||
       operation.databaseId !== db.databaseId ||
@@ -79,7 +80,7 @@ function bindOperation(db, uid, controller, handle, beforeEffect) {
     deletionId: operation.deletionId, startedAt: operation.scope.guardStartedAt,
     retainUntil: operation.completedAt === null ? null :
       Timestamp.fromMillis(operation.completedAt.toMillis() + 65 * 60 * 1000)});
-  guardBindings.set(guard, {db, uid, controller, handle, beforeEffect});
+  guardBindings.set(guard, {db, uid, controller, handle, beforeEffect, authorizeCapture});
   return guard;
 }
 
@@ -94,6 +95,20 @@ async function requireActiveGuard(tx, db, uid, guard) {
   const value = binding(db, uid, guard);
   try {
     await value.controller.assertOperationTransaction(tx, value.handle);
+    const original = value.controller.originalOperation(value.handle);
+    const headerRef = manifest.refs(db, original, original.scope.privateRoot).header;
+    const snapshot = await tx.get(headerRef);
+    if (snapshot.exists) {
+      const h = snapshot.data();
+      if (h.deletionId !== original.deletionId || h.state === "QUARANTINED" ||
+          h.authOutcome === "UNKNOWN") conflict("ACCOUNT_CLEANUP_REVIEW_REQUIRED");
+      if (h.billingVersion !== null) {
+        const account = await tx.get(db.doc("billing_google_accounts/" + original.scope.billingAccountHash));
+        if (account.exists && (!account.updateTime || !h.billingVersion.isEqual(account.updateTime))) {
+          conflict("ACCOUNT_CLEANUP_REVIEW_REQUIRED");
+        }
+      }
+    }
   } catch (error) {
     if (error instanceof control.DeletionControlError) {
       if (error.code === "COMPLETE") conflict("ACCOUNT_CLEANUP_COMPLETE");
@@ -135,6 +150,42 @@ async function requireRecursiveScope(tx, db, uid, ref) {
       claim.circleId !== circleId || !time(claim.startedAt)) conflict();
 }
 
+function treeOptions(db, uid, guard, ref) {
+  const value = binding(db, uid, guard);
+  const operation = value.controller.originalOperation(value.handle);
+  if (ref?.path !== operation.scope.privateRoot &&
+      !(typeof ref?.path === "string" && /^circles\/[^/]+$/.test(ref.path))) conflict();
+  return {db: value.db, operation,
+    ref, authorizeCapture: value.authorizeCapture,
+    assertOriginalOperation: tx => value.controller.assertOperationTransaction(tx, value.handle),
+    beforeEffect: () => value.beforeEffect(ref),
+    assertOperation: async tx => {
+      await requireActiveGuard(tx, value.db, uid, guard);
+      await requireRecursiveScope(tx, value.db, uid, ref);
+    }};
+}
+async function captureTree(db, uid, guard, ref, circleDeleted = false) {
+  const options = {...treeOptions(db, uid, guard, ref), circleDeleted};
+  try {
+    await db.runTransaction(tx => options.assertOperation(tx));
+    return await manifest.captureTree(options);
+  }
+  catch (error) {
+    if (["ACCOUNT_CLEANUP_REVIEW_REQUIRED", "ACCOUNT_CLEANUP_LIMIT"].includes(error?.code)) {
+      await manifest.quarantine(options, "CAPTURE_UNPROVEN");
+    }
+    throw error;
+  }
+}
+function treeState(db, uid, guard, ref, optional = false) {
+  return manifest.state(treeOptions(db, uid, guard, ref), optional);
+}
+function setAuthOutcome(db, uid, guard, ref, expected, next) {
+  return manifest.authOutcome(treeOptions(db, uid, guard, ref), expected, next);
+}
+async function capturePermitted(db, uid, guard) {
+  return (await binding(db, uid, guard).authorizeCapture()) === true;
+}
 function withActiveGuard(db, uid, guard) {
   const value = binding(db, uid, guard);
   if (value.wrapper) return value.wrapper;
@@ -159,13 +210,10 @@ function withActiveGuard(db, uid, guard) {
         }};
       return writer;
     },
-    recursiveDelete: async ref => {
-      await value.beforeEffect(ref);
-      await db.runTransaction(async tx => {
-        await requireActiveGuard(tx, db, uid, guard);
-        await requireRecursiveScope(tx, db, uid, ref);
-      });
-      return db.recursiveDelete(ref);
+    recursiveDelete: ref => value.wrapper.deleteTree(ref),
+    deleteTree: async ref => {
+      await captureTree(db, uid, guard, ref);
+      return manifest.removeTree(treeOptions(db, uid, guard, ref));
     }});
   return value.wrapper;
 }
@@ -355,7 +403,7 @@ async function cleanupPendingMarkers(db, uid, guard) {
     });
     if (!claimed) return;
     for (const memberUid of marker.memberUids) await clearLink(db, memberUid, marker.circleId);
-    await db.recursiveDelete(circleRef);
+    await db.deleteTree(circleRef);
     await db.runTransaction(async (tx) => {
       await requireGuard(tx, db, uid, guard);
       const current = await tx.get(doc.ref);
@@ -437,6 +485,6 @@ async function verifyReferences(db, uid, tx) {
     if (doc.data()?.initiatedBy === uid || doc.data()?.memberUids?.includes(uid)) conflict();
   }, tx);
 }
-module.exports = {PAGE_SIZE, storedPathSegment, guardRef, validateGuard, beginGuard, bindOperation, requireGuard, requireActiveGuard, withActiveGuard,
+module.exports = {capturePermitted, captureTree, treeState, setAuthOutcome, PAGE_SIZE, storedPathSegment, guardRef, validateGuard, beginGuard, bindOperation, requireGuard, requireActiveGuard, withActiveGuard,
   assertUserTreeEmpty, preflightOwned, cleanupOwned, cleanupPendingMarkers, cleanupMemberships,
   cleanupHistory, assertEmpty, verifyReferences};

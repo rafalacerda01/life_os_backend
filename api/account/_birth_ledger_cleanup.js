@@ -202,6 +202,19 @@ function checkUser(user, operation) {
 
 // Real terminal queries: no constant attestation can substitute for these reads.
 async function assertTerminal(tx, db, accountUid) {
+  const privateHash = createHash("sha256").update("users/" + accountUid).digest("hex");
+  const journal = await tx.get(db.doc("account_deletion_guards/" + accountUid +
+    "/cleanup_manifests/" + privateHash));
+  if (journal.exists) {
+    const h = journal.data();
+    const original = await tx.get(db.doc("account_deletion_guards/" + accountUid + "/control/operation"));
+    if (h.version !== 2 || h.uid !== accountUid || h.projectId !== db.projectId ||
+        h.databaseId !== db.databaseId || h.state !== "COMPLETE" ||
+        !original.exists || h.deletionId !== original.data().deletionId ||
+        ["UNKNOWN", "DISPATCHED"].includes(h.authOutcome) ||
+        (original.data().origin === "PRE_AUTH" && h.authOutcome !== "CONFIRMED")) fail();
+  }
+
   const hash = createHash("sha256").update(accountUid, "utf8").digest("hex");
   const billing = await tx.get(db.collection("billing_google_accounts").doc(hash));
   const tokens = await tx.get(db.collection("billing_google_tokens")
@@ -291,7 +304,7 @@ export async function prepare({db, auth, uid: accountUid, preflight}) {
           if (ref?.path === operation.scope.privateRoot) {
             await beforeRootRemoval(db, auth, admission);
           }
-        });
+        }, async () => (await verifyStep(db, auth, admission)) === true);
     const admission = Object.freeze({bound: Object.freeze({...binding}), guard});
     value.guard = guard;
     admissions.set(admission, value);
