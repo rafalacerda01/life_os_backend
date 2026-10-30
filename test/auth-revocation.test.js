@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {createNormalWriterFixture, assertGuardedDatabase} from './helpers/normal-writer-fixture.cjs';
 
 import { getApps, initializeApp } from 'firebase-admin/app';
 
@@ -71,10 +72,14 @@ function assertSanitizedAuthenticationError(response, expectedCode) {
 
 test('Activity verifica o ID token com checkRevoked=true', async () => {
   const verifyCalls = [];
+  const db = createNormalWriterFixture();
   const handler = createActivityHandler(
     'taskComplete',
     'ACTIVITY_FAILED',
-    async () => ({ body: { ok: true } }),
+    async parameters => {
+      await assertGuardedDatabase(parameters.db, db, 'activity-revocation-check');
+      return {body: {ok: true}};
+    },
   );
 
   const response = await invoke(handler, authenticatedPost(), {
@@ -85,7 +90,7 @@ test('Activity verifica o ID token com checkRevoked=true', async () => {
           return { uid: 'activity-revocation-check' };
         },
       },
-      db: {},
+      db,
     }),
   });
 
@@ -117,10 +122,14 @@ test('Activity rejeita token revogado com resposta sanitizada', async () => {
 
 test('Focus verifica o ID token com checkRevoked=true', async () => {
   const verifyCalls = [];
+  const db = createNormalWriterFixture();
   const handler = createFocusHandler(
     'start',
     'FOCUS_FAILED',
-    async () => ({ body: { ok: true } }),
+    async parameters => {
+      await assertGuardedDatabase(parameters.db, db, 'focus-revocation-check');
+      return {body: {ok: true}};
+    },
   );
 
   const response = await invoke(handler, authenticatedPost(), {
@@ -131,7 +140,7 @@ test('Focus verifica o ID token com checkRevoked=true', async () => {
           return { uid: 'focus-revocation-check' };
         },
       },
-      db: {},
+      db,
     }),
   });
 
@@ -194,4 +203,24 @@ test('Sync rejeita token revogado com resposta sanitizada', async () => {
   } finally {
     console.error = originalConsoleError;
   }
+});
+
+// Invalid IO remains closed; fixing the positive fixture must not bypass R5.
+test('Activity still refuses a bare database after valid Auth', async () => {
+  let executions = 0;
+  const handler = createActivityHandler('taskComplete', 'ACTIVITY_FAILED', async () => {executions++; return {body: {ok: true}};});
+  const response = await invoke(handler, authenticatedPost(), {getServices: () => ({db: {}, auth: {verifyIdToken: async () => ({uid: 'activity-revocation-check'})}})});
+  assert.equal(response.statusCode, 503);
+  assert.equal(response.body.code, 'ACCOUNT_DELETION_BLOCKED');
+  assert.equal(executions, 0);
+});
+
+// Invalid IO remains closed; fixing the positive fixture must not bypass R5.
+test('Focus still refuses a bare database after valid Auth', async () => {
+  let executions = 0;
+  const handler = createFocusHandler('start', 'FOCUS_FAILED', async () => {executions++; return {body: {ok: true}};});
+  const response = await invoke(handler, authenticatedPost(), {getServices: () => ({db: {}, auth: {verifyIdToken: async () => ({uid: 'focus-revocation-check'})}})});
+  assert.equal(response.statusCode, 503);
+  assert.equal(response.body.code, 'ACCOUNT_DELETION_BLOCKED');
+  assert.equal(executions, 0);
 });

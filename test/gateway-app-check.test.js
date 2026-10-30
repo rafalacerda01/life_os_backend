@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {createNormalWriterFixture, assertGuardedDatabase, r5Paths, writerObservation} from './helpers/normal-writer-fixture.cjs';
 
 import { createActivityHandler } from '../api/activity/_shared.js';
 import { createFocusHandler } from '../api/focus/_shared.js';
@@ -61,7 +62,7 @@ function fixture(gateway) {
   const calls = [];
   const uid = `gateway-test-${++fixtureId}`;
   const state = { appCheckError: null, authError: null, uidReads: 0 };
-  const db = {};
+  const db = createNormalWriterFixture();
   const appCheck = {
     async verifyToken(token) {
       calls.push('appCheck');
@@ -84,12 +85,12 @@ function fixture(gateway) {
   const handler = gateway.create(async (parameters) => {
     calls.push('execute');
     assert.equal(parameters.uid, uid);
-    assert.equal(parameters.db, db);
+    await assertGuardedDatabase(parameters.db, db, uid);
     assert.deepEqual(parameters.body, gateway.body);
     return { body: { ok: true } };
   });
   return {
-    handler, calls, state, uid,
+    handler, calls, state, uid, db,
     runtime: {
       getServices: () => ({ auth, appCheck, db }),
       checkRateLimit: async () => { calls.push('rateLimit'); return true; },
@@ -224,5 +225,45 @@ for (const [name, handler, body] of [
     assert.equal(res.statusCode, 401);
     assert.equal(res.body.code, 'APP_CHECK_REQUIRED');
     assert.equal(servicesCalls, 0);
+  });
+}
+
+for (const gateway of gateways) {
+  for (const index of [0, 1, 2]) test(gateway.name + ': isolated R5 control ' + index + ' denies the writer callback', async () => {
+    const f = fixture(gateway); f.db.put(r5Paths(f.uid)[index], {});
+    const before = [...f.db.docs];
+    const response = await invoke(f.handler, post(gateway.body), f.runtime);
+    assert.equal(response.statusCode, 503);
+    assert.equal(response.body.code, 'ACCOUNT_DELETION_BLOCKED');
+    assert.deepEqual([...f.db.docs], before);
+    assert.equal(writerObservation(f.db).probes.at(-1).entered, false);
+  });
+  test(gateway.name + ': controls for independent B do not block verified A', async () => {
+    const f = fixture(gateway); for (const path of r5Paths('independent-B')) f.db.put(path, {deny: true});
+    const before = [...f.db.docs];
+    const response = await invoke(f.handler, post(gateway.body), f.runtime);
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.body, {ok: true});
+    assert.deepEqual([...f.db.docs], before);
+    assert.equal(writerObservation(f.db).probes.at(-1).completed, true);
+  });
+  test(gateway.name + ': R5 introduced before commit is checked again on retry', async () => {
+    const f = fixture(gateway), target = f.db.doc('users/' + f.uid + '/probe/private');
+    f.db.put('users/independent-B', {keep: true}); let injected = 0;
+    f.db.hooks.beforeCommit = ({writes}) => {
+      if (!injected && writes.some(w => w.path === target.path)) {injected++; f.db.put(r5Paths(f.uid)[2], {deny: true});}
+    };
+    const handler = gateway.create(async parameters => {
+      await parameters.db.runTransaction(tx => {tx.set(target, {mutation: true});});
+      return {body: {ok: true}};
+    });
+    const response = await invoke(handler, post(gateway.body), f.runtime);
+    assert.equal(response.statusCode, 503);
+    assert.equal(response.body.code, 'ACCOUNT_DELETION_BLOCKED');
+    assert.equal(injected, 1); assert.ok(f.db.conflicts >= 1);
+    assert.equal(f.db.docs.has(target.path), false);
+    assert.deepEqual(f.db.docs.get('users/independent-B'), {keep: true});
+    assert.equal(writerObservation(f.db).attempts.length, 2);
+    for (const row of writerObservation(f.db).attempts) assert.deepEqual(row.reads, r5Paths(f.uid));
   });
 }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
+import {observeTransactions, assertGuardedDatabase} from './helpers/normal-writer-fixture.cjs';
 
 import { createActivityHandler } from '../api/activity/_shared.js';
 import { createFocusHandler } from '../api/focus/_shared.js';
@@ -45,8 +46,17 @@ class FakeFirestore {
   tail = Promise.resolve();
 
   collection(name) {
-    assert.equal(name, 'server_rate_limits');
-    return { doc: (id) => ({ id }) };
+    assert.ok(['server_rate_limits', 'account_deletion_guards', 'retired_auth_identities'].includes(name) ||
+      /^account_deletion_guards\/[^/]+\/control$/.test(name));
+    return {doc: id => this.reference(name + '/' + id)};
+  }
+
+  reference(path) {
+    return {path, id: path.split('/').at(-1), collection: name => this.collection(path + '/' + name)};
+  }
+
+  key(ref) {
+    return ref.path.startsWith('server_rate_limits/') ? ref.id : ref.path;
   }
 
   runTransaction(callback) {
@@ -54,11 +64,11 @@ class FakeFirestore {
       this.transactionCalls += 1;
       const writes = new Map();
       const result = await callback({
-        get: async ({ id }) => ({
-          exists: this.documents.has(id),
-          data: () => ({ ...this.documents.get(id) }),
+        get: async ref => ({
+          exists: this.documents.has(this.key(ref)),
+          data: () => this.documents.has(this.key(ref)) ? {...this.documents.get(this.key(ref))} : undefined,
         }),
-        set: ({ id }, data) => writes.set(id, { ...data }),
+        set: (ref, data) => writes.set(this.key(ref), {...data}),
       });
       for (const [id, data] of writes) this.documents.set(id, data);
       return result;
@@ -69,7 +79,7 @@ class FakeFirestore {
 }
 
 function fixture(gateway) {
-  const db = new FakeFirestore();
+  const db = observeTransactions(new FakeFirestore());
   const calls = [];
   const rateCalls = [];
   const businessCalls = [];
@@ -106,6 +116,7 @@ function fixture(gateway) {
   const execute = async (parameters) => {
     calls.push('business');
     businessCalls.push(parameters);
+    await assertGuardedDatabase(parameters.db, db, UID);
     return { body: { ok: true } };
   };
   const handler = gateway.create(execute);
@@ -150,8 +161,10 @@ for (const gateway of gateways) {
       'appCheck', 'auth', ...(gateway.group === 'circles' ? ['now'] : []),
       'rateLimit', 'business',
     ]);
-    assert.deepEqual(f.businessCalls, [{
-      body: gateway.body, db: f.db, uid: UID,
+    // Rate-limit IO keeps the raw DB; business receives the real guarded adapter.
+    // The fixture executes that adapter and verifies its UID and all R5 reads.
+    assert.deepEqual(f.businessCalls.map(({db, ...parameters}) => parameters), [{
+      body: gateway.body, uid: UID,
       ...(gateway.group === 'circles' ? { nowMillis: f.state.now } : {}),
     }]);
   });

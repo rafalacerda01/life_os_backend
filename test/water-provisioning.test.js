@@ -8,6 +8,10 @@ import { createWaterProvisioningTestHarness, provisionWaterAccount, provisionWat
 import { syncWater, WATER_V2_ENABLED } from '../api/health/_sync_water.js';
 import { deleteAccount } from '../api/account/delete.js';
 import cleanup from '../api/account/_circle_cleanup.cjs';
+import cleanupManifest from '../api/account/_cleanup_manifest.cjs';
+// Trace entry into the real bounded executor; no broad SDK delete is simulated.
+const removeCapturedTree = cleanupManifest.removeTree;
+cleanupManifest.removeTree = options => options.db.runCapturedTree(options, removeCapturedTree);
 
 const UID = 'demo-new-water-account';
 const RUN = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -63,23 +67,25 @@ class FakeFirestore {
     return { path, kind: 'doc', listCollections: async () => {
       const names = [...new Set([...this.docs.keys()].filter(p => p.startsWith(path + "/"))
         .map(p => p.slice(path.length + 1).split("/")[0]))];
-      return names.map(name => ({listDocuments: async () => [...new Set([...this.docs.keys()]
-        .filter(p => p.startsWith(path + "/" + name + "/"))
-        .map(p => p.slice(0, (path + "/" + name + "/").length) +
-          p.slice((path + "/" + name + "/").length).split("/")[0]))]}));
+      return names.map(name => ({path: path + '/' + name,
+        listDocuments: async () => [...new Set([...this.docs.keys()]
+          .filter(p => p.startsWith(path + '/' + name + '/'))
+          .map(p => path + '/' + name + '/' + p.slice((path + '/' + name + '/').length).split('/')[0]))]
+          .map(p => this.ref(p))}));
     }, collection: name => this.collection(`${path}/${name}`),
       get: async () => this.snapshot(path, this.docs, this.created) };
   }
-  snapshot(path, docs, created) {
+  snapshot(path, docs, created, versions = this.versions) {
     return { ref: this.ref(path), id: path.split('/').at(-1), exists: docs.has(path),
-      createTime: created.get(path), data: () => copy(docs.get(path)) };
+      createTime: created.get(path), updateTime: docs.has(path) ? Timestamp.fromMillis(versions.get(path) || 0) : undefined,
+      data: () => copy(docs.get(path)) };
   }
-  querySnapshot(q, docs, created) {
+  querySnapshot(q, docs, created, versions = this.versions) {
     const found = [...docs.keys()].sort().filter(p =>
       (q.group ? p.split('/').at(-2) === q.path : p.startsWith(`${q.path}/`) &&
         !p.slice(q.path.length + 1).includes('/')) &&
       q.filters.every(f => f.op === '==' && docs.get(p)?.[f.field] === f.value))
-      .slice(0, q.bound).map(p => this.snapshot(p, docs, created));
+      .slice(0, q.bound).map(p => this.snapshot(p, docs, created, versions));
     return { docs: found, empty: found.length === 0, size: found.length };
   }
   put(path, data, createdAt = CREATED) {
@@ -101,7 +107,7 @@ class FakeFirestore {
           const key = ref.kind === 'query' ? `${ref.group ? 'group' : 'query'}:${ref.path}` : ref.path;
           reads.set(key, versions.get(key) ?? 0);
           await this.hooks.onRead?.({ ...record, path: ref.path });
-          return ref.kind === 'query' ? this.querySnapshot(ref, docs, created) : this.snapshot(ref.path, docs, created);
+          return ref.kind === 'query' ? this.querySnapshot(ref, docs, created, versions) : this.snapshot(ref.path, docs, created, versions);
         },
         create: (ref, data) => buffer('create', ref, data),
         set: (ref, data) => buffer('set', ref, data),
@@ -128,15 +134,11 @@ class FakeFirestore {
     }
     throw new Error('MVCC retry exhaustion');
   }
-  async recursiveDelete(ref) {
-    this.recursiveDeletes.push(ref.path);
-    const keys = [...this.docs.keys()].filter(p => p === ref.path || p.startsWith(`${ref.path}/`));
-    if (this.partialCleanup) {
-      this.partialCleanup = false;
-      this.put(ref.path, undefined);
-      throw new Error('partial recursive cleanup');
-    }
-    for (const p of keys) this.put(p, undefined);
+  async runCapturedTree(options, execute) {
+    assert.equal(options.db, this);
+    // Historical oracle name retained: entries now represent bounded executions.
+    this.recursiveDeletes.push(options.ref.path);
+    return execute(options);
   }
 }
 function fixture() {
@@ -403,7 +405,16 @@ for (const partial of [false, true]) check(`real deleteAccount removes provision
     assert.deepEqual(reservation, {version: 2, state: 'RESERVED', deletionId: original.deletionId, origin: 'PRE_AUTH'});
   };
   if (partial) {
+    // Force two descendant pages. The first page commits; the second fails
+    // before commit, while the water receipt and the final root remain intact.
+    for (let i = 0; i < 45; i++) f.db.put(ROOT + '/cleanup_probe/n' + String(i).padStart(2, '0'), {old: true});
     f.db.partialCleanup = true;
+    f.db.hooks.beforeCommit = record => {
+      if (f.db.partialCleanup && record.pending.some(w => w.type === 'delete' && w.ref.path === R)) {
+        f.db.partialCleanup = false;
+        throw new Error('partial recursive cleanup');
+      }
+    };
     await assert.rejects(deleteAccount({ db: f.db, auth, uid: UID }), error => {
       assert.equal(error.name, 'AccountHttpError');
       assert.equal(error.statusCode, 503);
@@ -414,8 +425,13 @@ for (const partial of [false, true]) check(`real deleteAccount removes provision
       return true;
     });
     assert.equal(f.db.docs.get(G).state, 'IN_PROGRESS'); assert.equal(f.db.docs.has(R), true);
-    assert.equal(f.db.partialCleanup, false, 'the original recursive fault was actually injected');
-    assert.deepEqual(f.db.recursiveDeletes, [ROOT]); assert.equal(f.db.docs.has(ROOT), false);
+    assert.equal(f.db.partialCleanup, false, 'fault reached a real chunk after the first confirmed page');
+    assert.deepEqual(f.db.recursiveDeletes, [ROOT]); assert.equal(f.db.docs.has(ROOT), true);
+    const header = [...f.db.docs.keys()].find(p => p.startsWith(G + '/cleanup_manifests/') && !p.includes('/pages/'));
+    assert.equal(f.db.docs.get(header).state, 'SEALED');
+    assert.equal(f.db.docs.get(header + '/pages/0').done, true);
+    assert.equal(f.db.docs.get(header + '/pages/1').done, false);
+    assert.equal(f.db.writes.slice(deletionStart).filter(w => w.type === 'delete' && w.ref.path.startsWith(ROOT + '/')).length, 40);
     assert.deepEqual(calls, [UID]);
     await assert.rejects(auth.getUser(UID), error => error.code === 'auth/user-not-found');
     assert.deepEqual(f.db.docs.get(operationPath), original);
@@ -455,7 +471,20 @@ check('actual concurrent deletion wins, provision retries without resurrecting d
   f.db.hooks.beforeCommit = async r => {
     if (r.label === 'provision' && r.attempt === 1) await hold.hold();
   };
-  const pending = f.call('provision'); await hold.reached;
+  const pending = f.call('provision');
+  // Observe the typed rejection immediately and join it even when deletion
+  // or another assertion fails. No process-level rejection handler is used.
+  const pendingRejection = rejected(pending, 'WATER_ACCOUNT_DELETING');
+  t.after(async () => {
+    hold.release(); await pendingRejection;
+    t.diagnostic("provisioningSettled=true; typedRejectionVerified=true; cleanupJoined=true");
+  });
+  let paused = false;
+  await Promise.race([
+    hold.reached.then(() => {paused = true;}),
+    pendingRejection.then(() => assert.equal(paused, true, 'provision must reach the controlled pause')),
+  ]);
+  assert.equal(paused, true);
   assert.equal(f.db.docs.has(A), false);
   const first = f.db.attempts.find(r => r.label === 'provision');
   assert.equal(first.attempt, 1);
@@ -467,7 +496,7 @@ check('actual concurrent deletion wins, provision retries without resurrecting d
   assert.equal(f.db.docs.get(operationPath).state, 'COMPLETE');
   const original = copy(f.db.docs.get(operationPath)), reservation = copy(f.db.docs.get(reservationPath));
   const before = [...f.db.docs], count = f.db.writes.length; hold.release();
-  await rejected(pending, 'WATER_ACCOUNT_DELETING'); unchanged(f.db, before, count);
+  await pendingRejection; unchanged(f.db, before, count);
   assert.equal(f.db.conflicts.length, 1); assert.equal(f.db.docs.has(A), false);
   assert.equal(f.db.conflicts[0].label, 'provision');
   assert.ok(f.db.conflicts[0].changed.includes(G));
@@ -772,4 +801,36 @@ check('R1 untrusted storage cannot forge provisioning deletion-blocked response'
   });
   assert.deepEqual(provisioningError(error), { code: 'WATER_PROVISION_STORAGE_UNAVAILABLE',
     message: 'Provisionamento de hidratação indisponível.' });
+});
+
+check('Water deletion resumes an acknowledged chunk after a lost reply without replaying its deletes', async () => {
+  const f = fixture(); await f.call(); await f.next(); await increment(f);
+  for (let i = 0; i < 45; i++) f.db.put(ROOT + '/cleanup_probe/n' + String(i).padStart(2, '0'), {old: true});
+  const foreign = 'users/independent-B/notes/private'; f.db.put(foreign, {keep: true});
+  const calls = [], auth = deletionAuth(calls); let injected = 0;
+  f.db.hooks.afterCommit = record => {
+    if (!injected && record.pending.some(w => w.type === 'delete' && w.ref.path.startsWith(ROOT + '/'))) {
+      injected++; throw new Error('lost captured chunk reply');
+    }
+  };
+  await assert.rejects(deleteAccount({db: f.db, auth, uid: UID}), error =>
+    error.statusCode === 503 && error.code === 'ACCOUNT_DELETION_BLOCKED');
+  assert.equal(injected, 1);
+  const header = [...f.db.docs.keys()].find(p => p.startsWith(G + '/cleanup_manifests/') && !p.includes('/pages/'));
+  const page = copy(f.db.docs.get(header + '/pages/0'));
+  assert.equal(page.done, true); assert.equal(page.entries.length, 40);
+  for (const entry of page.entries) assert.equal(f.db.docs.has(entry.path), false);
+  assert.equal(f.db.docs.has(ROOT), true); assert.equal(f.db.docs.has(R), true);
+  const original = copy(f.db.docs.get(G + '/control/operation'));
+  const reservation = copy(f.db.docs.get('retired_auth_identities/' + UID));
+  const confirmed = new Set(page.entries.map(entry => entry.path));
+  const countDeletes = () => f.db.writes.filter(w => w.type === 'delete' && confirmed.has(w.ref.path)).length;
+  const before = countDeletes(); f.db.hooks.afterCommit = undefined;
+  assert.equal((await deleteAccount({db: f.db, auth, uid: UID})).body.deleted, true);
+  assert.equal(countDeletes(), before); assert.deepEqual(f.db.docs.get(header + '/pages/0'), page);
+  assert.equal([...f.db.docs.keys()].some(p => p === ROOT || p.startsWith(ROOT + '/')), false);
+  const terminal = f.db.docs.get(G + '/control/operation');
+  assert.deepEqual(terminal, {...original, state: 'COMPLETE', completedAt: terminal.completedAt});
+  assert.deepEqual(f.db.docs.get('retired_auth_identities/' + UID), reservation);
+  assert.deepEqual(f.db.docs.get(foreign), {keep: true}); assert.deepEqual(calls, [UID]);
 });
