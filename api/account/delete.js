@@ -432,6 +432,11 @@ export async function deleteAccount({ db, auth, uid, [INTERNAL_CONTINUATION]: or
       cleanup = await ensureExternalCleanupMarker({ db: cleanupDb, uid, userRef, guard });
       prepared = await circleCleanup.captureTree(db, uid, guard, userRef, cleanup.circleDeleted);
     } else {
+      if (prepared.state === 'CAPTURING') {
+        // Resume the original capture only while original Auth remains proven.
+        if (!(await birthCleanup.verifyStep(db, auth, admission))) throw stateConflict();
+        prepared = await circleCleanup.captureTree(db, uid, guard, userRef, prepared.circleDeleted);
+      }
       cleanup = {circleDeleted: prepared.circleDeleted};
     }
     if (prepared.authOutcome === 'NOT_REQUESTED') {

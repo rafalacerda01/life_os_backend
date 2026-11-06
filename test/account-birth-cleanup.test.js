@@ -5,6 +5,7 @@ cleanupManifest.removeTree = options => {
   return options.db.recursiveDelete(options.ref);
 };
 import assert from 'node:assert/strict';
+import reachOrFail from './helpers/observed-gate.cjs';
 import test from 'node:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Timestamp } from 'firebase-admin/firestore';
@@ -499,14 +500,16 @@ export async function runD2aRace(artifact, options = {}) {
     }
   };
   // Attach rejection handlers before releasing any barrier.
-  const first = f.call('D2-A:first').then(value => ({value}), error => ({error}));
-  await authGate.reached;
+  let first,second;
+  try {
+  first = f.call('D2-A:first').then(value => ({value}), error => ({error}));
+  await reachOrFail(authGate.reached,first);
   const id = f.db.docs.get(G).deletionId;
-  const second = f.call('D2-A:second').then(value => ({value}), error => ({error}));
+  second = f.call('D2-A:second').then(value => ({value}), error => ({error}));
   const secondEarlyResult = await second;
   assert.ok(secondEarlyResult.error, 'sealed dispatch must refuse a second preparatory writer');
   authGate.release();
-  await finalGate.reached;
+  await reachOrFail(finalGate.reached,first);
   if (options.onDelete) await options.onDelete(f);
   // COMPLETE is committed by the first backend attempt if no trigger was
   // injected. With a trigger, the same guard is already COMPLETE here.
@@ -522,6 +525,7 @@ export async function runD2aRace(artifact, options = {}) {
     billingPresent: f.db.docs.has(billingPath), runtimePresent: f.db.docs.has(runtimePath),
     lateWrites, retries: f.db.conflicts.filter(c => c.label === 'D2-A:second').length};
   return {f, evidence};
+  } finally {authGate.release();staleGate.release();finalGate.release();await Promise.allSettled([first,second].filter(Boolean));}
 }
 for (const artifact of ['billing', 'runtime']) {
   for (const root of [true, false]) for (const birth of [true, false]) {
@@ -618,7 +622,7 @@ for (const stage of ['billing', 'runtime']) test('R2 sentinel from ' + stage + '
   assert.equal(f.auth.deleteCalls.length, 0);
 });
 
-test('R2 admitted Circle deletion cannot recreate a marker containing the deleted UID', async () => {
+test('R2 admitted Circle deletion cannot recreate a marker containing the deleted UID', async t => {
   const f = fixture(), hold = gate(); let paused = false;
   f.db.put('circles/shared', {schemaVersion: 2, adminId: OTHER, memberLimit: 3, memberCount: 2});
   f.db.put('circles/shared/members/' + OTHER, {role: 'admin'});
@@ -633,7 +637,8 @@ test('R2 admitted Circle deletion cannot recreate a marker containing the delete
   const oldRequest = context.run('circle-request', () => deleteCircle({
     db: f.db, uid: OTHER, body: {circleId: 'shared'}, now: CLOCK,
   })).then(() => null, error => error);
-  await hold.reached;
+  t.after(hold.release);
+  await reachOrFail(hold.reached,oldRequest);
   assert.equal((await f.call()).body.deleted, true); integral(f);
   const before = [...f.db.docs]; hold.release();
   assert.equal((await oldRequest).code, 'CIRCLE_STATE_CONFLICT');
@@ -1055,7 +1060,7 @@ test('R6B1 concurrent requests share one committed operation and one Auth remova
       paused = true; await hold.hold();
     }
   };
-  const first = f.call('r6b1-first'); await hold.reached;
+  const first = f.call('r6b1-first'); await reachOrFail(hold.reached,first);
   assert.equal((await f.call('r6b1-second')).body.deleted, true);
   const original = copy(f.db.docs.get(r6b1OperationPath));
   hold.release(); assert.equal((await first).body.deleted, true); integral(f);

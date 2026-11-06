@@ -569,7 +569,7 @@ for (const config of operations) {
     assert.equal(f.docs.has(f.target), true);
     assert.equal(f.count(), 1);
     assert.equal(f.docs.has(f.marker), false);
-    assert.deepEqual([...f.attempts[0].reads.keys()], [GUARD, RETIRED, RECEIPT, USER, f.target, f.marker]);
+    assert.deepEqual([...f.attempts[0].reads.keys()], [GUARD, RETIRED, RECEIPT, `trusted_account_origins/${UID}`, USER, f.target, f.marker]);
     assertControlReadsBeforeWrites(f.attempts[0]);
     assert.equal(f.writes.length, 2);
   });
@@ -787,7 +787,7 @@ function assertSubjectCleanup(f, expectedSubjects = 2, expectedReviewQueue = 7, 
   assert.equal(new Set(cardDeletes.map(write => write.path)).size, cardDeletes.length,
     'no card is deleted or counted twice');
   for (const attempt of f.attempts.filter(attempt => attempt.queryReads.size)) {
-    assert.deepEqual([...attempt.reads.keys()], [GUARD, RETIRED, RECEIPT, USER, STUDY]);
+    assert.deepEqual([...attempt.reads.keys()], [GUARD, RETIRED, RECEIPT, `trusted_account_origins/${UID}`, USER, STUDY]);
     assertControlReadsBeforeWrites(attempt);
     const limit = attempt.querySnapshots[0].ref.limitCount;
     if (adaptive) assert.ok(Number.isInteger(limit) && limit >= 1 && limit <= CHUNK_SIZE);
@@ -876,7 +876,7 @@ for (const size of [0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 450, 451, 1001]) {
     assert.equal(f.chunks().length, Math.ceil(size / CHUNK_SIZE));
     assert.equal(f.chunks().reduce((total, chunk) => total + chunk.result.deleted, 0), size);
     const seal = f.attempts[0];
-    assert.deepEqual([...seal.reads.keys()], [GUARD, RETIRED, RECEIPT, USER, f.target, f.marker]);
+    assert.deepEqual([...seal.reads.keys()], [GUARD, RETIRED, RECEIPT, `trusted_account_origins/${UID}`, USER, f.target, f.marker]);
     assertControlReadsBeforeWrites(seal);
     assert.equal(seal.queryReads.size, 0, 'phase 1 does not read study_info or query cards');
     assert.equal(seal.pending.length, 3);
@@ -1365,14 +1365,14 @@ test('H1: phase 1 size error propagates without reducing chunks or sealing parti
 // Exact read sets above remain exact. This additional trace proves the control
 // reads precede every buffered business write in the very same transaction.
 function assertControlReadsBeforeWrites(attempt) {
-  assert.deepEqual([...attempt.reads.keys()].slice(0, 3), [GUARD, RETIRED, RECEIPT]);
-  assert.deepEqual(attempt.io.slice(0, 3), [GUARD, RETIRED, RECEIPT].map(path => ({ type: 'read', path })));
+  assert.deepEqual([...attempt.reads.keys()].slice(0, 4), [GUARD, RETIRED, RECEIPT, `trusted_account_origins/${UID}`]);
+  assert.deepEqual(attempt.io.slice(0, 4), [GUARD, RETIRED, RECEIPT, `trusted_account_origins/${UID}`].map(path => ({ type: 'read', path })));
   assert.deepEqual(attempt.io.filter(row => row.type === 'read').map(row => row.path),
     [...attempt.reads.keys(), ...attempt.queryReads.keys()], 'no hidden duplicate or additional reads');
   assert.deepEqual(attempt.io.filter(row => row.type === 'write').map(row => row.path),
     attempt.pending.map(row => row.path), 'every business write belongs to this transaction');
   const firstWrite = attempt.io.findIndex(row => row.type === 'write');
-  assert.ok(firstWrite === -1 || firstWrite >= 3);
+  assert.ok(firstWrite === -1 || firstWrite >= 4);
   assert.equal(attempt.io.some((row, i) => row.type === 'read' && firstWrite !== -1 && i > firstWrite), false);
   console.log(JSON.stringify({ historicalEvidence: 'exact-read-set', test: attempt.testName,
     label: attempt.label, attempt: attempt.attempt, reads: [...attempt.reads.keys()],
@@ -1441,7 +1441,7 @@ for (const config of operations) {
       assert.deepEqual(f.docs, barrier, 'no writer mutation follows the retirement commit');
       const attempts = f.attempts.filter(row => row.label === 'writer');
       assert.equal(attempts.length, 2);
-      assert.deepEqual([...attempts[0].reads.keys()], [GUARD, RETIRED, RECEIPT, USER, f.target, f.marker]);
+      assert.deepEqual([...attempts[0].reads.keys()], [GUARD, RETIRED, RECEIPT, `trusted_account_origins/${UID}`, USER, f.target, f.marker]);
       assert.deepEqual([...attempts[1].reads.keys()], [GUARD]);
       assert.equal(attempts[1].pending.length, 0);
       assert.ok(attempts.every(row => row.applied === false));
@@ -1458,7 +1458,7 @@ for (const config of operations) {
       for (const row of f.commits.filter(row => row.label === 'other-user')) {
         assert.deepEqual([...row.reads.keys()], [
           `account_deletion_guards/${otherUid}`, `retired_auth_identities/${otherUid}`,
-          `account_deletion_guards/${otherUid}/control/operation`, otherRoot, otherTarget,
+          `account_deletion_guards/${otherUid}/control/operation`, `trusted_account_origins/${otherUid}`, otherRoot, otherTarget,
           `${otherRoot}/sync_tombstones/${config.collection}__${ID}`,
         ]);
         assert.deepEqual(row.pending.map(w => w.path), [otherTarget, otherRoot]);

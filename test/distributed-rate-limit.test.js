@@ -265,3 +265,18 @@ test('falha do Firestore é convertida em erro genérico sem segredo', async () 
     },
   );
 });
+
+test('account_bootstrap uses the same distributed five-request quota, isolation and renewal', async () => {
+  const db = new FakeFirestore();
+  const options = {scope:'account_bootstrap',limit:5};
+  const replies = await Promise.all(Array.from({length:6},()=>check(db, options)));
+  assert.deepEqual(replies,[true,true,true,true,true,false]);
+  assert.equal(await check(db,{...options,uid:'independent-B'}),true);
+  assert.equal(await check(db,{...options,nowMs:61000}),true);
+  assert.ok(db.documentIds.every(id=>id.startsWith('account_bootstrap_')));
+});
+test('account_bootstrap storage failure stays closed with no in-memory fallback', async () => {
+  const db = new FakeFirestore(); db.runTransaction = async () => {throw Error('unavailable');};
+  await assert.rejects(check(db,{scope:'account_bootstrap',limit:5}),/DISTRIBUTED_RATE_LIMIT_FAILED/);
+  assert.equal(db.documents.size,0);
+});

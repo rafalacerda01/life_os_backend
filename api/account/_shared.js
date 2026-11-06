@@ -1,3 +1,4 @@
+import trustedAccount from "./_trusted_account.cjs";
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
@@ -312,14 +313,14 @@ export function createAccountHandler(
         );
       }
 
-      const result = await execute({
+      const result = await trustedAccount.runAuthenticated(decodedToken, () => execute({
         body: req.body,
         db: firestore,
         auth,
         decodedToken,
         uid,
         nowMillis,
-      });
+      }));
       return res.status(result.statusCode ?? 200).json(result.body);
     } catch (error) {
       return sendError(res, error, fallbackCode);

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "development": {
+    "projectId": "demo-life-os",
+    "databaseId": "(default)",
+    "transport": "EMULATOR_LOOPBACK_ONLY"
+  },
+  "production": {
+    "state": "CLOSED",
+    "projectId": null,
+    "databaseId": "(default)",
+    "identityPlatformVerified": false,
+    "r8Verified": false,
+    "writersVerified": false
+  }
+}

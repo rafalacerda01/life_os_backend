@@ -19,6 +19,8 @@ import {
 
 let db;
 
+function database() {
+if (!db) {
 if (!getApps().length) {
   const projectId = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
@@ -40,6 +42,9 @@ if (!getApps().length) {
 }
 
 db = getFirestore();
+}
+return db;
+}
 
 // ============================================================================
 // LIMITES
@@ -84,7 +89,7 @@ function applyCors(req, res) {
 }
 async function hasAiConsent(
   userId,
-  { firestore = db } = {},
+  { firestore = database() } = {},
 ) {
   const consentSnapshot = await firestore
     .collection('users')
@@ -105,7 +110,7 @@ async function hasAiConsent(
 
 export async function hasPremiumAccess(
   userId,
-  { firestore = db, nowMillis = Date.now() } = {},
+  { firestore = database(), nowMillis = Date.now() } = {},
 ) {
   const userSnapshot = await firestore
     .collection('users')
@@ -403,7 +408,7 @@ if (!premiumGranted) {
 let rateLimitAllowed;
 const checkRateLimit =
   runtime.checkRateLimit ??
-  ((parameters) => checkDistributedRateLimit({ db, ...parameters }));
+  ((parameters) => checkDistributedRateLimit({ db: database(), ...parameters }));
 
 try {
   rateLimitAllowed = await checkRateLimit({
@@ -604,4 +609,12 @@ if (!rateLimitAllowed) {
   }
 }
 
-export default chatHandler;
+// The deployed Vercel entry is deliberately CLOSED. The existing named kernel
+// remains available for isolated contract tests; no production module imports it.
+// No environment flag or injected runtime can open this launch boundary.
+export default async function chatReleaseClosed(req, res) {
+  applyCors(req, res);
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  return res.status(503).json({code: 'AI_RELEASE_CLOSED',
+    error: 'Companion IA indisponível nesta versão.'});
+}

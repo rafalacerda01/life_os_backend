@@ -46,7 +46,7 @@ class FakeFirestore {
   tail = Promise.resolve();
 
   collection(name) {
-    assert.ok(['server_rate_limits', 'account_deletion_guards', 'retired_auth_identities'].includes(name) ||
+    assert.ok(['server_rate_limits', 'account_deletion_guards', 'retired_auth_identities', 'trusted_account_origins'].includes(name) ||
       /^account_deletion_guards\/[^/]+\/control$/.test(name));
     return {doc: id => this.reference(name + '/' + id)};
   }

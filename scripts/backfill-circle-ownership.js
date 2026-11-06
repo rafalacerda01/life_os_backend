@@ -36,6 +36,15 @@ async function readDocument(reader, ref) {
   return snapshot;
 }
 
+// Existing origins are DENY-only for these legacy maintenance tools. Absence
+// preserves their legacy contract; it never proves generation or grants cleanup.
+async function assertLegacyMaintenanceScope(reader, db, uid) {
+  if (!validUid(uid)) throw new Error('MAINTENANCE_IDENTITY_INVALID');
+  const origin = await readDocument(reader,
+      db.doc('trusted_account_origins/' + uid));
+  if (origin.exists) throw new Error('TRUSTED_MAINTENANCE_CLOSED');
+}
+
 async function isRetired(reader, db, uid) {
   if (!validUid(uid)) throw new Error('MAINTENANCE_IDENTITY_INVALID');
   const controls = [];
@@ -45,7 +54,9 @@ async function isRetired(reader, db, uid) {
     controls.push(await readDocument(reader, db.doc(path)));
   }
   // Presence is deny-only, not proof of cleanup or permission to recover it.
-  return controls.some(snapshot => snapshot.exists);
+  if (controls.some(snapshot => snapshot.exists)) return true;
+  await assertLegacyMaintenanceScope(reader, db, uid);
+  return false;
 }
 
 async function inspectCircleOwnership(reader, db, circleId) {
@@ -57,6 +68,7 @@ async function inspectCircleOwnership(reader, db, circleId) {
   if (!root.exists || !data || data.schemaVersion !== 2 ||
       !validUid(data.adminId) || Object.hasOwn(data, 'deletionState') ||
       marker.exists || closure.exists) return false;
+  await assertLegacyMaintenanceScope(reader, db, data.adminId);
   const admin = await readDocument(reader, rootRef.collection('members').doc(data.adminId));
   if (!admin.exists || admin.data().role !== 'admin' ||
       (Object.hasOwn(admin.data(), 'uid') && admin.data().uid !== data.adminId)) return false;

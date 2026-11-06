@@ -1,3 +1,4 @@
+import trustedAccount from "../account/_trusted_account.cjs";
 import deletionControl from '../account/_deletion_control.cjs';
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
@@ -287,12 +288,12 @@ export function createCircleDeleteHandler(
         );
       }
 
-      const result = await execute({
+      const result = await trustedAccount.runAuthenticated(decodedToken, () => execute({
         body,
         db: deletionControl.withNormalWriterTransactions(services.db, uid),
         uid,
         nowMillis,
-      });
+      }));
       return res.status(result.statusCode ?? 200).json(result.body);
     } catch (error) {
       return sendError(res, error, operation);

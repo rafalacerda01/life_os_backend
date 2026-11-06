@@ -1,3 +1,4 @@
+import trustedAccount from "../../account/_trusted_account.cjs";
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
@@ -277,13 +278,13 @@ export function createBillingHandler(execute, { getServices = getFirebaseService
         );
       }
 
-      const result = await execute({
+      const result = await trustedAccount.runAuthenticated(decodedToken, () => execute({
         db: services.db,
         uid,
         purchaseToken,
         nowMillis,
         runtime,
-      });
+      }));
       return res.status(result.statusCode ?? 200).json(result.body);
     } catch (error) {
       return sendError(res, error);

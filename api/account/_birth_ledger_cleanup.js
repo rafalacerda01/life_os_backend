@@ -2,8 +2,11 @@
 import {createHash, randomUUID} from "node:crypto";
 import {Timestamp} from "firebase-admin/firestore";
 import circles from "./_circle_cleanup.cjs";
+import cleanupManifest from "./_cleanup_manifest.cjs";
 
 import control from "./_deletion_control.cjs";
+import historicalAdmission from "./_historical_admission.cjs";
+import trustedAccount from "./_trusted_account.cjs";
 const KEYS = ["version", "uid", "projectId", "tenantId", "authCreatedAt",
   "sourceType", "sourceEventId", "eventAt", "cohort", "decisionId",
   "originalIdentity", "recordedAt", "status"];
@@ -208,11 +211,12 @@ async function assertTerminal(tx, db, accountUid) {
   if (journal.exists) {
     const h = journal.data();
     const original = await tx.get(db.doc("account_deletion_guards/" + accountUid + "/control/operation"));
-    if (h.version !== 2 || h.uid !== accountUid || h.projectId !== db.projectId ||
+    if (![2, 3].includes(h.version) || h.uid !== accountUid || h.projectId !== db.projectId ||
         h.databaseId !== db.databaseId || h.state !== "COMPLETE" ||
         !original.exists || h.deletionId !== original.data().deletionId ||
         ["UNKNOWN", "DISPATCHED"].includes(h.authOutcome) ||
         (original.data().origin === "PRE_AUTH" && h.authOutcome !== "CONFIRMED")) fail();
+    if (h.version === 3) cleanupManifest.validateHeader(h, original.data(), "users/" + accountUid);
   }
 
   const hash = createHash("sha256").update(accountUid, "utf8").digest("hex");
@@ -238,6 +242,11 @@ export async function prepare({db, auth, uid: accountUid, preflight}) {
     // Check explicit public App project configuration when supplied as well.
     if (auth.app?.options.projectId !== undefined &&
         auth.app.options.projectId !== binding.projectId) fail();
+    // No supported authoritative generation/ownership source: deny before
+    // Auth lookup, preflight, scope capture, Circle/Billing or Auth effects.
+    let trustedProof;
+    try { trustedProof = await trustedAccount.resolveDeletion(db, auth, accountUid); }
+    catch (_) { await historicalAdmission.refuseUnprovenAdmission(db, binding, "PRE_AUTH"); }
     let lastUser = await lookup(auth, accountUid);
     let sawAbsent = lastUser === null;
     let controller;
@@ -282,8 +291,8 @@ export async function prepare({db, auth, uid: accountUid, preflight}) {
         return {...context, privateTreeEmpty: true, externalResourcesEmpty: true};
       },
     };
-    controller = control.createController({db, binding,
-      clock: () => Timestamp.now(), uuid: randomUUID, ports});
+    controller = trustedAccount.protectController(db, trustedProof, control.createController({db, binding,
+      clock: () => Timestamp.now(), uuid: randomUUID, ports}));
     admitted = await controller.admitBackend();
     if (!admitted.handle) fail();
     const operation = controller.originalOperation(admitted.handle);

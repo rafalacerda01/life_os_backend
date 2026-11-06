@@ -1,9 +1,12 @@
+import httpCustody from "./_http_generation_custody.cjs";
+import trustedAccount from "./account/_trusted_account.cjs";
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import {
   getFirestore,
   FieldValue,
+  Timestamp,
 } from 'firebase-admin/firestore';
 import { ActivityHttpError } from './activity/_shared.js';
 import deletionControl from './account/_deletion_control.cjs';
@@ -59,15 +62,10 @@ const db = getFirestore();
 // All three missing-control reads participate in the mutation's transaction.
 // The predicate is executed anew by Firestore for every callback retry.
 function runSyncTransaction(userId, callback, ...options) {
-  return db.runTransaction(async (transaction) => {
-    try {
-      await deletionControl.assertNormalWriterTransaction(transaction, db, userId);
-    } catch (error) {
-      if (error instanceof deletionControl.DeletionControlError) throw syncDeletionBlocked();
-      throw error;
-    }
-    return callback(transaction);
-  }, ...options);
+  return httpCustody.transaction(db, userId, callback, ...options).catch(error => {
+    if (error instanceof deletionControl.DeletionControlError) throw syncDeletionBlocked();
+    throw error;
+  });
 }
 
 // Kept behind the existing unconditional legacy rejection. Even if that block
@@ -160,6 +158,7 @@ const MAX_HABIT_DATE_LENGTH = 20;
 
 const SAFE_SYNC_DOMAIN_ERRORS = Object.freeze({
   ...REVIEW_CARD_CREATE_ERRORS,
+  GOAL_PROGRESS_INVALID: Object.freeze({statusCode:400,messages:Object.freeze(['Progresso da meta inválido.'])}),
   ACCOUNT_DELETION_BLOCKED: Object.freeze({
     statusCode: 503,
     messages: Object.freeze(['Conta indisponível para sincronização.']),
@@ -405,11 +404,12 @@ function applyCors(req, res) {
     res.setHeader('Vary', 'Origin');
   }
 
+  res.setHeader('Access-Control-Expose-Headers', 'X-LifeOS-Operation-Ack');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Authorization, X-Firebase-AppCheck',
+    'Content-Type, Authorization, X-Firebase-AppCheck, X-LifeOS-Operation',
   );
 }
 
@@ -1319,6 +1319,31 @@ function validateSubjectDeletePayload(body) {
     valid: true,
   };
 }
+function validateGoalUpdatePayload(body) {
+  if (!isPlainObject(body) || Object.keys(body).some(k => !['operation','goalId','currentValue','lastReset'].includes(k)) ||
+      typeof body.goalId !== 'string' || !body.goalId.trim() || body.goalId.length > MAX_GOAL_ID_LENGTH || body.goalId.includes('/') ||
+      !Number.isSafeInteger(body.currentValue) || body.currentValue < 0 ||
+      (Object.hasOwn(body,'lastReset') && (typeof body.lastReset !== 'string' || body.lastReset.length > 40 || !Number.isFinite(Date.parse(body.lastReset))))) {
+    return {valid:false,error:'Atualização da meta inválida.'};
+  }
+  return {valid:true};
+}
+
+// Same one-transaction R1/R5/receipt adapter as the existing create/delete.
+async function updateGoalProgress({userId,goalId,currentValue,lastReset}) {
+  const userRef=db.collection('users').doc(userId),goalRef=userRef.collection('goals').doc(goalId),tombstoneRef=syncTombstoneRef(userRef,'goals',goalId);
+  return runSyncTransaction(userId,async tx=>{
+    const goal=await tx.get(goalRef),tombstone=await tx.get(tombstoneRef);
+    if(tombstone.exists || !goal.exists) return {outcome:tombstone.exists?'DELETED':'ABSENT'};
+    const value=goal.data();
+    if(!Number.isSafeInteger(value.targetValue) || value.targetValue<=0 || currentValue>value.targetValue) {
+      const error=new Error('Progresso da meta inválido.');error.statusCode=400;error.code='GOAL_PROGRESS_INVALID';throw error;
+    }
+    tx.update(goalRef,{currentValue,...(lastReset===undefined?{}:{lastReset:new Date(lastReset)}),updatedAt:FieldValue.serverTimestamp()});
+    return {outcome:'UPDATED'};
+  });
+}
+
 function validateGoalCreatePayload(body) {
   if (!isPlainObject(body)) {
     return {
@@ -2713,6 +2738,51 @@ async function deleteHabitWithQuota({
 // HANDLER
 // ============================================================================
 
+
+
+export function validateCheckInUpload(body) {
+  if(!isPlainObject(body)||Object.keys(body).sort().join(',')!=='checkInId,energy,focus,motivation,operation'||body.operation!=='upsert_checkin'||
+    typeof body.checkInId!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(body.checkInId)||body.checkInId.startsWith('0000-'))return false;
+  const date=new Date(body.checkInId+'T00:00:00.000Z');
+  return Number.isFinite(date.getTime())&&date.toISOString().slice(0,10)===body.checkInId&&['energy','focus','motivation'].every(k=>typeof body[k]==='number'&&Number.isFinite(body[k])&&body[k]>=0&&body[k]<=10);
+}
+export async function applyCheckInUpload({db,userId,body}) {
+  if(!validateCheckInUpload(body))throw new ActivityHttpError(400,'INVALID_PAYLOAD','Check-in inválido.');
+  const {checkInId,energy,focus,motivation}=body,ref=db.collection('users').doc(userId).collection('checkins').doc(checkInId);
+  await db.runTransaction(async tx=>{tx.set(ref,{energy,focus,motivation,updatedAt:FieldValue.serverTimestamp()},{merge:true});});
+  return {success:true,operation:'upsert_checkin',checkInId,energy,focus,motivation};
+}
+
+export function validateNotificationDismissal(body) {
+  let parts;
+  if (!isPlainObject(body) || Object.keys(body).sort().join(',') !== 'notificationId,occurrenceKey,operation' ||
+      body.operation !== 'delete_notification' || typeof body.notificationId !== 'string' ||
+      !body.notificationId || body.notificationId.length > 200 || body.notificationId.includes('/') ||
+      typeof body.occurrenceKey !== 'string' || body.occurrenceKey.length > 1024) return false;
+  try {parts=JSON.parse(body.occurrenceKey);} catch {return false;}
+  const id=body.notificationId;
+  return Array.isArray(parts) && parts.length===4 && parts[0]===1 && parts[1]===id && Number.isSafeInteger(parts[3]) &&
+    ((parts[2]==='habits'&&id.startsWith('habit_')) || (parts[2]==='studies'&&id.startsWith('exam_')) || (parts[2]==='health'&&id.startsWith('health_med_')));
+}
+export async function applyNotificationDismissal({db,userId,body}) {
+  if(!validateNotificationDismissal(body))throw new ActivityHttpError(400,'INVALID_PAYLOAD','Ocorrência de notificação inválida.');
+  const {notificationId,occurrenceKey}=body,ref=db.collection('users').doc(userId).collection('notifications').doc(notificationId);
+  return db.runTransaction(async tx=>{
+    const snapshot=await tx.get(ref);let outcome='ABSENT';
+    if(snapshot.exists){
+      const value=snapshot.data(),due=value.dueDate;
+      let micros;
+      if(due instanceof Timestamp)micros=due.seconds*1000000+Math.floor(due.nanoseconds/1000);
+      else if(due instanceof Date && Number.isFinite(due.getTime()))micros=due.getTime()*1000;
+      const actual=JSON.stringify([1,notificationId,value.moduleType,micros]);
+      if(!Number.isSafeInteger(micros)||!validateNotificationDismissal({operation:'delete_notification',notificationId,occurrenceKey:actual}))
+        throw new ActivityHttpError(503,'NOTIFICATION_OCCURRENCE_UNPROVEN','A notificação permanece pendente de revisão.');
+      if(actual===occurrenceKey){tx.delete(ref);outcome='DELETED';}else outcome='OBSOLETE';
+    }
+    return {success:true,operation:'delete_notification',notificationId,occurrenceKey,outcome};
+  });
+}
+
 export async function syncHandler(req, res, runtime = {}) {
   applyCors(req, res);
 
@@ -2835,6 +2905,9 @@ export async function syncHandler(req, res, runtime = {}) {
   // --------------------------------------------------------------------------
 
   const userId = decodedToken.uid;
+  let custody;
+  try { custody = httpCustody.parse(req, decodedToken, db, 'sync'); }
+  catch (error) { return res.status(error.statusCode ?? 409).json({code:error.code ?? 'HTTP_CUSTODY_INVALID'}); }
 
   // --------------------------------------------------------------------------
   // RATE LIMIT
@@ -2872,7 +2945,16 @@ export async function syncHandler(req, res, runtime = {}) {
     // BODY
     // ------------------------------------------------------------------------
 
-    const rawBody = req.body;
+    return await trustedAccount.runAuthenticated(decodedToken, () => httpCustody.run(custody, async () => {
+    const rawBody = custody?.body ?? req.body;
+    // Keep response body contracts; the ACK binds only a confirmed transaction.
+    if (custody) {
+      const json = res.json.bind(res);
+      res.json = body => {
+        if ((res.statusCode ?? 200) >= 200 && (res.statusCode ?? 200) < 300) httpCustody.ack(custody, res, body, res.statusCode ?? 200);
+        return json(body);
+      };
+    }
 
     if (!isPlainObject(rawBody)) {
       return res.status(400).json({
@@ -2880,7 +2962,7 @@ export async function syncHandler(req, res, runtime = {}) {
           'Payload de sincronização inválido.',
       });
     }
-    
+
         // ------------------------------------------------------------------------
     // OPERAÇÕES SERVER-SIDE DE HÁBITOS
     // ------------------------------------------------------------------------
@@ -2893,6 +2975,19 @@ export async function syncHandler(req, res, runtime = {}) {
       runTransaction: (callback, ...options) =>
         runSyncTransaction(userId, callback, ...options),
     };
+    if (operation === 'upsert_checkin') {
+      if (!validateCheckInUpload(rawBody)) return res.status(400).json({code:'INVALID_PAYLOAD',error:'Check-in inválido.'});
+      try {return res.status(200).json(await applyCheckInUpload({db:guardedDb,userId,body:rawBody}));}
+      catch(error){return sendSyncOperationError(res,error,{logMessage:'[sync] Check-in pendente.',fallbackError:'Não foi possível confirmar o check-in.',fallbackCode:'CHECKIN_UNCONFIRMED'});}
+    }
+    if (operation === 'delete_notification') {
+      if (!validateNotificationDismissal(rawBody)) return res.status(400).json({code:'INVALID_PAYLOAD',error:'Ocorrência de notificação inválida.'});
+      try { return res.status(200).json(await applyNotificationDismissal({db:guardedDb,userId,body:rawBody})); }
+      catch(error){
+        if(error instanceof ActivityHttpError && error.code==='NOTIFICATION_OCCURRENCE_UNPROVEN') return res.status(503).json({code:'NOTIFICATION_OCCURRENCE_UNPROVEN',error:'A notificação permanece pendente de revisão.'});
+        return sendSyncOperationError(res,error,{logMessage:'[sync] Dispensa pendente.',fallbackError:'Não foi possível confirmar a dispensa.',fallbackCode:'NOTIFICATION_DELETE_UNCONFIRMED'});
+      }
+    }
     if (operation === 'create_review_card') {
       const validation = validateStudyCardCreatePayload(rawBody);
       if (!validation.valid) {
@@ -3306,6 +3401,17 @@ if (operation === 'delete_subject') {
   }
 }
 
+if (operation === 'update_goal') {
+  const validation=validateGoalUpdatePayload(rawBody);
+  if(!validation.valid)return res.status(400).json({error:validation.error});
+  try {
+    const result=await updateGoalProgress({userId,goalId:rawBody.goalId.trim(),currentValue:rawBody.currentValue,lastReset:rawBody.lastReset});
+    return res.status(200).json({success:true,operation:'update_goal',goalId:rawBody.goalId.trim(),currentValue:rawBody.currentValue,...result});
+  } catch(error) {
+    return sendSyncOperationError(res,error,{logMessage:'[sync] Falha ao atualizar meta.',fallbackError:'Não foi possível atualizar a meta.',fallbackCode:'GOAL_UPDATE_FAILED'});
+  }
+}
+
 if (operation === 'delete_goal') {
   const validation =
     validateGoalDeletePayload(rawBody);
@@ -3618,6 +3724,7 @@ if (operation === 'delete_task') {
       serverTimestamp:
         serverIsoString,
     });
+    }));
   } catch (_) {
     console.error('[sync] Falha crítica no processo de sincronização.');
 

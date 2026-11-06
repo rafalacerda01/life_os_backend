@@ -155,7 +155,7 @@ function treeOptions(db, uid, guard, ref) {
   const operation = value.controller.originalOperation(value.handle);
   if (ref?.path !== operation.scope.privateRoot &&
       !(typeof ref?.path === "string" && /^circles\/[^/]+$/.test(ref.path))) conflict();
-  return {db: value.db, operation,
+  return {db: value.db, operation, partitionedCapture: true,
     ref, authorizeCapture: value.authorizeCapture,
     assertOriginalOperation: tx => value.controller.assertOperationTransaction(tx, value.handle),
     beforeEffect: () => value.beforeEffect(ref),

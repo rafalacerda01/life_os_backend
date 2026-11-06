@@ -28,6 +28,15 @@ async function readDocument(reader, ref) {
   return snapshot;
 }
 
+// Existing origins are DENY-only for these legacy maintenance tools. Absence
+// preserves their legacy contract; it never proves generation or grants cleanup.
+async function assertLegacyMaintenanceScope(reader, db, uid) {
+  if (!validUid(uid)) throw new Error('MAINTENANCE_IDENTITY_INVALID');
+  const origin = await readDocument(reader,
+      db.doc('trusted_account_origins/' + uid));
+  if (origin.exists) throw new Error('TRUSTED_MAINTENANCE_CLOSED');
+}
+
 async function isRetired(reader, db, uid) {
   if (!validUid(uid)) throw new Error('MAINTENANCE_IDENTITY_INVALID');
   const controls = [];
@@ -37,7 +46,9 @@ async function isRetired(reader, db, uid) {
     controls.push(await readDocument(reader, db.doc(path)));
   }
   // Presence is deny-only, not proof of cleanup or permission to recover it.
-  return controls.some(snapshot => snapshot.exists);
+  if (controls.some(snapshot => snapshot.exists)) return true;
+  await assertLegacyMaintenanceScope(reader, db, uid);
+  return false;
 }
 
 const COUNTERS = ['habits', 'tasks', 'goals', 'subjects', 'medications', 'transactions'];

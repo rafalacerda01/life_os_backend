@@ -1,3 +1,5 @@
+import httpCustody from "../_http_generation_custody.cjs";
+import trustedAccount from "../account/_trusted_account.cjs";
 import deletionControl from '../account/_deletion_control.cjs';
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAppCheck } from 'firebase-admin/app-check';
@@ -37,11 +39,13 @@ const RATE_LIMITS = Object.freeze({
   start: 20,
   finish: 30,
   cancel: 30,
+  status: 30,
 });
 const RATE_LIMIT_SCOPES = Object.freeze({
   start: 'focus_start',
   finish: 'focus_finish',
   cancel: 'focus_cancel',
+  status: 'focus_status',
 });
 
 const ALLOWED_ORIGINS = new Set([
@@ -350,11 +354,12 @@ function applyCors(req, res) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
   }
+  res.setHeader('Access-Control-Expose-Headers', 'X-LifeOS-Operation-Ack');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Authorization, X-Firebase-AppCheck',
+    'Content-Type, Authorization, X-Firebase-AppCheck, X-LifeOS-Operation',
   );
 }
 
@@ -439,6 +444,7 @@ function sendError(res, error, fallbackCode) {
       retryable: true,
     });
   }
+  if (error instanceof httpCustody.CustodyError) return res.status(error.statusCode).json({code:error.code});
   if (error instanceof FocusHttpError) {
     return res.status(error.statusCode).json({
       error: error.message,
@@ -507,6 +513,7 @@ export function createFocusHandler(operation, fallbackCode, execute) {
       }
 
       const accountUid = decodedToken.uid;
+      const custody = httpCustody.parse(req, decodedToken, firestore, 'focus/'+operation);
       const checkRateLimit = runtime.checkRateLimit ?? checkDistributedRateLimit;
       let rateLimitAllowed;
       try {
@@ -532,7 +539,12 @@ export function createFocusHandler(operation, fallbackCode, execute) {
           'Muitas solicitações Focus. Tente novamente em instantes.',
         );
       }
-      const result = await execute({ body: req.body, db: deletionControl.withNormalWriterTransactions(firestore, accountUid), uid: accountUid });
+      const result = await trustedAccount.runAuthenticated(decodedToken, () => httpCustody.run(custody, () => execute({
+        body: custody?.body ?? req.body,
+        db: custody ? httpCustody.database(firestore, accountUid) : deletionControl.withNormalWriterTransactions(firestore, accountUid),
+        uid: accountUid,
+      })));
+      httpCustody.ack(custody, res, result.body, result.statusCode ?? 200);
       return res.status(result.statusCode ?? 200).json(result.body);
     } catch (error) {
       return sendError(res, error, fallbackCode);

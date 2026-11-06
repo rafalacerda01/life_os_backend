@@ -46,8 +46,8 @@ async function assertGuardedDatabase(adapter, raw, uid) {
   probe.completed = true;
   assert.equal(result, sentinel);
   assert.equal(attempts.length, 1);
-  assert.deepEqual(attempts[0].reads, r5Paths(uid),
-    'the real transaction must read all three controls for the verified UID');
+  assert.deepEqual(attempts[0].reads, [...r5Paths(uid), "trusted_account_origins/" + uid],
+    'the real transaction must read all three controls and the origin for the verified UID');
   return adapter;
 }
 function writerObservation(db) {

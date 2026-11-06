@@ -105,8 +105,11 @@ for (const gateway of gateways) {
       method: 'OPTIONS', headers: { origin: 'https://app.life-os.com' },
     }, f.runtime);
     assert.equal(res.statusCode, 204);
-    assert.equal(res.headers['Access-Control-Allow-Headers'],
-      'Content-Type, Authorization, X-Firebase-AppCheck');
+    const custodyGateway = gateway.name === 'activity' || gateway.name === 'focus';
+    assert.equal(res.headers['Access-Control-Allow-Headers'], custodyGateway
+      ? 'Content-Type, Authorization, X-Firebase-AppCheck, X-LifeOS-Operation'
+      : 'Content-Type, Authorization, X-Firebase-AppCheck');
+    if (custodyGateway) assert.equal(res.headers['Access-Control-Expose-Headers'], 'X-LifeOS-Operation-Ack');
     assert.equal(res.headers['Access-Control-Allow-Methods'], 'POST,OPTIONS');
     assert.equal(res.headers['Access-Control-Allow-Credentials'], 'true');
     assert.equal(res.headers['Access-Control-Allow-Origin'], 'https://app.life-os.com');
@@ -264,6 +267,9 @@ for (const gateway of gateways) {
     assert.equal(f.db.docs.has(target.path), false);
     assert.deepEqual(f.db.docs.get('users/independent-B'), {keep: true});
     assert.equal(writerObservation(f.db).attempts.length, 2);
-    for (const row of writerObservation(f.db).attempts) assert.deepEqual(row.reads, r5Paths(f.uid));
+    const attempts = writerObservation(f.db).attempts;
+    assert.deepEqual(attempts[0].reads, [...r5Paths(f.uid), 'trusted_account_origins/' + f.uid]);
+    // The retry refuses at the third R5 control, before origin/business reads.
+    assert.deepEqual(attempts[1].reads, r5Paths(f.uid));
   });
 }

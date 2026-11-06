@@ -3,6 +3,7 @@
 
 const {createHash} = require("node:crypto");
 const {Timestamp} = require("firebase-admin/firestore");
+const trustedAccount = require("./_trusted_account.cjs");
 
 const UUID = new RegExp("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-" +
     "[89ab][0-9a-f]{3}-[0-9a-f]{12}$");
@@ -748,6 +749,7 @@ async function assertNormalWriterTransaction(transaction, db, accountUid) {
         fail("ACCOUNT_DELETION_BLOCKED");
       }
     }
+    await trustedAccount.assertWriterTransaction(transaction, db, accountUid);
   } catch (_) {
     // Neither a read error nor an unknown snapshot is evidence of absence.
     fail("ACCOUNT_DELETION_BLOCKED");

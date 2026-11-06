@@ -1,0 +1,24 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {initializeApp,getApps} from 'firebase-admin/app';
+import {Timestamp} from 'firebase-admin/firestore';
+import control from '../api/account/_deletion_control.cjs';
+import memory from './account-cleanup-memory.cjs';
+if(!getApps().length)initializeApp({projectId:'synthetic-notification-contract'});
+const {applyNotificationDismissal:apply,validateNotificationDismissal:valid,applyCheckInUpload:upload,validateCheckInUpload:checkInValid}=await import('../api/sync.js');
+const uid='synthetic-a',id='habit_daily',path='users/'+uid+'/notifications/'+id;
+const due=new Timestamp(1760000000,123456789),micros=due.seconds*1000000+123456,key=JSON.stringify([1,id,'habits',micros]);
+const body={operation:'delete_notification',notificationId:id,occurrenceKey:key};
+function fixture(data){const db=new memory.MemoryFirestore();if(data!==undefined)db.put(path,data);return{db,run:()=>apply({db:control.withNormalWriterTransactions(db,uid),userId:uid,body})};}
+test('notification exact microsecond occurrence is deleted; B preserved',async()=>{const f=fixture({moduleType:'habits',dueDate:due});f.db.put('users/B/notifications/'+id,{keep:true});assert.equal((await f.run()).outcome,'DELETED');assert.equal(f.db.docs.has(path),false);assert.deepEqual(f.db.docs.get('users/B/notifications/'+id),{keep:true});});
+test('notification different occurrence is an obsolete no-op, never deletes replacement',async()=>{const f=fixture({moduleType:'habits',dueDate:new Timestamp(due.seconds,123457000)}),v=f.db.versions.get(path);assert.equal((await f.run()).outcome,'OBSOLETE');assert.equal(f.db.versions.get(path),v);});
+test('notification absent occurrence confirms a server no-op',async()=>{const f=fixture();assert.equal((await f.run()).outcome,'ABSENT');assert.equal(f.db.commits.flat().filter(w=>w.type==='delete').length,0);});
+for(const data of [{moduleType:'unknown',dueDate:due},{moduleType:'habits',dueDate:null},{moduleType:'habits',dueDate:'2026-01-01'}])test('notification unknown remote occurrence stays pending '+JSON.stringify(data),async()=>{const f=fixture(data),v=f.db.versions.get(path);await assert.rejects(f.run(),e=>e.statusCode===503&&e.code==='NOTIFICATION_OCCURRENCE_UNPROVEN');assert.equal(f.db.versions.get(path),v);});
+for(const suffix of ['account_deletion_guards/'+uid,'retired_auth_identities/'+uid,'account_deletion_guards/'+uid+'/control/operation'])test('notification normal writer preserves R5 '+suffix,async()=>{const f=fixture({moduleType:'habits',dueDate:due});f.db.put(suffix,{blocked:true});await assert.rejects(f.run());assert.equal(f.db.docs.has(path),true);});
+test('notification R5 replacement on retry prevents stale deletion',async()=>{const f=fixture({moduleType:'habits',dueDate:due});let once=0;f.db.hooks.beforeCommit=({writes})=>{if(!once&&writes.some(w=>w.type==='delete')){once++;f.db.put('account_deletion_guards/'+uid+'/control/operation',{blocked:true});}};await assert.rejects(f.run());assert.ok(f.db.conflicts);assert.ok(f.db.docs.has(path));});
+test('notification invalid payloads grant no target or coercion',()=>{for(const value of [{...body,userId:'B'},{...body,notificationId:'../B'},{...body,occurrenceKey:JSON.stringify([1,id,'habits',2**53])},{...body,occurrenceKey:JSON.stringify([1,id,'habits',String(micros)])}])assert.equal(valid(value),false);});
+
+const metrics={operation:'upsert_checkin',checkInId:'2026-11-04',energy:1.25,focus:2.5,motivation:3.75};
+test('Check-in finite decimals are stored under the authenticated owner only',async()=>{const db=new memory.MemoryFirestore();db.put('users/B/checkins/2026-11-04',{keep:true});const r=await upload({db:control.withNormalWriterTransactions(db,uid),userId:uid,body:metrics});assert.deepEqual(r,{...metrics,success:true});const value=db.docs.get('users/'+uid+'/checkins/2026-11-04');assert.equal(value.energy,1.25);assert.equal(value.focus,2.5);assert.equal(value.motivation,3.75);assert.deepEqual(db.docs.get('users/B/checkins/2026-11-04'),{keep:true});});
+for(const suffix of ['account_deletion_guards/'+uid,'retired_auth_identities/'+uid,'account_deletion_guards/'+uid+'/control/operation'])test('Check-in revalidates R5 '+suffix,async()=>{const db=new memory.MemoryFirestore();db.put(suffix,{blocked:true});await assert.rejects(upload({db:control.withNormalWriterTransactions(db,uid),userId:uid,body:metrics}));assert.equal(db.docs.has('users/'+uid+'/checkins/2026-11-04'),false);});
+test('Check-in refuses invalid calendar dates, strings, nonfinite and out-of-range values',()=>{for(const b of [{...metrics,checkInId:'2026-02-30'},{...metrics,checkInId:'0000-01-01'},{...metrics,energy:'1'},{...metrics,energy:-1},{...metrics,focus:Infinity},{...metrics,motivation:11},{...metrics,uid:'B'}])assert.equal(checkInValid(b),false);assert.equal(checkInValid({...metrics,checkInId:'2024-02-29',energy:0}),true);});
