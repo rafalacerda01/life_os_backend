@@ -93,6 +93,9 @@ async function quarantine(argumentsForQuarantine, reason) {
       current : await tx.get(account.header);
     if ([current, original].some(s => s.exists &&
         s.data().deletionId !== operation.deletionId)) fail();
+    // An unresolved dispatch must retain its original manifest and receipt.
+    if (original.exists &&
+        ["DISPATCHED", "UNKNOWN"].includes(original.data().authOutcome)) fail();
     function mark(reference, snapshot, root) {
       if (!snapshot.exists) {
         tx.create(reference, {version: 2, uid: operation.uid,

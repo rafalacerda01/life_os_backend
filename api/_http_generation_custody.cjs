@@ -37,7 +37,7 @@ function parse(req,decoded,db,route) {
   if(c?.v===1) fail('HTTP_LEGACY_OPERATION_REVIEW_REQUIRED');
   const b=c?.binding;
   if(!exact(c,['v','binding','operationId','route','bodyHash']) || c.v!==2 || !HEX.test(c.operationId) || !HEX.test(c.bodyHash) || c.route!==route ||
-      !exact(b,['v','project','database','tenant','uid','generation']) || b.v!==2 || b.project!=='demo-life-os' || b.database!=='(default)' || b.tenant!==null ||
+      !exact(b,['v','project','database','tenant','uid','generation']) || b.v!==2 || b.project!==require('../config/local_homologation_environment.cjs').selectedProject() || b.database!=='(default)' || b.tenant!==null ||
       typeof b.uid!=='string' || !b.uid || b.uid.includes('/') || !UUID.test(b.generation) || b.project!==db.projectId || b.database!==db.databaseId ||
       decoded.uid!==b.uid || decoded.sub!==b.uid || decoded.aud!==b.project || decoded.iss!=='https://securetoken.google.com/'+b.project ||
       (decoded.firebase?.tenant ?? null)!==b.tenant || decoded.lifeos_generation!==b.generation) fail('HTTP_CUSTODY_IDENTITY_MISMATCH');

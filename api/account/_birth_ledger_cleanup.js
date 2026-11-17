@@ -7,6 +7,7 @@ import cleanupManifest from "./_cleanup_manifest.cjs";
 import control from "./_deletion_control.cjs";
 import historicalAdmission from "./_historical_admission.cjs";
 import trustedAccount from "./_trusted_account.cjs";
+import {buildAdmissionReceipt} from "./_terminal_receipt.js";
 const KEYS = ["version", "uid", "projectId", "tenantId", "authCreatedAt",
   "sourceType", "sourceEventId", "eventAt", "cohort", "decisionId",
   "originalIdentity", "recordedAt", "status"];
@@ -205,19 +206,16 @@ function checkUser(user, operation) {
 
 // Real terminal queries: no constant attestation can substitute for these reads.
 async function assertTerminal(tx, db, accountUid) {
-  const privateHash = createHash("sha256").update("users/" + accountUid).digest("hex");
-  const journal = await tx.get(db.doc("account_deletion_guards/" + accountUid +
-    "/cleanup_manifests/" + privateHash));
-  if (journal.exists) {
-    const h = journal.data();
-    const original = await tx.get(db.doc("account_deletion_guards/" + accountUid + "/control/operation"));
-    if (![2, 3].includes(h.version) || h.uid !== accountUid || h.projectId !== db.projectId ||
-        h.databaseId !== db.databaseId || h.state !== "COMPLETE" ||
-        !original.exists || h.deletionId !== original.data().deletionId ||
-        ["UNKNOWN", "DISPATCHED"].includes(h.authOutcome) ||
-        (original.data().origin === "PRE_AUTH" && h.authOutcome !== "CONFIRMED")) fail();
-    if (h.version === 3) cleanupManifest.validateHeader(h, original.data(), "users/" + accountUid);
-  }
+  const binding = {projectId: db.projectId, databaseId: db.databaseId, uid: accountUid};
+  const original = await tx.get(control.references(db, binding).operation);
+  const operation = control.validateControl(original.data(), binding);
+  if (operation.origin !== "PRE_AUTH" || !operation.scope) fail();
+  const root = operation.scope.privateRoot;
+  const journal = await tx.get(cleanupManifest.refs(db, operation, root).header);
+  // An empty inventory and an absent Auth user cannot replace the original proof.
+  if (!journal.exists) fail();
+  const h = cleanupManifest.validateHeader(journal.data(), operation, root);
+  if (h.state !== "COMPLETE" || h.authOutcome !== "CONFIRMED") fail();
 
   const hash = createHash("sha256").update(accountUid, "utf8").digest("hex");
   const billing = await tx.get(db.collection("billing_google_accounts").doc(hash));
@@ -232,7 +230,7 @@ async function assertTerminal(tx, db, accountUid) {
 
 // Server-only seam called by the existing verified HTTP wrapper. No endpoint
 // accepts a UID, operation ID, scope or attestation from the request body.
-export async function prepare({db, auth, uid: accountUid, preflight}) {
+export async function prepare({db, auth, uid: accountUid, preflight, receipt}) {
   return controlled(async () => {
     const binding = control.validateBinding({projectId: db?.projectId,
       databaseId: db?.databaseId, uid: accountUid});
@@ -251,6 +249,7 @@ export async function prepare({db, auth, uid: accountUid, preflight}) {
     let sawAbsent = lastUser === null;
     let controller;
     let admitted;
+    let receiptOperationId;
     const ports = {
       getAuthenticatedSubject: async () => binding,
       getAuthUser: async () => {
@@ -291,12 +290,20 @@ export async function prepare({db, auth, uid: accountUid, preflight}) {
         return {...context, privateTreeEmpty: true, externalResourcesEmpty: true};
       },
     };
+    if (receipt !== undefined) {
+      ports.admissionReceipt = async (tx, operation) => {
+        const record = await buildAdmissionReceipt(tx, db, operation, receipt);
+        receiptOperationId = operation.deletionId;
+        return record;
+      };
+    }
     controller = trustedAccount.protectController(db, trustedProof, control.createController({db, binding,
       clock: () => Timestamp.now(), uuid: randomUUID, ports}));
     admitted = await controller.admitBackend();
     if (!admitted.handle) fail();
     const operation = controller.originalOperation(admitted.handle);
     if (operation.origin !== "PRE_AUTH") fail();
+    if (receipt !== undefined && receiptOperationId !== operation.deletionId) unavailable();
     checkUser(lastUser, operation);
     if (admitted.status === "COMPLETE") {
       // A concurrent original executor may have completed after the first

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "profileId": "p1-life-os-27b92-android-local",
+  "state": "CLOSED_PENDING_EXTERNAL_AUTHORIZATION",
+  "projectId": "life-os-27b92",
+  "projectNumber": "278760083864",
+  "packageName": "com.rafalacerda.lifeos.p1nativegate",
+  "appId": null,
+  "databaseId": "(default)",
+  "tenantId": null,
+  "authEmulator": "127.0.0.1:45099",
+  "firestoreEmulator": "127.0.0.1:45089",
+  "backendBaseUrl": "http://127.0.0.1:45789",
+  "egressAuthorized": false,
+  "debugRegistrationApproved": false
+}

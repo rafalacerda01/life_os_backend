@@ -510,6 +510,17 @@ function createController(options) {
             fail("READ_UNAVAILABLE");
           }
         }
+        let receipt;
+        if (ports.admissionReceipt !== undefined) {
+          if (review || operation.origin !== "PRE_AUTH" || typeof ports.admissionReceipt !== "function") {
+            fail("BOUNDARY_REFUSED");
+          }
+          receipt = await ports.admissionReceipt(Object.freeze({get: tx.get.bind(tx)}), operation);
+          if (!receipt || receipt.deletionId !== deletionId || receipt.uid !== binding.uid ||
+              receipt.projectId !== binding.projectId || receipt.databaseId !== binding.databaseId) {
+            fail("BOUNDARY_REFUSED");
+          }
+        }
         const reservation = {version: 2, state: "RESERVED", deletionId,
           origin: operation.origin};
         const guard = {version: 1, state: "IN_PROGRESS", deletionId,
@@ -517,6 +528,7 @@ function createController(options) {
         tx.create(refs.reservation, reservation);
         if (!review) tx.create(refs.guard, guard);
         tx.create(refs.operation, operation);
+        if (receipt) tx.create(refs.guard.collection("control").doc("receipt"), receipt);
         return review ? outcome("REVIEW_REQUIRED") :
           handleFor(operation, "ADMITTED");
       });

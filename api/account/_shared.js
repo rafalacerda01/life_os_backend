@@ -223,7 +223,10 @@ export function createAccountHandler(
 
     try {
       assertBodyWithinLimit(req);
-      validateDeletePayload(req.body);
+      if (operation !== 'delete' || !hasExactKeys(req.body, ['receiptKey']) ||
+          typeof req.body.receiptKey !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(req.body.receiptKey)) {
+        validateDeletePayload(req.body);
+      }
       const rawAppCheckToken = req.headers?.['x-firebase-appcheck'];
       if (
         typeof rawAppCheckToken !== 'string' ||

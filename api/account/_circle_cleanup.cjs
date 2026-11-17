@@ -91,7 +91,7 @@ function binding(db, uid, guard) {
   return value;
 }
 
-async function requireActiveGuard(tx, db, uid, guard) {
+async function requireActiveGuard(tx, db, uid, guard, settlingAuthOutcome = false) {
   const value = binding(db, uid, guard);
   try {
     await value.controller.assertOperationTransaction(tx, value.handle);
@@ -102,6 +102,9 @@ async function requireActiveGuard(tx, db, uid, guard) {
       const h = snapshot.data();
       if (h.deletionId !== original.deletionId || h.state === "QUARANTINED" ||
           h.authOutcome === "UNKNOWN") conflict("ACCOUNT_CLEANUP_REVIEW_REQUIRED");
+      if (h.authOutcome === "DISPATCHED" && !settlingAuthOutcome) {
+        conflict("ACCOUNT_AUTH_OUTCOME_UNKNOWN");
+      }
       if (h.billingVersion !== null) {
         const account = await tx.get(db.doc("billing_google_accounts/" + original.scope.billingAccountHash));
         if (account.exists && (!account.updateTime || !h.billingVersion.isEqual(account.updateTime))) {
@@ -150,7 +153,7 @@ async function requireRecursiveScope(tx, db, uid, ref) {
       claim.circleId !== circleId || !time(claim.startedAt)) conflict();
 }
 
-function treeOptions(db, uid, guard, ref) {
+function treeOptions(db, uid, guard, ref, settlingAuthOutcome = false) {
   const value = binding(db, uid, guard);
   const operation = value.controller.originalOperation(value.handle);
   if (ref?.path !== operation.scope.privateRoot &&
@@ -160,7 +163,8 @@ function treeOptions(db, uid, guard, ref) {
     assertOriginalOperation: tx => value.controller.assertOperationTransaction(tx, value.handle),
     beforeEffect: () => value.beforeEffect(ref),
     assertOperation: async tx => {
-      await requireActiveGuard(tx, value.db, uid, guard);
+      await requireActiveGuard(tx, value.db, uid, guard,
+          settlingAuthOutcome && ref.path === operation.scope.privateRoot);
       await requireRecursiveScope(tx, value.db, uid, ref);
     }};
 }
@@ -181,7 +185,8 @@ function treeState(db, uid, guard, ref, optional = false) {
   return manifest.state(treeOptions(db, uid, guard, ref), optional);
 }
 function setAuthOutcome(db, uid, guard, ref, expected, next) {
-  return manifest.authOutcome(treeOptions(db, uid, guard, ref), expected, next);
+  return manifest.authOutcome(treeOptions(db, uid, guard, ref,
+      expected === "DISPATCHED"), expected, next);
 }
 async function capturePermitted(db, uid, guard) {
   return (await binding(db, uid, guard).authorizeCapture()) === true;

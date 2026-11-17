@@ -1,6 +1,7 @@
 import { Timestamp } from 'firebase-admin/firestore';
 import circleCleanup from './_circle_cleanup.cjs';
 import * as birthCleanup from './_birth_ledger_cleanup.js';
+import {isReceiptKey} from './_terminal_receipt.js';
 import {
   establishBillingDeletionBarrier,
   finishBillingDeletion,
@@ -391,11 +392,20 @@ async function ensureExternalCleanupMarker({ db, uid, userRef, guard }) {
 
 const INTERNAL_CONTINUATION = Symbol("original deletion continuation");
 
-export async function deleteAccount({ db, auth, uid, [INTERNAL_CONTINUATION]: originalAdmission }) {
+export async function deleteAccount({ db, auth, uid, body, decodedToken, nowMillis,
+  [INTERNAL_CONTINUATION]: originalAdmission }) {
   const userRef = db.collection('users').doc(uid);
   let admission = originalAdmission;
   try {
-    if (admission === undefined) admission = await birthCleanup.prepare({ db, auth, uid, preflight: async (transaction) => {
+    const receiptKey = body?.receiptKey;
+    if (receiptKey !== undefined && (!isReceiptKey(receiptKey) || decodedToken?.uid !== uid ||
+        decodedToken.aud !== db.projectId || !Number.isSafeInteger(nowMillis))) {
+      throw new AccountHttpError(400, 'INVALID_ACCOUNT_PAYLOAD', 'Payload de conta invalido.');
+    }
+    if (admission === undefined) admission = await birthCleanup.prepare({ db, auth, uid,
+      receipt: receiptKey === undefined ? undefined : {
+        generation: decodedToken.lifeos_generation, key: receiptKey, now: nowMillis,
+      }, preflight: async (transaction) => {
       const user = await transaction.get(userRef);
       const marker = await transaction.get(accountDeletionMarkerRef(userRef));
       if (marker.exists && validateExternalCleanupMarker(marker.data()).version === 2) throw stateConflict();
@@ -445,14 +455,13 @@ export async function deleteAccount({ db, auth, uid, [INTERNAL_CONTINUATION]: or
       try {
         await auth.deleteUser(uid);
       } catch (error) {
-        if (error?.code !== 'auth/user-not-found') {
-          await circleCleanup.setAuthOutcome(db, uid, guard, userRef, 'DISPATCHED', 'UNKNOWN');
-          throw error;
-        }
+        // A missing UID does not prove this operation removed the original Auth identity.
+        await circleCleanup.setAuthOutcome(db, uid, guard, userRef, 'DISPATCHED', 'UNKNOWN');
+        throw error;
       }
       await circleCleanup.setAuthOutcome(db, uid, guard, userRef, 'DISPATCHED', 'CONFIRMED');
     } else if (prepared.authOutcome !== 'CONFIRMED') {
-      throw stateConflict();
+      throw new Error('ACCOUNT_AUTH_OUTCOME_UNKNOWN');
     }
     await birthCleanup.beforeRootRemoval(db, auth, admission);
     await cleanupDb.deleteTree(userRef);

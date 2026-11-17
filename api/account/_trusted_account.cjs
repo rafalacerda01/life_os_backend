@@ -17,14 +17,15 @@ function fail(code = "TRUSTED_ACCOUNT_REVIEW_REQUIRED") {
   error.code = code; throw error;
 }
 function environment(db) {
+  const project = require("../../config/local_homologation_environment.cjs").selectedProject();
   for (const key of ["GOOGLE_APPLICATION_CREDENTIALS", "FIREBASE_PRIVATE_KEY", "FIREBASE_CLIENT_EMAIL", "FIREBASE_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN"]) {
     if (process.env[key] !== undefined) fail("TRUSTED_ACCOUNT_CREDENTIAL_MIX_REFUSED");
   }
   const loopback = v => /^127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(v || "") && Number(v.split(":")[1]) < 65536;
   if (environmentConfiguration.production.state !== "CLOSED" || environmentConfiguration.production.projectId !== null ||
-      environmentConfiguration.development.projectId !== "demo-life-os" || db?.projectId !== "demo-life-os" || db?.databaseId !== "(default)" ||
-      process.env.GCLOUD_PROJECT !== "demo-life-os" ||
-      ["GOOGLE_CLOUD_PROJECT", "FIREBASE_PROJECT_ID"].some(k => process.env[k] !== undefined && process.env[k] !== "demo-life-os") ||
+      environmentConfiguration.development.projectId !== "demo-life-os" || db?.projectId !== project || db?.databaseId !== "(default)" ||
+      process.env.GCLOUD_PROJECT !== project ||
+      ["GOOGLE_CLOUD_PROJECT", "FIREBASE_PROJECT_ID"].some(k => process.env[k] !== undefined && process.env[k] !== project) ||
       !loopback(process.env.FIRESTORE_EMULATOR_HOST) ||
       !loopback(process.env.FIREBASE_AUTH_EMULATOR_HOST)) fail("TRUSTED_ACCOUNT_CLOSED");
 }
